@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <vector>
+#include <algorithm>
 #include <raylib.h>
 #include <fstream>
 #include <sstream>
@@ -359,7 +360,13 @@ int main() {
 	Texture2D render = LoadTextureFromImage(ptData);
 
 	Image hdri = LoadImage("textures/HDRI.hdr");
-	ImageFormat(&hdri, PIXELFORMAT_UNCOMPRESSED_R32G32B32);
+	if (hdri.data == nullptr) {
+		std::cerr << "Warning: failed to load textures/HDRI.hdr (missing file, or raylib "
+			"built without HDR support). Falling back to procedural sky.\n";
+	}
+	else {
+		ImageFormat(&hdri, PIXELFORMAT_UNCOMPRESSED_R32G32B32);
+	}
 
 	rlImGuiSetup(true);
 

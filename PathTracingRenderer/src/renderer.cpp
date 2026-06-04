@@ -384,6 +384,13 @@ glm::vec3 sky(PathRay& ray, Params& params) {
 
 glm::vec3 hdriLogic(PathRay& ray, Params& params, Image& hdri) {
 
+	// Fall back to the procedural sky if the HDRI failed to load (missing file, or
+	// raylib built without SUPPORT_FILEFORMAT_HDR). Otherwise the zero dimensions
+	// below produce a negative index into a null buffer and segfault.
+	if (hdri.data == nullptr || hdri.width <= 0 || hdri.height <= 0) {
+		return sky(ray, params);
+	}
+
 	float phi = glm::atan(ray.dir.y, ray.dir.x);
 
 	float theta = glm::asin(ray.dir.z);
