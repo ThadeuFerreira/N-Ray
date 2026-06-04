@@ -37,7 +37,7 @@ void UI::drawStatsWindow(Params& params, Data& data) {
 
 	double totalRaysM = static_cast<double>(params.renderStatsTotalRays) / 1000000.0;
 	double raysPerSecM = params.renderStatsRaysPerSec / 1000000.0;
-	float sampleProgress = params.maxSamples > 0 ? static_cast<float>(params.renderStatsSample) / static_cast<float>(params.maxSamples) : 0.0f;
+	float sampleProgress = params.maxSamples > 0 ? static_cast<float>(params.currentSample) / static_cast<float>(params.maxSamples) : 0.0f;
 	sampleProgress = glm::clamp(sampleProgress, 0.0f, 1.0f);
 
 	ImGui::Text("UI FPS: %d", GetFPS());
@@ -65,8 +65,13 @@ void UI::drawStatsWindow(Params& params, Data& data) {
 	ImGui::Separator();
 	ImGui::Spacing();
 
-	ImGui::Text("Samples: %d / %d", params.renderStatsSample, params.maxSamples);
+	ImGui::Text("Samples: %d / %d", params.currentSample, params.maxSamples);
 	ImGui::ProgressBar(sampleProgress, ImVec2(-1.0f, 0.0f));
+	ImGui::Spacing();
+	ImGui::Separator();
+	ImGui::Spacing();
+
+	ImGui::Text("Worker samples: %d", params.renderStatsSample);
 	ImGui::Spacing();
 	ImGui::Separator();
 	ImGui::Spacing();

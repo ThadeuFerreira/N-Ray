@@ -8,19 +8,24 @@ UI::SelectedMaterialState UI::collectSelectedMaterialState(const Data& data) con
 			continue;
 		}
 
-		state.albedo += model.albedo;
-		state.specularCol += model.specularCol;
-		state.emissionCol += model.emissionCol;
-		state.absorptionCol += model.absorptionCol;
-		state.volumeCol += model.volumeCol;
-		state.IOR += model.IOR;
-		state.roughness += model.roughness;
-		state.emissionIntensity += model.emissionIntensity;
-		state.refraction += model.refraction;
-		state.absorption += model.absorption;
-		state.volume += model.volume;
-		state.density += model.density;
-		state.metalness += model.metalness;
+		if (model.materialIdx >= data.materials.size()) {
+			continue;
+		}
+
+		const PBRMaterial& material = data.materials[model.materialIdx];
+		state.albedo += material.albedo;
+		state.specularCol += material.specularCol;
+		state.emissionCol += material.emissionCol;
+		state.absorptionCol += material.absorptionCol;
+		state.volumeCol += material.volumeCol;
+		state.IOR += material.IOR;
+		state.roughness += material.roughness;
+		state.emissionIntensity += material.emissionIntensity;
+		state.refraction += material.refraction;
+		state.absorption += material.absorption;
+		state.volume += material.volume;
+		state.density += material.density;
+		state.metalness += material.metalness;
 		state.selectedCount++;
 	}
 
@@ -55,19 +60,24 @@ void UI::applySelectedMaterialState(Data& data, const SelectedMaterialState& sta
 			continue;
 		}
 
-		model.albedo = state.albedo;
-		model.specularCol = state.specularCol;
-		model.emissionCol = state.emissionCol;
-		model.absorptionCol = state.absorptionCol;
-		model.volumeCol = state.volumeCol;
-		model.IOR = state.IOR;
-		model.roughness = state.roughness;
-		model.emissionIntensity = state.emissionIntensity;
-		model.refraction = state.refraction;
-		model.absorption = state.absorption;
-		model.volume = state.volume;
-		model.density = state.density;
-		model.metalness = state.metalness;
+		if (model.materialIdx >= data.materials.size()) {
+			continue;
+		}
+
+		PBRMaterial& material = data.materials[model.materialIdx];
+		material.albedo = state.albedo;
+		material.specularCol = state.specularCol;
+		material.emissionCol = state.emissionCol;
+		material.absorptionCol = state.absorptionCol;
+		material.volumeCol = state.volumeCol;
+		material.IOR = state.IOR;
+		material.roughness = state.roughness;
+		material.emissionIntensity = state.emissionIntensity;
+		material.refraction = state.refraction;
+		material.absorption = state.absorption;
+		material.volume = state.volume;
+		material.density = state.density;
+		material.metalness = state.metalness;
 		model.updateTris(data);
 	}
 }

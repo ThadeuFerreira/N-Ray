@@ -59,15 +59,6 @@ struct ObjImporter {
 		});
 
 		data.models.push_back({
-			albedo, specularCol, emissionCol, absorptionCol, volumeCol,
-			IOR,
-			roughness,
-			emissionIntensity,
-			refraction,
-			absorption,
-			volume,
-			density,
-			metalness,
 			doubleSided,
 			modelIdx,
 			materialIdx

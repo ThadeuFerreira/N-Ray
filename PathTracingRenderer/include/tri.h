@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <glm/glm.hpp>
 
 struct Tri {
@@ -19,14 +20,6 @@ struct Tri {
 	bool doubleSided;
 	uint32_t modelIdx;
 
-	Tri(glm::vec3 albedo, glm::vec3 specularCol, glm::vec3 emissionCol, glm::vec3 absorptionCol, glm::vec3 volumeCol, glm::vec3 a, glm::vec3 b, glm::vec3 c, glm::vec3 aN, glm::vec3 bN, glm::vec3 cN,
-		float IOR, float roughness, float emissionIntensity, float refraction, float absorption, float volume, float density, float metalness, bool doubleSided)
-		: a(a), b(b), c(c), aN(aN), bN(bN), cN(cN), idx(0), materialIdx(0), doubleSided(doubleSided), modelIdx(0) {
-		calculateNormal();
-		calculateAABB();
-		calculateCenter();
-	}
-
 	Tri(glm::vec3 a, glm::vec3 b, glm::vec3 c, glm::vec3 aN, glm::vec3 bN, glm::vec3 cN, uint32_t materialIdx, uint32_t modelIdx, bool doubleSided)
 		: a(a), b(b), c(c), aN(aN), bN(bN), cN(cN), idx(0), materialIdx(materialIdx), doubleSided(doubleSided), modelIdx(modelIdx) {
 		calculateNormal();
@@ -38,7 +31,9 @@ struct Tri {
 		eA = b - a;
 		eB = c - a;
 
-		normal = glm::normalize(glm::cross(eA, eB));
+		glm::vec3 faceNormal = glm::cross(eA, eB);
+		float lenSq = glm::dot(faceNormal, faceNormal);
+		normal = lenSq > 0.00000001f ? glm::normalize(faceNormal) : glm::vec3(0.0f, 0.0f, 1.0f);
 	}
 
 	void calculateAABB() {

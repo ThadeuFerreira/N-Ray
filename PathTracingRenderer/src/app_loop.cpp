@@ -10,15 +10,20 @@ void updateUiHoverState() {
 
 void rebuildRenderTarget(RuntimeResources& runtime) {
 	runtime.prevRes = params.res;
-	runtime.renderWorker.requestCancel();
-	params.currentSample = 0;
+	runtime.renderWorker.shutdown();
+	runtime.renderWorker.discardFrame();
 	resetRenderStats(params);
 	screen.initScreen(params.res, data.frameBuffer, data.accumBuffer);
+	runtime.asyncFrame.clear();
+	runtime.asyncAccum.clear();
+	runtime.asyncRaysPerPixel = params.raysPerPixel;
 
 	UnloadTexture(runtime.render);
 	runtime.render = createRenderTexture();
 
 	params.shouldSample = false;
+	params.renderInvalidated = false;
+	params.displayInvalidated = false;
 }
 
 void handleRenderTargetResize(RuntimeResources& runtime) {
@@ -37,6 +42,7 @@ void handleViewportActions() {
 	if (myCam.clickDof && IsMouseButtonPressed(0) && !params.isMouseHoveringUI) {
 		setDofDist();
 		params.shouldSample = false;
+		params.renderInvalidated = true;
 	}
 
 	if (params.enableSelection) {
@@ -44,40 +50,83 @@ void handleViewportActions() {
 	}
 }
 
-void updatePathTraceRender(RuntimeResources& runtime) {
-	if (!params.render) {
-		runtime.renderWorker.requestCancel();
-		runtime.renderWorker.joinFinished();
-		resetRenderStats(params);
+bool displayedFrameMatchesTarget(const RuntimeResources& runtime) {
+	size_t pixelCount = static_cast<size_t>(screen.resX) * static_cast<size_t>(screen.resY);
+	return params.currentSample > 0 &&
+		runtime.asyncAccum.size() == pixelCount &&
+		runtime.asyncFrame.size() == pixelCount;
+}
+
+void recomposeDisplayedFrame(RuntimeResources& runtime) {
+	if (!displayedFrameMatchesTarget(runtime)) {
 		return;
 	}
 
+	composeRenderFrame(
+		pt,
+		params.exposure,
+		params.contrast,
+		params.currentSample,
+		runtime.asyncRaysPerPixel,
+		runtime.asyncAccum,
+		runtime.asyncFrame,
+		1
+	);
+	UpdateTexture(runtime.render, runtime.asyncFrame.data());
+}
+
+void updatePathTraceRender(RuntimeResources& runtime) {
+	if (!params.render) {
+		runtime.renderWorker.shutdown();
+		runtime.renderWorker.discardFrame();
+		resetRenderStats(params);
+		runtime.asyncAccum.clear();
+		return;
+	}
+
+	runtime.renderWorker.updateDisplaySettings(params, params.displayInvalidated);
 	runtime.renderWorker.joinFinished();
 
-	if (!params.shouldSample) {
+	if (params.displayInvalidated) {
+		recomposeDisplayedFrame(runtime);
+		params.displayInvalidated = false;
+	}
+
+	if (params.renderInvalidated) {
 		runtime.renderWorker.requestCancel();
-		params.currentSample = 0;
+		runtime.renderWorker.joinFinished();
+
+		if (runtime.renderWorker.isRunning()) {
+			params.renderStatsActive = true;
+			drawRenderTexture(runtime.render, screen);
+			return;
+		}
+
+		runtime.asyncFrame.clear();
+		runtime.asyncAccum.clear();
+		runtime.renderWorker.discardFrame();
 		resetRenderStats(params);
-		params.renderStatsActive = runtime.renderWorker.isRunning();
-	}
-	else {
-		if (!runtime.renderWorker.isRunning() && params.currentSample < params.maxSamples) {
-			runtime.renderWorker.start(params, data, myCam, screen, makeRenderEnvironment(runtime.hdri), globalCompactBVH);
-		}
-
-		int frameSample = 0;
-		int frameResX = 0;
-		int frameResY = 0;
-		if (runtime.renderWorker.consumeFrame(runtime.asyncFrame, frameSample, frameResX, frameResY)) {
-			if (frameResX == screen.resX && frameResY == screen.resY) {
-				params.currentSample = frameSample;
-				UpdateTexture(runtime.render, runtime.asyncFrame.data());
-			}
-		}
-
-		applyRenderStats(params, runtime.renderWorker.stats());
+		params.renderInvalidated = false;
 	}
 
+	int frameSample = 0;
+	int frameRaysPerPixel = 1;
+	int frameResX = 0;
+	int frameResY = 0;
+	if (runtime.renderWorker.consumeFrame(runtime.asyncFrame, runtime.asyncAccum, frameSample, frameRaysPerPixel, frameResX, frameResY)) {
+		if (frameResX == screen.resX && frameResY == screen.resY) {
+			runtime.asyncRaysPerPixel = frameRaysPerPixel;
+			params.currentSample = frameSample;
+			UpdateTexture(runtime.render, runtime.asyncFrame.data());
+		}
+	}
+
+	RenderStatsSnapshot stats = runtime.renderWorker.stats();
+	if (params.shouldSample && !runtime.renderWorker.isRunning() && stats.sample < params.maxSamples) {
+		runtime.renderWorker.start(params, data, myCam, screen, makeRenderEnvironment(runtime.hdri), globalCompactBVH);
+	}
+
+	applyRenderStats(params, stats);
 	drawRenderTexture(runtime.render, screen);
 }
 

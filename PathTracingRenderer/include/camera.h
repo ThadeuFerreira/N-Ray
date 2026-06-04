@@ -41,6 +41,7 @@ struct PTCam {
 		if (IsKeyDown(key)) {
 			params.shouldSample = false;
 			params.enableSampling = false;
+			params.renderInvalidated = true;
 			return true;
 		}
 		else {
@@ -53,6 +54,7 @@ struct PTCam {
 		if (IsMouseButtonDown(key)) {
 			params.shouldSample = false;
 			params.enableSampling = false;
+			params.renderInvalidated = true;
 			return true;
 		}
 		else {

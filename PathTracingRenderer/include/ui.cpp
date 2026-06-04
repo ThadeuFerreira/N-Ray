@@ -31,7 +31,13 @@ void UI::sectionHeader(const char* title) {
 }
 
 void UI::markRenderDirty(Params& params) {
+	params.renderInvalidated = true;
+	params.displayInvalidated = true;
 	params.shouldSample = false;
+}
+
+void UI::markDisplayDirty(Params& params) {
+	params.displayInvalidated = true;
 }
 
 void UI::normalizeSunDirection(Params& params) {

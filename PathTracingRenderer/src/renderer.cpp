@@ -1,6 +1,8 @@
 #include "renderer.h"
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <limits>
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtx/rotate_vector.hpp>
 
@@ -14,6 +16,15 @@ uint64_t splitMix64(uint64_t x) {
 
 float randomSignedUnit(RenderRng& rng) {
 	return rng.nextFloat01() * 2.0f - 1.0f;
+}
+
+glm::vec3 safeNormalize(const glm::vec3& value, const glm::vec3& fallback) {
+	float lenSq = glm::dot(value, value);
+	if (!std::isfinite(lenSq) || lenSq <= 0.00000001f) {
+		return fallback;
+	}
+
+	return glm::normalize(value);
 }
 }
 
@@ -34,10 +45,9 @@ float RenderRng::nextFloat01() {
 }
 
 RenderRng makeRenderRng(uint32_t pixelIndex, uint32_t sampleIndex, uint32_t rayIndex) {
-	uint64_t seed = uint64_t(pixelIndex) ^
-		(uint64_t(sampleIndex) << 32) ^
-		(uint64_t(rayIndex) << 48) ^
-		0xD1B54A32D192ED03ull;
+	uint64_t seed = splitMix64(uint64_t(pixelIndex) ^ 0xD1B54A32D192ED03ull) ^
+		splitMix64(uint64_t(sampleIndex) ^ 0x9E3779B97F4A7C15ull) ^
+		splitMix64(uint64_t(rayIndex) ^ 0xBF58476D1CE4E5B9ull);
 	return RenderRng(seed);
 }
 
@@ -86,25 +96,37 @@ bool PathTracer::RayIntersectsTriangle(PathRay& ray, const Tri& tri, float& t, f
 }
 
 bool PathTracer::rayAABB(const PathRay& ray, const glm::vec3& boxMin, const glm::vec3& boxMax, float maxT) {
-	float tx1 = (boxMin.x - ray.src.x) * ray.invDir.x;
-	float tx2 = (boxMax.x - ray.src.x) * ray.invDir.x;
+	float tmin = 0.0f;
+	float tmax = maxT;
 
-	float tmin = std::min(tx1, tx2);
-	float tmax = std::max(tx1, tx2);
+	for (int axis = 0; axis < 3; ++axis) {
+		float src = ray.src[axis];
+		float dir = ray.dir[axis];
+		float minBound = boxMin[axis];
+		float maxBound = boxMax[axis];
 
-	float ty1 = (boxMin.y - ray.src.y) * ray.invDir.y;
-	float ty2 = (boxMax.y - ray.src.y) * ray.invDir.y;
+		if (std::fabs(dir) <= 0.00000001f) {
+			if (src < minBound || src > maxBound) {
+				return false;
+			}
+			continue;
+		}
 
-	tmin = std::max(tmin, std::min(ty1, ty2));
-	tmax = std::min(tmax, std::max(ty1, ty2));
+		float invDir = 1.0f / dir;
+		float t1 = (minBound - src) * invDir;
+		float t2 = (maxBound - src) * invDir;
+		if (t1 > t2) {
+			std::swap(t1, t2);
+		}
 
-	float tz1 = (boxMin.z - ray.src.z) * ray.invDir.z;
-	float tz2 = (boxMax.z - ray.src.z) * ray.invDir.z;
+		tmin = std::max(tmin, t1);
+		tmax = std::min(tmax, t2);
+		if (tmax < tmin) {
+			return false;
+		}
+	}
 
-	tmin = std::max(tmin, std::min(tz1, tz2));
-	tmax = std::min(tmax, std::max(tz1, tz2));
-
-	return tmax >= std::max(tmin, 0.0f) && tmin < maxT;
+	return tmin < maxT;
 }
 
 void PathTracer::diffuseLighting(PathRay& ray, PathRayState& rayState, glm::vec3& normal, const std::vector<Tri>& tris, RenderRng& rng) {
@@ -120,7 +142,7 @@ void PathTracer::diffuseLighting(PathRay& ray, PathRayState& rayState, glm::vec3
 	);
 
 	glm::vec3 up = fabsf(normal.z) < 0.999f ? glm::vec3(0, 0, 1) : glm::vec3(1, 0, 0);
-	glm::vec3 tangent = glm::normalize(glm::cross(up, normal));
+	glm::vec3 tangent = safeNormalize(glm::cross(up, normal), glm::vec3(1, 0, 0));
 	glm::vec3 bitangent = glm::cross(normal, tangent);
 
 	glm::vec3 worldDir =
@@ -128,7 +150,7 @@ void PathTracer::diffuseLighting(PathRay& ray, PathRayState& rayState, glm::vec3
 		localDir.y * bitangent +
 		localDir.z * normal;
 
-	worldDir = glm::normalize(worldDir);
+	worldDir = safeNormalize(worldDir, normal);
 
 	if (glm::dot(worldDir, tris[rayState.triIdx].normal) < 0.0f) {
 		worldDir = -worldDir;
@@ -150,10 +172,10 @@ glm::vec3 PathTracer::sampleGGX(const glm::vec3& normal, float roughness, float 
 	);
 
 	glm::vec3 up = fabs(normal.z) < 0.999f ? glm::vec3(0, 0, 1) : glm::vec3(1, 0, 0);
-	glm::vec3 tangent = glm::normalize(glm::cross(up, normal));
+	glm::vec3 tangent = safeNormalize(glm::cross(up, normal), glm::vec3(1, 0, 0));
 	glm::vec3 bitangent = glm::cross(normal, tangent);
 
-	return glm::normalize(tangent * h.x + bitangent * h.y + normal * h.z);
+	return safeNormalize(tangent * h.x + bitangent * h.y + normal * h.z, normal);
 }
 
 bool PathTracer::specularLighting(PathRay& ray, PathRayState& rayState, glm::vec3& normal, const std::vector<Tri>& tris, const std::vector<PBRMaterial>& materials, RenderRng& rng) {
@@ -208,18 +230,25 @@ void PathTracer::refractionLighting(PathRay& ray, PathRayState& rayState, glm::v
 		rayState.throughput *= absorptionScale;
 	}
 
-	float eta = n1 / n2;
-
-	float k = 1.0f - eta * eta * (1.0f - cosi * cosi);
-
-	if (k < 0.0f) {
+	if (n2 <= 0.0001f) {
 		ray.dir = glm::reflect(ray.dir, normal);
 		ray.src = rayState.hitPos + normal * 0.001f;
 		rayState.isRefraction = true;
 		return;
 	}
 
-	ray.dir = glm::normalize(glm::refract(ray.dir, normal, eta));
+	float eta = n1 / n2;
+
+	float k = 1.0f - eta * eta * (1.0f - cosi * cosi);
+
+	if (k <= 0.00000001f) {
+		ray.dir = glm::reflect(ray.dir, normal);
+		ray.src = rayState.hitPos + normal * 0.001f;
+		rayState.isRefraction = true;
+		return;
+	}
+
+	ray.dir = safeNormalize(glm::refract(ray.dir, normal, eta), glm::reflect(ray.dir, normal));
 
 	if (isExiting) {
 		ray.src = rayState.hitPos - normal * 0.001f;
@@ -322,7 +351,7 @@ glm::vec3 PathTracer::InterpolateNormal(PathRayState& rayState, const std::vecto
 		v * tris[rayState.triIdx].bN +
 		w * tris[rayState.triIdx].cN;
 
-	return glm::normalize(interpolatedNormal);
+	return safeNormalize(interpolatedNormal, tris[rayState.triIdx].normal);
 }
 
 //void PathTracer::directLight(PathRay& ray, glm::vec3 normal, std::vector<Tri>& tris, Params& params) {
@@ -395,7 +424,8 @@ glm::vec3 sky(PathRay& ray, Params& params) {
 	}
 
 	if (params.enableSun) {
-		float sunAngle = glm::acos(glm::dot(ray.dir, params.sunDir));
+		float sunDot = glm::clamp(glm::dot(ray.dir, params.sunDir), -1.0f, 1.0f);
+		float sunAngle = glm::acos(sunDot);
 
 		if (glm::degrees(sunAngle) < params.sunAngle) {
 			skyCol = params.sunColor * params.sunIntensity;
@@ -416,7 +446,7 @@ glm::vec3 hdriLogic(PathRay& ray, Params& params, const RenderEnvironment& envir
 
 	float phi = glm::atan(ray.dir.y, ray.dir.x);
 
-	float theta = glm::asin(ray.dir.z);
+	float theta = glm::asin(glm::clamp(ray.dir.z, -1.0f, 1.0f));
 
 	float u = (phi + PI) / (2.0f * PI);
 	float v = 1.0f - (theta + PI * 0.5f) / PI;
@@ -538,8 +568,11 @@ std::vector<DebugRay> PathTracer::rayLogic(PathRay& ray, PathRayState& rayState,
 
 		if (rayState.isVolume && rayState.triIdx != UINT32_MAX) {
 			const PBRMaterial& material = materials[tris[rayState.triIdx].materialIdx];
-			float randomVal = std::max(rng.nextFloat01(), 0.0001f);
-			float scatterDist = -std::log(randomVal) / material.density;
+			float scatterDist = FLT_MAX;
+			if (material.density > 0.000001f) {
+				float randomVal = std::max(rng.nextFloat01(), 0.0001f);
+				scatterDist = -std::log(randomVal) / material.density;
+			}
 
 			if (scatterDist < closestT) {
 
@@ -551,7 +584,7 @@ std::vector<DebugRay> PathTracer::rayLogic(PathRay& ray, PathRayState& rayState,
 					randDir = glm::vec3(randomSignedUnit(rng), randomSignedUnit(rng), randomSignedUnit(rng));
 				} while (glm::length(randDir) > 1.0f || glm::length(randDir) < 0.001f);
 
-				ray.dir = glm::normalize(randDir);
+				ray.dir = safeNormalize(randDir, ray.dir);
 				ray.invDir = 1.0f / ray.dir;
 
 				rayState.throughput *= material.volumeCol;
@@ -651,14 +684,14 @@ void PathTracer::generatePixelRay(uint32_t pixelIndex, PathRay& ray, PathRayStat
 	src -= myCam.right * (srcOffsetX) * (myCam.sensorSize / 1000.0f);
 	src += myCam.up * (srcOffsetY) * ((myCam.sensorSize / 1000.0f) / screen.ratio);
 
-	glm::vec3 dir = glm::normalize(myCam.focalPoint - src);
+	glm::vec3 dir = safeNormalize(myCam.focalPoint - src, myCam.camNormal);
 
 	glm::vec3 focusPoint = myCam.camPos + (dir * (myCam.focusDist / glm::dot(dir, myCam.camNormal)));
 
 	src -= myCam.right * (diskSample.x) * (myCam.sensorSize / 1000.0f);
 	src += myCam.up * (diskSample.y) * ((myCam.sensorSize / 1000.0f) / screen.ratio);
 
-	dir = glm::normalize(focusPoint - src);
+	dir = safeNormalize(focusPoint - src, myCam.camNormal);
 
 	ray.src = src;
 	ray.dir = dir;

@@ -24,7 +24,7 @@ void UI::drawRenderSettings(Params& params, const LayoutSizes& sizes) {
 	}
 
 	if (sliderHelper("Publish Hz", "Maximum viewport update rate while tracing", sizes.slider, params.renderPublishHz, 1, 120)) {
-		markRenderDirty(params);
+		markDisplayDirty(params);
 	}
 
 	if (sliderHelper("Resolution", "Sets image resolution size", sizes.slider, params.res, 16, 1024)) {
@@ -36,10 +36,10 @@ void UI::drawPostSettings(Params& params, const LayoutSizes& sizes) {
 	sectionHeader("Post Settings");
 
 	if (sliderHelper("Exposure", "Controls image exposure after rendering", sizes.slider, params.exposure, 0.0f, 5.0f, LogSlider)) {
-		markRenderDirty(params);
+		markDisplayDirty(params);
 	}
 
 	if (sliderHelper("Contrast", "Controls image contrast", sizes.slider, params.contrast, 0.0f, 2.0f, LogSlider)) {
-		markRenderDirty(params);
+		markDisplayDirty(params);
 	}
 }

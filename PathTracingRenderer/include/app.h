@@ -17,6 +17,8 @@ struct RuntimeResources {
 	Image hdri = {};
 	AsyncRenderWorker renderWorker;
 	std::vector<RenderPixel> asyncFrame;
+	std::vector<glm::vec3> asyncAccum;
+	int asyncRaysPerPixel = 1;
 };
 
 extern Params params;

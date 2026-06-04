@@ -32,6 +32,13 @@ void AsyncRenderWorker::shutdown() {
 	}
 }
 
+void AsyncRenderWorker::discardFrame() {
+	std::lock_guard<std::mutex> lock(frameMutex);
+	pendingFrame.clear();
+	pendingAccum.clear();
+	frameAvailable = false;
+}
+
 void AsyncRenderWorker::start(const Params& sourceParams, const Data& sourceData, const PTCam& sourceCamera, const Screen& sourceScreen, const RenderEnvironment& sourceEnvironment, const std::vector<CompactBVH>& sourceFlatBVH) {
 	joinFinished();
 
@@ -53,7 +60,9 @@ void AsyncRenderWorker::start(const Params& sourceParams, const Data& sourceData
 	{
 		std::lock_guard<std::mutex> lock(frameMutex);
 		pendingFrame.clear();
+		pendingAccum.clear();
 		pendingSample = 0;
+		pendingRaysPerPixel = sourceParams.raysPerPixel;
 		pendingResX = sourceScreen.resX;
 		pendingResY = sourceScreen.resY;
 		frameAvailable = false;
@@ -65,12 +74,22 @@ void AsyncRenderWorker::start(const Params& sourceParams, const Data& sourceData
 	statsElapsedNs.store(0);
 	statsPublishedFrames.store(0);
 	statsPublishNs.store(0);
+	updateDisplaySettings(sourceParams, false);
 	cancelRequested.store(false);
 	running.store(true);
 	thread = std::thread(&AsyncRenderWorker::run, this, std::move(workload));
 }
 
-bool AsyncRenderWorker::consumeFrame(std::vector<RenderPixel>& frameOut, int& sampleOut, int& resXOut, int& resYOut) {
+void AsyncRenderWorker::updateDisplaySettings(const Params& sourceParams, bool requestRefresh) {
+	displayExposure.store(sourceParams.exposure);
+	displayContrast.store(sourceParams.contrast);
+	displayPublishHz.store(std::max(1, sourceParams.renderPublishHz));
+	if (requestRefresh) {
+		displayRefreshRequested.store(true);
+	}
+}
+
+bool AsyncRenderWorker::consumeFrame(std::vector<RenderPixel>& frameOut, std::vector<glm::vec3>& accumOut, int& sampleOut, int& raysPerPixelOut, int& resXOut, int& resYOut) {
 	std::lock_guard<std::mutex> lock(frameMutex);
 
 	if (!frameAvailable) {
@@ -78,7 +97,9 @@ bool AsyncRenderWorker::consumeFrame(std::vector<RenderPixel>& frameOut, int& sa
 	}
 
 	frameOut.swap(pendingFrame);
+	accumOut.swap(pendingAccum);
 	sampleOut = pendingSample;
+	raysPerPixelOut = pendingRaysPerPixel;
 	resXOut = pendingResX;
 	resYOut = pendingResY;
 	frameAvailable = false;
@@ -125,35 +146,57 @@ int AsyncRenderWorker::chooseWorkerThreadCount(const Params& workerParams) const
 	return std::max(1, static_cast<int>(hardwareThreads) - 1);
 }
 
-bool AsyncRenderWorker::shouldPublishFrame(const Params& workerParams, std::chrono::steady_clock::time_point now, std::chrono::steady_clock::time_point lastPublish) const {
+bool AsyncRenderWorker::shouldPublishFrame(const Params& workerParams, std::chrono::steady_clock::time_point now, std::chrono::steady_clock::time_point lastPublish) {
+	if (displayRefreshRequested.exchange(false)) {
+		return true;
+	}
+
 	if (workerParams.currentSample <= 4 || workerParams.currentSample >= workerParams.maxSamples) {
 		return true;
 	}
 
-	int publishHz = std::max(1, workerParams.renderPublishHz);
+	int publishHz = displayPublishHz.load();
 	auto publishPeriod = std::chrono::duration<double>(1.0 / static_cast<double>(publishHz));
 	return now - lastPublish >= publishPeriod;
 }
 
-void AsyncRenderWorker::composeFrame(PathTracer& tracer, Params& workerParams, Data& workerData) {
-	float invSamples = workerParams.currentSample > 0 ? 1.0f / (float(workerParams.currentSample) * float(workerParams.raysPerPixel)) : 1.0f;
+void composeRenderFrame(PathTracer& tracer, float exposure, float contrast, int sample, int raysPerPixel, const std::vector<glm::vec3>& accumBuffer, std::vector<RenderPixel>& frameBuffer, int threadCount) {
+	frameBuffer.resize(accumBuffer.size());
 
-#pragma omp parallel for schedule(static)
-	for (int i = 0; i < static_cast<int>(workerData.frameBuffer.size()); i++) {
-		glm::vec3 col = workerData.accumBuffer[i] * invSamples;
+	float invSamples = sample > 0 ? 1.0f / (float(sample) * float(std::max(1, raysPerPixel))) : 1.0f;
+	int requestedThreads = std::max(1, threadCount);
 
-		col *= workerParams.exposure;
-		col = glm::min(col, 1.0f);
-		tracer.colorManagement(workerParams.contrast, col);
+#pragma omp parallel for schedule(static) num_threads(requestedThreads)
+	for (int i = 0; i < static_cast<int>(frameBuffer.size()); i++) {
+		glm::vec3 col = accumBuffer[i] * invSamples;
 
-		workerData.frameBuffer[i] = vec3ToRenderPixel(col);
+		col *= exposure;
+		col = glm::clamp(col, 0.0f, 1.0f);
+		tracer.colorManagement(contrast, col);
+
+		frameBuffer[i] = vec3ToRenderPixel(col);
 	}
+}
+
+void AsyncRenderWorker::composeFrame(PathTracer& tracer, const Params& workerParams, Data& workerData, int threadCount) {
+	composeRenderFrame(
+		tracer,
+		displayExposure.load(),
+		displayContrast.load(),
+		workerParams.currentSample,
+		workerParams.raysPerPixel,
+		workerData.accumBuffer,
+		workerData.frameBuffer,
+		threadCount
+	);
 }
 
 void AsyncRenderWorker::publishFrame(Data& workerData, const Params& workerParams, const Screen& workerScreen) {
 	std::lock_guard<std::mutex> lock(frameMutex);
 	pendingFrame.swap(workerData.frameBuffer);
+	pendingAccum = workerData.accumBuffer;
 	pendingSample = workerParams.currentSample;
+	pendingRaysPerPixel = workerParams.raysPerPixel;
 	pendingResX = workerScreen.resX;
 	pendingResY = workerScreen.resY;
 	frameAvailable = true;
@@ -169,7 +212,7 @@ void AsyncRenderWorker::run(RenderWorkload workload) {
 
 	workerParams.currentSample = 0;
 	workerParams.shouldSample = true;
-	omp_set_num_threads(chooseWorkerThreadCount(workerParams));
+	const int workerThreadCount = chooseWorkerThreadCount(workerParams);
 
 	const size_t pixelCount = static_cast<size_t>(workerScreen.resX) * static_cast<size_t>(workerScreen.resY);
 	const uint64_t raysPerSample = static_cast<uint64_t>(pixelCount) * static_cast<uint64_t>(workerParams.raysPerPixel);
@@ -184,7 +227,7 @@ void AsyncRenderWorker::run(RenderWorkload workload) {
 
 	while (!cancelRequested.load() && workerParams.currentSample < workerParams.maxSamples) {
 		for (int rays = 0; rays < workerParams.raysPerPixel && !cancelRequested.load(); rays++) {
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) num_threads(workerThreadCount)
 			for (int i = 0; i < static_cast<int>(workerData.accumBuffer.size()); i++) {
 				PathRay ray;
 				PathRayState rayState;
@@ -209,7 +252,7 @@ void AsyncRenderWorker::run(RenderWorkload workload) {
 
 		if (!cancelRequested.load() && shouldPublishFrame(workerParams, now, lastPublishTime)) {
 			auto publishStart = std::chrono::steady_clock::now();
-			composeFrame(workerTracer, workerParams, workerData);
+			composeFrame(workerTracer, workerParams, workerData, workerThreadCount);
 			publishFrame(workerData, workerParams, workerScreen);
 			workerData.frameBuffer.resize(pixelCount);
 			auto publishEnd = std::chrono::steady_clock::now();
@@ -235,6 +278,7 @@ void resetRenderStats(Params& params) {
 	params.renderStatsPublishedFrames = 0;
 	params.renderStatsPublishMs = 0.0;
 	params.renderStatsSamplesPerSec = 0.0;
+	params.currentSample = 0;
 }
 
 void applyRenderStats(Params& params, const RenderStatsSnapshot& stats) {
@@ -248,7 +292,6 @@ void applyRenderStats(Params& params, const RenderStatsSnapshot& stats) {
 	params.renderStatsPublishedFrames = stats.publishedFrames;
 	params.renderStatsPublishMs = stats.publishMs;
 	params.renderStatsSamplesPerSec = stats.samplesPerSec;
-	params.currentSample = stats.sample;
 }
 
 void drawRenderTexture(Texture2D& render, const Screen& screen) {

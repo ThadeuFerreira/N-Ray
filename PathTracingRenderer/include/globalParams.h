@@ -54,6 +54,8 @@ struct Params {
 
 	bool shouldSample = true;
 	bool enableSampling = true;
+	bool renderInvalidated = false;
+	bool displayInvalidated = false;
 
 	bool isMouseHoveringUI = false;
 	bool enableDebugRay = false;

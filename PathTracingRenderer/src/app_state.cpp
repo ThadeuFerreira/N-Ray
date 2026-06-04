@@ -37,10 +37,15 @@ Texture2D createRenderTexture() {
 }
 
 RenderEnvironment makeRenderEnvironment(const Image& image) {
+	if (image.format != PIXELFORMAT_UNCOMPRESSED_R32G32B32) {
+		return {};
+	}
+
 	return RenderEnvironment{
 		static_cast<const float*>(image.data),
 		image.width,
 		image.height,
-		3
+		3,
+		true
 	};
 }

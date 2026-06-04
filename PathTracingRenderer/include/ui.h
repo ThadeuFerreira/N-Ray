@@ -57,6 +57,7 @@ private:
 
 	static void sectionHeader(const char* title);
 	static void markRenderDirty(Params& params);
+	static void markDisplayDirty(Params& params);
 	static void normalizeSunDirection(Params& params);
 
 	SelectedMaterialState collectSelectedMaterialState(const Data& data) const;
