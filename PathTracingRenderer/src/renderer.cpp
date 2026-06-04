@@ -51,7 +51,7 @@ RenderRng makeRenderRng(uint32_t pixelIndex, uint32_t sampleIndex, uint32_t rayI
 	return RenderRng(seed);
 }
 
-bool PathTracer::RayIntersectsTriangle(PathRay& ray, const Tri& tri, float& t, float& hitU, float& hitV) {
+bool PathTracer::RayIntersectsTriangle(PathRay& ray, const TriIntersect& tri, float& t, float& hitU, float& hitV) {
 	const float EPSILON = 0.0000001f;
 
 	glm::vec3 h = glm::cross(ray.dir, tri.eB);
@@ -96,37 +96,19 @@ bool PathTracer::RayIntersectsTriangle(PathRay& ray, const Tri& tri, float& t, f
 }
 
 bool PathTracer::rayAABB(const PathRay& ray, const glm::vec3& boxMin, const glm::vec3& boxMax, float maxT) {
-	float tmin = 0.0f;
-	float tmax = maxT;
+	// Branchless slab test using the precomputed reciprocal direction. min/max
+	// fold the per-axis swap away and behave correctly for negative directions;
+	// a degenerate (zero) direction yields ±inf and is still ordered by min/max.
+	glm::vec3 t0 = (boxMin - ray.src) * ray.invDir;
+	glm::vec3 t1 = (boxMax - ray.src) * ray.invDir;
 
-	for (int axis = 0; axis < 3; ++axis) {
-		float src = ray.src[axis];
-		float dir = ray.dir[axis];
-		float minBound = boxMin[axis];
-		float maxBound = boxMax[axis];
+	glm::vec3 tSmall = glm::min(t0, t1);
+	glm::vec3 tBig = glm::max(t0, t1);
 
-		if (std::fabs(dir) <= 0.00000001f) {
-			if (src < minBound || src > maxBound) {
-				return false;
-			}
-			continue;
-		}
+	float tmin = std::max(std::max(tSmall.x, tSmall.y), std::max(tSmall.z, 0.0f));
+	float tmax = std::min(std::min(tBig.x, tBig.y), std::min(tBig.z, maxT));
 
-		float invDir = 1.0f / dir;
-		float t1 = (minBound - src) * invDir;
-		float t2 = (maxBound - src) * invDir;
-		if (t1 > t2) {
-			std::swap(t1, t2);
-		}
-
-		tmin = std::max(tmin, t1);
-		tmax = std::min(tmax, t2);
-		if (tmax < tmin) {
-			return false;
-		}
-	}
-
-	return tmin < maxT;
+	return tmax >= tmin;
 }
 
 void PathTracer::diffuseLighting(PathRay& ray, PathRayState& rayState, glm::vec3& normal, const std::vector<Tri>& tris, RenderRng& rng) {
@@ -260,68 +242,72 @@ void PathTracer::refractionLighting(PathRay& ray, PathRayState& rayState, glm::v
 	}
 }
 
-void PathTracer::flattenBVH(uint32_t buildNodeIdx, const std::vector<BVH>& buildNodes, std::vector<CompactBVH>& flatNodes) {
+uint32_t PathTracer::flattenBVH(uint32_t buildNodeIdx, const std::vector<BVH>& buildNodes, std::vector<CompactBVH>& flatNodes) {
 
+	// Capture everything we need before recursing: child push_backs reallocate
+	// flatNodes, so we re-index by `myFlatIndex` rather than holding a reference.
 	const BVH& buildNode = buildNodes[buildNodeIdx];
-
-	CompactBVH compactNode;
-	compactNode.min = buildNode.min;
-	compactNode.max = buildNode.max;
+	const glm::vec3 nodeMin = buildNode.min;
+	const glm::vec3 nodeMax = buildNode.max;
+	const uint32_t child0 = buildNode.children[0];
+	const uint32_t child1 = buildNode.children[1];
+	const uint32_t startIndex = buildNode.startIndex;
+	const uint32_t endIndex = buildNode.endIndex;
+	const uint8_t axis = buildNode.splitAxis;
 
 	uint32_t myFlatIndex = static_cast<uint32_t>(flatNodes.size());
 
+	CompactBVH compactNode{};
+	compactNode.min = nodeMin;
+	compactNode.max = nodeMax;
 	flatNodes.push_back(compactNode);
 
-	if (buildNode.children[0] == UINT32_MAX && buildNode.children[1] == UINT32_MAX) {
-
-		uint32_t count = buildNode.endIndex - buildNode.startIndex + 1;
-
-		flatNodes[myFlatIndex].triCount = count;
-		flatNodes[myFlatIndex].startIndex = buildNode.startIndex;
-
+	if (child0 == UINT32_MAX && child1 == UINT32_MAX) {
+		flatNodes[myFlatIndex].triCount = static_cast<uint16_t>(endIndex - startIndex + 1);
+		flatNodes[myFlatIndex].startIndex = startIndex;
 	}
 	else {
 		flatNodes[myFlatIndex].triCount = 0;
+		flatNodes[myFlatIndex].axis = axis;
 
-		flattenBVH(buildNode.children[0], buildNodes, flatNodes);
-		flattenBVH(buildNode.children[1], buildNodes, flatNodes);
-
-		flatNodes[myFlatIndex].missLink = static_cast<uint32_t>(flatNodes.size());
+		// First child sits immediately after this node; only the second is linked.
+		flattenBVH(child0, buildNodes, flatNodes);
+		uint32_t secondChild = flattenBVH(child1, buildNodes, flatNodes);
+		flatNodes[myFlatIndex].secondChild = secondChild;
 	}
+
+	return myFlatIndex;
 }
 
-void PathTracer::traverseFlatBVH(PathRay& ray, PathRayState& rayState, float& closestT, const std::vector<Tri>& tris, const std::vector<CompactBVH>& flatBVH) {
+void PathTracer::traverseFlatBVH(PathRay& ray, PathRayState& rayState, float& closestT, const std::vector<TriIntersect>& triIsect, const std::vector<CompactBVH>& flatBVH) {
 
-	uint32_t idx = 0;
-	uint32_t nodeCount = static_cast<uint32_t>(flatBVH.size());
+	if (flatBVH.empty()) return;
 
-	if (nodeCount == 0) return;
+	// Visit the child on the same side as the ray direction first: closestT
+	// shrinks sooner, so more of the far sub-tree fails the slab test outright.
+	const bool dirIsNeg[3] = {
+		ray.invDir.x < 0.0f,
+		ray.invDir.y < 0.0f,
+		ray.invDir.z < 0.0f
+	};
 
-	while (idx < nodeCount) {
-		const CompactBVH& node = flatBVH[idx];
+	uint32_t stack[64];
+	int stackPtr = 0;
+	uint32_t current = 0;
 
-		if (!rayAABB(ray, node.min, node.max, closestT)) {
+	while (true) {
+		const CompactBVH& node = flatBVH[current];
 
+		if (rayAABB(ray, node.min, node.max, closestT)) {
 			if (node.triCount > 0) {
-				idx++;
-			}
-			else {
-				idx = node.missLink;
-			}
-			continue;
-		}
+				const uint32_t start = node.startIndex;
+				for (uint32_t i = 0; i < node.triCount; ++i) {
+					float t;
+					float hitU = 0.0f;
+					float hitV = 0.0f;
+					const TriIntersect& tri = triIsect[start + i];
 
-		if (node.triCount > 0) {
-
-			for (uint32_t i = 0; i < node.triCount; ++i) {
-
-				float t;
-				float hitU = 0.0f;
-				float hitV = 0.0f;
-				const Tri& tri = tris[node.startIndex + i];
-
-				if (RayIntersectsTriangle(ray, tri, t, hitU, hitV)) {
-					if (t < closestT) {
+					if (RayIntersectsTriangle(ray, tri, t, hitU, hitV) && t < closestT) {
 						closestT = t;
 						rayState.hit = true;
 						rayState.hitPos = ray.src + ray.dir * t;
@@ -330,13 +316,24 @@ void PathTracer::traverseFlatBVH(PathRay& ray, PathRayState& rayState, float& cl
 						rayState.hitV = hitV;
 					}
 				}
+
+				if (stackPtr == 0) break;
+				current = stack[--stackPtr];
 			}
-
-			idx++;
-
+			else {
+				if (dirIsNeg[node.axis]) {
+					stack[stackPtr++] = current + 1;
+					current = node.secondChild;
+				}
+				else {
+					stack[stackPtr++] = node.secondChild;
+					current = current + 1;
+				}
+			}
 		}
 		else {
-			idx++;
+			if (stackPtr == 0) break;
+			current = stack[--stackPtr];
 		}
 	}
 }
@@ -541,9 +538,7 @@ glm::vec3 hdriLogic(PathRay& ray, Params& params, const RenderEnvironment& envir
 //		//}
 //}
 
-std::vector<DebugRay> PathTracer::rayLogic(PathRay& ray, PathRayState& rayState, const std::vector<Tri>& tris, const std::vector<PBRMaterial>& materials, const std::vector<CompactBVH>& flatBVH, Params& params, const RenderEnvironment& environment, RenderRng& rng, bool debug) {
-
-	std::vector<DebugRay> localDebugRays;
+void PathTracer::rayLogic(PathRay& ray, PathRayState& rayState, const std::vector<Tri>& tris, const std::vector<TriIntersect>& triIsect, const std::vector<PBRMaterial>& materials, const std::vector<CompactBVH>& flatBVH, Params& params, const RenderEnvironment& environment, RenderRng& rng, std::vector<DebugRay>* debugOut) {
 
 	for (int bounce = 0; bounce <= params.maxBounces; bounce++) {
 		if (!rayState.active) {
@@ -555,15 +550,15 @@ std::vector<DebugRay> PathTracer::rayLogic(PathRay& ray, PathRayState& rayState,
 		rayState.hit = false;
 		rayState.triIdx = UINT32_MAX;
 
-		traverseFlatBVH(ray, rayState, closestT, tris, flatBVH);
+		traverseFlatBVH(ray, rayState, closestT, triIsect, flatBVH);
 
-		if (debug) {
+		if (debugOut) {
 			float drawLength = closestT;
 			if (closestT == FLT_MAX) {
 				drawLength = 1000.0f;
 			}
 
-			localDebugRays.push_back({ ray.src, ray.dir, rayState.throughput, drawLength });
+			debugOut->push_back({ ray.src, ray.dir, rayState.throughput, drawLength });
 		}
 
 		if (rayState.isVolume && rayState.triIdx != UINT32_MAX) {
@@ -659,10 +654,24 @@ std::vector<DebugRay> PathTracer::rayLogic(PathRay& ray, PathRayState& rayState,
 			break;
 		}
 
+		// Russian roulette: once a few bounces deep, kill the path with a
+		// probability tied to its remaining energy and reweight the survivors.
+		// This is unbiased (E[contribution] unchanged) but cuts average depth.
+		if (params.russianRoulette && bounce >= params.rrMinBounces && rayState.active) {
+			float pSurvive = glm::clamp(
+				glm::max(rayState.throughput.x, glm::max(rayState.throughput.y, rayState.throughput.z)),
+				0.05f, 1.0f);
+
+			if (rng.nextFloat01() > pSurvive) {
+				rayState.active = false;
+				break;
+			}
+
+			rayState.throughput /= pSurvive;
+		}
+
 		ray.invDir = 1.0f / ray.dir;
 	}
-
-	return localDebugRays;
 }
 
 void PathTracer::generatePixelRay(uint32_t pixelIndex, PathRay& ray, PathRayState& rayState, const PTCam& myCam, const Screen& screen, const Params& params, RenderRng& rng) {

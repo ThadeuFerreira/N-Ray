@@ -19,6 +19,10 @@ void UI::drawRenderSettings(Params& params, const LayoutSizes& sizes) {
 		markRenderDirty(params);
 	}
 
+	if (buttonHelper("Russian Roulette", "Probabilistically terminate low-energy paths (unbiased, faster)", sizes.button, params.russianRoulette)) {
+		markRenderDirty(params);
+	}
+
 	if (sliderHelper("Worker Threads", "CPU render threads. 0 reserves one hardware thread for the UI", sizes.slider, params.renderWorkerThreads, 0, 64)) {
 		markRenderDirty(params);
 	}

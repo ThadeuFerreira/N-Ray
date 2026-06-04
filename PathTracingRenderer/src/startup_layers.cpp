@@ -57,6 +57,14 @@ void initializeRenderLayer() {
 		data.models[data.tris[i].modelIdx].tris.push_back(uint32_t(i));
 	}
 
+	// Build the cache-friendly intersection mirror once geometry is final and
+	// indices are assigned. BVH traversal reads this instead of the fat Tri.
+	data.triIsect.resize(data.tris.size());
+	for (size_t i = 0; i < data.tris.size(); i++) {
+		const Tri& t = data.tris[i];
+		data.triIsect[i] = { t.a, t.eA, t.eB, t.idx, t.doubleSided ? 1u : 0u };
+	}
+
 	std::cout << data.models.size();
 
 	cam3D.position = { myCam.camPos.x, myCam.camPos.y, myCam.camPos.z };

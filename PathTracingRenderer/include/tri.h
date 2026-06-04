@@ -2,8 +2,19 @@
 #include <cstdint>
 #include <glm/glm.hpp>
 
+// Cache-friendly intersection record, kept in a parallel array to `data.tris`.
+// BVH traversal touches only this (44 bytes) instead of the ~160-byte fat `Tri`;
+// the full triangle (normals, material) is read once, on the final hit, via `idx`.
+struct TriIntersect {
+	glm::vec3 a;
+	glm::vec3 eA;
+	glm::vec3 eB;
+	uint32_t idx;
+	uint32_t doubleSided;
+};
+
 struct Tri {
-	glm::vec3 a; 
+	glm::vec3 a;
 	glm::vec3 b;
 	glm::vec3 c;
 	glm::vec3 aN;

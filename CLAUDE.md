@@ -4,60 +4,82 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-N-Ray is a CPU path tracing renderer (educational project). It uses **raylib** for windowing/input/texture display, **Dear ImGui** (via rlImGui) for the UI, **glm** for math, and **OpenMP** for multithreading. Rendering is progressive: samples accumulate over frames until the camera moves.
+N-Ray is a CPU path tracing renderer (educational project). It uses **raylib** for windowing/input/texture display, **Dear ImGui** (via rlImGui) for the UI, **glm** for math, and **OpenMP** for multithreading. Rendering is progressive and runs on a **background worker thread**: samples accumulate until the camera moves or a render setting changes. The long-term goal is a Vulkan GPU port — the CPU path has been optimized as far as it reasonably goes (see **Performance** below).
 
 ## Build & Run
 
 Requires a C++20 compiler, `premake5`, OpenMP, and raylib. Builds with AVX2 (`-mavx2`).
 
 ```bash
-make                  # build Release: vendored raylib -> premake gmake2 -> compile
-make CONFIG=debug_x64 # debug build (symbols, no optimization)
-make run              # build, then run from PathTracingRenderer/ (assets resolve there)
-make raylib           # (re)build vendor/raylib/src/libraylib.a only
-make generate         # regenerate build/ project files only
-make clean            # rm -rf build bin obj (keeps the raylib lib)
-make distclean        # also clean the vendored raylib objects/lib
+make                   # build Release: vendored raylib -> premake gmake2 -> compile
+make CONFIG=debug_x64  # debug build (symbols, no optimization)
+make build-performance # Performance config: -O3 -march=native -ffast-math -flto
+make run               # build Release, then run from PathTracingRenderer/ (assets resolve there)
+make run-performance   # build + run the Performance binary
+make raylib            # (re)build vendor/raylib/src/libraylib.a only
+make generate          # regenerate build/ project files only
+make clean             # rm -rf build bin obj (keeps the raylib lib)
+make distclean         # also clean the vendored raylib objects/lib
 ```
 
-The root `Makefile` is a hand-written wrapper. `premake5.lua` sets `location "build"`, so `premake5 gmake2` generates the workspace makefiles **under `build/`** (not the repo root — don't remove `location` or premake will clobber the wrapper `Makefile`). The compiled binary lands at `bin/<Config>/PathTracingRenderer`. On Windows, open `PathTracingRenderer.sln` in VS2022 (x64). `premake5.lua` is the source of truth for project config (sources, include dirs, per-platform links/flags) — edit it, not the generated files.
+`premake5.lua` defines three configurations: **Debug**, **Release**, **Performance**. The root `Makefile` is a hand-written wrapper. `premake5.lua` sets `location "build"`, so `premake5 gmake2` generates the workspace makefiles **under `build/`** (not the repo root — don't remove `location` or premake will clobber the wrapper `Makefile`). The compiled binary lands at `bin/<Config>/PathTracingRenderer`. On Windows, open `PathTracingRenderer.sln` in VS2022 (x64). `premake5.lua` is the source of truth for project config (sources, include dirs, per-platform links/flags) — edit it, not the generated files.
 
-**raylib on Linux is built from the vendored source** at `vendor/raylib/` (there is no system raylib and the headers under `PathTracingRenderer/external/raylib/` ship without a compiled library). The wrapper `make` builds `vendor/raylib/src/libraylib.a` via raylib's own Makefile; `premake5.lua` adds `vendor/raylib/src` to `includedirs` (ahead of the bundled headers, so versions match) and `libdirs`. **`vendor/raylib/src/config.h` must have `SUPPORT_FILEFORMAT_HDR 1`** — raylib disables HDR loading by default, and the renderer hard-depends on loading `textures/HDRI.hdr`. If the lib is built without it, `LoadImage` returns an empty image; the renderer now falls back to the procedural sky (`hdriLogic` guards against a null/zero-size image) instead of crashing, but the HDRI won't appear.
+**raylib on Linux is built from the vendored source** at `vendor/raylib/` (there is no system raylib and the headers under `PathTracingRenderer/external/raylib/` ship without a compiled library). The wrapper `make` builds `vendor/raylib/src/libraylib.a` via raylib's own Makefile; `premake5.lua` adds `vendor/raylib/src` to `includedirs` (ahead of the bundled headers, so versions match) and `libdirs`. **`vendor/raylib/src/config.h` must have `SUPPORT_FILEFORMAT_HDR 1`** — raylib disables HDR loading by default, and the renderer wants to load `textures/HDRI.hdr`. If the lib is built without it, `LoadImage` returns an empty image; the renderer falls back to the procedural sky (`hdriLogic`/`makeRenderEnvironment` guard against an invalid image) instead of crashing, but the HDRI won't appear.
 
-**Run from a directory containing `models/` and `textures/`** (use `make run`, or `cd PathTracingRenderer`). Asset paths are relative to the working directory (CWD), not the binary, and these assets live under `PathTracingRenderer/`. The default executable loads `models/scene.obj` and `textures/HDRI.hdr` at startup; a missing OBJ prints "Could not open file" and is skipped rather than aborting (e.g. `models/dragon.obj`, referenced in `main()` but not present). Note `SetTraceLogLevel(LOG_NONE)` suppresses raylib's own warnings, so asset-load failures are otherwise silent.
+**Run from a directory containing `models/` and `textures/`** (use `make run`, or `cd PathTracingRenderer`). Asset paths are relative to the working directory (CWD), not the binary, and these assets live under `PathTracingRenderer/`. The scene is composed in `loadSceneLayer()` as a series of `ObjImporter{...}` declarations; a missing OBJ prints "Could not open file" and is skipped rather than aborting (e.g. `models/dragon.obj`, referenced but not present). Note `SetTraceLogLevel(LOG_NONE)` suppresses raylib's own warnings, so asset-load failures are otherwise silent.
 
-There are **no automated tests** — verification is manual (run the renderer, move the camera, use the debug ray / stats panel). See README.md for controls (WASD + RMB camera, LMB debug ray / model select / click-DoF).
+There are **no automated tests** — verification is manual (run the renderer, move the camera, use the debug ray / stats panel). For a quick headless throughput check, `src/renderer.cpp` can be compiled against a tiny standalone harness with no window (leave `RenderEnvironment` invalid to use the procedural sky). See README.md for controls (WASD + RMB camera, LMB debug ray / model select / click-DoF).
 
 ## Architecture
 
-Everything is driven from `src/Main.cpp`'s `main()` loop. Most subsystems are plain structs instantiated as **globals** there (`params`, `data`, `screen`, `pt`, `myCam`, `ui`, `mRayGen`) plus the two BVH arrays. Per-frame: handle input → update camera → `pt.render(...)` (when `params.render`) → draw 3D rasterized preview or debug rays → ImGui UI.
+`src/Main.cpp` is a thin entry point: `configureApplication()` → `startupWindow()` → `loadSceneLayer()` → `initializeRenderLayer()` → `startupRuntimeLayer()` → `runMainLoop()` → shutdown. The code is split into small translation units rather than one monolith:
+
+- **`src/app_state.cpp`** — defines the globals (`params`, `data`, `screen`, `pt`, `myCam`, `ui`, `mRayGen`, `cam3D`, plus `globalBVH`/`globalCompactBVH`), declared `extern` in `include/app.h`. Also window lifecycle and the render-texture / `RenderEnvironment` helpers.
+- **`src/startup_layers.cpp`** — `loadSceneLayer` (hardcoded `ObjImporter{...}` scene), `initializeRenderLayer` (BVH build via `createFlatBVH` + `flattenBVH`, per-triangle index assignment, `triIsect` mirror build, camera init), `startupRuntimeLayer` (HDRI load, render texture, ImGui).
+- **`src/app_loop.cpp`** — `runMainLoop` and its per-frame helpers (UI hover state, render-target resize, sampling gate, viewport actions, driving the async worker, drawing).
+- **`src/render_worker.cpp` / `include/render_worker.h`** — the async render worker (below).
+- **`src/interaction.cpp`** — mouse-ray features. **`src/viewport_preview.cpp`** — raster preview.
+- UI is split across **`include/ui*.cpp`** (compiled via the `include/**.cpp` glob).
 
 **Central data flow** revolves around two structs in `include/globalParams.h`:
-- `Data` — owns all scene/render buffers: `tris`, `models`, the per-pixel `rays`/`rayStates`, the `frameBuffer` (8-bit RGBA shown on screen) and `accumBuffer` (float HDR accumulation).
-- `Params` — all tunable render settings (resolution `res`, `maxBounces`, `maxSamples`, sky/sun, exposure, contrast) and frame flags. **`shouldSample`** gates accumulation: it's set false when the camera moves so the image restarts; `currentSample` counts accumulated samples toward `maxSamples`.
+- `Data` — `tris` (the fat `Tri`), `triIsect` (compact intersection mirror), `materials` (`PBRMaterial`), `models` (`PTModel`), the `frameBuffer` (8-bit RGBA shown on screen) and `accumBuffer` (float HDR accumulation).
+- `Params` — all tunable render settings (`res`, `maxBounces`, `maxSamples`, `raysPerPixel`, sky/sun, exposure, contrast, `russianRoulette`/`rrMinBounces`, `renderWorkerThreads`, `renderPublishHz`) and the frame-gate flags. **`shouldSample`** gates accumulation; **`renderInvalidated`** forces a worker restart (camera/scene/setting change); **`displayInvalidated`** recomposes the existing accumulation buffer without re-tracing (exposure/contrast tweaks). `currentSample` counts accumulated samples toward `maxSamples`.
 
-**Geometry & materials (`include/tri.h`, `include/model.h`).** `Tri` is a "fat" struct: each triangle carries its full material (albedo, IOR, roughness, metalness, refraction, absorption, volume, emission, etc.) *and* precomputed geometry (normal, AABB min/max, center). A `PTModel` is a logical object that owns indices into `data.tris` and mirrors the material params; editing a material in the UI calls `PTModel::updateTris()` (`src/model.cpp`) to push values down to its triangles. `ObjImporter` (`include/objImporter.h`) is a constructor-as-loader: instantiating it parses an OBJ, creates one `PTModel`, and appends triangles — material is passed as constructor args, so **scene composition is hardcoded in `main()`** as a series of `ObjImporter{...}` declarations.
+**Geometry & materials (`include/tri.h`, `include/pbr_model.h`).** Materials are **not** baked into triangles anymore: `PBRMaterial` (albedo, IOR, roughness, metalness, refraction, absorption, volume, emission, etc.) lives in `data.materials`, and each `Tri` stores a `materialIdx` (plus `modelIdx`). `Tri` is still "fat" — it precomputes geometry (verts, vertex normals, edges `eA`/`eB`, face normal, AABB min/max, center). `TriIntersect` is a compact 44-byte parallel record (`a, eA, eB, idx, doubleSided`) that BVH traversal reads **instead of** the ~160-byte `Tri`; the fat `Tri` is only touched on the final hit (normals) and during shading (material lookup). `PTModel` owns triangle indices and a `materialIdx`; the UI edits `data.materials[...]` and calls `PTModel::updateTris` (`src/pbr_model.cpp`), which pushes `doubleSided` down to its triangles. `ObjImporter` (`include/objImporter.h`) is a constructor-as-loader: instantiating it appends one `PBRMaterial`, one `PTModel`, and the parsed triangles — so **scene composition is hardcoded in `loadSceneLayer`**.
 
-**Acceleration (`include/bvh.h`, BVH code in `src/renderer.cpp`).** Two representations:
-- `BVH` — recursive build node. Construction is in the constructor: compute AABB, split by the average centroid along the longest axis, partition `data.tris` in place via swaps, recurse. Build nodes accumulate into the global `globalBVH` vector (`createFlatBVH()` in Main.cpp).
-- `CompactBVH` — cache-friendly flattened node produced by `PathTracer::flattenBVH()` into `globalCompactBVH`. Traversal (`traverseFlatBVH`) is **stackless**: leaves store `startIndex`/`triCount`; interior nodes store a `missLink` to jump to on AABB miss (`startIndex` and `missLink` share a union).
+**Acceleration (`include/bvh.h`, code in `src/renderer.cpp`).** Two representations:
+- `BVH` — recursive build node. The constructor computes the AABB and splits via a **binned SAH** (`BVH_SAH_BINS`, 8) — for each axis it bins centroids, sweeps to find the lowest surface-area×count split, and partitions `data.tris` in place by swaps; it falls back to a median (`nth_element`) split along the longest extent when SAH finds no useful plane. Leaves hold up to `BVH_LEAF_TRIANGLE_COUNT` (6) triangles. The chosen `splitAxis` is recorded for ordered traversal. Build nodes accumulate into `globalBVH`.
+- `CompactBVH` — flattened node (PBRT layout) produced by `PathTracer::flattenBVH` into `globalCompactBVH`: the **first child sits immediately after the parent**, so only `secondChild` is linked; `axis` is stored. Leaves store `startIndex`/`triCount` (`startIndex` shares a `union` with `secondChild`).
+- `traverseFlatBVH` is **ordered + stack-based**: a small explicit stack, visiting the near child first (chosen by `ray.invDir` sign vs. `node.axis`) so `closestT` shrinks quickly and far sub-trees fail the box test. `rayAABB` is a **branchless slab test using the precomputed `ray.invDir`** (no per-node divides).
 
-Both `globalBVH` and `globalCompactBVH` are `extern` globals (declared in `bvh.h`, defined in `Main.cpp`) and referenced directly inside `renderer.cpp` rather than passed everywhere.
+Both `globalBVH` and `globalCompactBVH` are `extern` globals (declared in `bvh.h`, defined in `app_state.cpp`).
 
-**Path tracing core (`src/renderer.cpp`, `include/renderer.h`).** `PathTracer::render` runs `raysPerPixel` passes per frame; each pass:
-1. `rayGeneration` — OpenMP `parallel for collapse(2)` over the pixel grid; builds a physically-based camera ray per pixel with sub-pixel jitter (anti-aliasing) and aperture disk sampling (depth of field).
-2. `rayLogic` per ray — OpenMP `parallel for`; the bounce loop traverses the BVH, then branches by material: cosine-weighted `diffuseLighting`, GGX microfacet `specularLighting` (Fresnel-Schlick, metalness-aware), `refractionLighting` (Snell + total internal reflection + Beer's-law absorption via `throughput`), and homogeneous-medium volume scattering. Emission adds `throughput * emissionCol`. Rays that escape sample the environment via `hdriLogic` (equirectangular HDRI lookup); `sky()` is an alternative procedural environment (currently commented out at the call site).
-3. Accumulate each ray's `col` into `accumBuffer`.
+**Async rendering (`src/render_worker.cpp`).** Path tracing runs on a background `std::thread` (`AsyncRenderWorker`), not in the main loop. `start()` snapshots params/camera/screen/environment/scene/BVH into a `RenderWorkload` (copies `tris`, `triIsect`, `materials`, `flatBVH`) and launches `run()`. `run()` loops samples until `maxSamples` or cancel; each sample is an OpenMP `parallel for schedule(dynamic, 1024)` over pixels — per pixel: `makeRenderRng` (seeded deterministically by pixel/sample/ray), `generatePixelRay`, `rayLogic`, accumulate into `accumBuffer`. Finished frames are composed (`composeRenderFrame`: divide by sample count, exposure, S-curve contrast, gamma 2.2) and published under a mutex via a double-buffered `swap`; the main thread polls `consumeFrame` and `UpdateTexture`. Stats (rays/sec, ms/sample, published frames) are atomics read each frame. `renderInvalidated` cancels and restarts the worker; `displayInvalidated` recomposes the existing accum buffer without re-tracing.
 
-`drawScreen` then divides the accumulator by sample count, applies exposure, an S-curve contrast (`contrastSCurve`), and gamma 2.2, writes the `frameBuffer`, and blits it via a raylib texture.
+**Path tracing core (`src/renderer.cpp`, `include/renderer.h`).** `rayLogic` runs the bounce loop per ray: traverse the BVH, then branch by material — cosine-weighted `diffuseLighting`, GGX microfacet `specularLighting` (Fresnel-Schlick, metalness-aware), `refractionLighting` (Snell + total internal reflection + Beer's-law absorption via `throughput`), and homogeneous-medium volume scattering. Emission adds `throughput * emissionCol`. After `rrMinBounces`, **Russian roulette** probabilistically terminates low-energy paths and reweights the survivors by `1/p` (unbiased — converges to the same image; toggle via `params.russianRoulette`). Rays that escape sample the environment via `hdriLogic` (equirectangular HDRI lookup; falls back to procedural `sky()` when the HDRI is missing). `rayLogic` takes an optional `std::vector<DebugRay>*` — non-null **only** for the debug-ray tool, so the render path allocates nothing per ray.
 
-**Interaction (`include/mouseRay.h`).** `MouseRay::mouseRay` reconstructs a primary ray through the cursor, reused for three features in Main.cpp: debug ray visualization (`traceDebugRay`, draws the bounce path as cylinders), click-to-select model (`selectModel`), and click-to-focus DoF (`setDofDist`).
+**Interaction (`include/mouseRay.h`, `src/interaction.cpp`).** `MouseRay::mouseRay` reconstructs a primary ray through the cursor, reused for three features: debug ray visualization (`traceDebugRay`, draws the bounce path as cylinders), click-to-select model (`selectModel`), and click-to-focus DoF (`setDofDist`).
 
-**Rendering vs. preview.** When `params.render` is false, `main()` draws the scene as a fast flat-shaded rasterized preview with raw `rlgl` triangles instead of path tracing — useful for navigating before committing to a render.
+**Rendering vs. preview.** When `params.render` is false, `drawRasterPreview` (`viewport_preview.cpp`) draws the scene as a fast flat-shaded rasterized preview with raw `rlgl` triangles instead of path tracing — useful for navigating before committing to a render.
+
+## Performance (CPU path)
+
+The CPU renderer has been optimized as the **final CPU pass** before the planned Vulkan port — measured at ~2.8–3.2× over the previous version (and bit-identical output for the non-RR optimizations). Key hot-path choices, all in `renderer.cpp` / `bvh.h`:
+
+- **Branchless `rayAABB`** using the precomputed `ray.invDir` — no per-node divisions. Keep `ray.invDir` updated after every direction change (`generatePixelRay`, end of the bounce loop, volume scatter).
+- **Compact `TriIntersect` mirror** so traversal streams 44 B/triangle instead of the ~160 B fat `Tri`.
+- **Ordered (near-child-first) stack traversal** over the SAH-built tree.
+- **OpenMP `schedule(dynamic, 1024)`** to balance wildly uneven per-pixel cost (glass/volume vs. background).
+- **Russian roulette** (unbiased) to cut average path length.
+
+When extending the hot path, keep `TriIntersect` small and avoid per-ray heap allocation.
 
 ## Conventions & gotchas
 
-- `include/ui.cpp` lives in `include/` (not `src/`) but is compiled — `premake5.lua` globs `include/**.cpp`. Keep that glob in mind when adding files.
+- `include/*.cpp` files (UI + widgets) **are compiled** — `premake5.lua` globs `include/**.cpp`. Keep that in mind when adding files.
+- Globals are defined once in `src/app_state.cpp` and declared `extern` in `include/app.h`.
 - `PI` comes from raylib (`raylib.h`), not a project header.
 - Coordinate convention is **Z-up** (world up is `{0,0,1}`).
-- New material parameters must be threaded through several places in lockstep: `Tri`, `PTModel` (+ its constructor and `updateTris`), `ObjImporter`'s constructor/argument list, the `ObjImporter{...}` calls in `main()`, and the UI in `ui.cpp`.
+- `data.triIsect` mirrors `data.tris` geometry and is built once in `initializeRenderLayer` after triangle indices are assigned. It stays valid because geometry and `doubleSided` never change at runtime. **If you ever mutate triangle positions or `doubleSided` at runtime, rebuild `triIsect` (and the BVH).**
+- A new material parameter must be threaded through several places in lockstep: `PBRMaterial`, `ObjImporter`'s constructor/argument list and the `ObjImporter{...}` calls in `loadSceneLayer`, `PTModel::updateTris` (if it affects triangles), and the UI (`ui_scene_settings.cpp` + `UI::SelectedMaterialState`).
+- The render path runs on a worker thread; per-pixel RNG is seeded deterministically (`makeRenderRng`), so frames are reproducible regardless of thread scheduling.

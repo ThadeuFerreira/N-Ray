@@ -29,6 +29,7 @@ struct BVH {
 	uint32_t startIndex = 0;
 	uint32_t endIndex = 0;
 	uint32_t next = 0;
+	uint8_t splitAxis = 0;
 
 	BVH(uint32_t startIndex, uint32_t endIndex, std::vector<Tri>& tris, std::vector<BVH>& globalBVH) :
 		startIndex(startIndex), endIndex(endIndex) {
@@ -183,6 +184,17 @@ struct BVH {
 
 		uint32_t aIdx = startIndex;
 
+		// Record the axis we split on so the flattened tree can order traversal.
+		if (bestAxis >= 0) {
+			splitAxis = static_cast<uint8_t>(bestAxis);
+		}
+		else {
+			int axis = 0;
+			if (extent.y > extent.x) axis = 1;
+			if (extent.z > extent[axis]) axis = 2;
+			splitAxis = static_cast<uint8_t>(axis);
+		}
+
 		if (bestAxis >= 0) {
 			float centroidMin = std::numeric_limits<float>::max();
 			float centroidMax = std::numeric_limits<float>::lowest();
@@ -257,14 +269,20 @@ struct BVH {
 	}
 };
 
+// Flattened node for ordered front-to-back traversal (PBRT layout). The first
+// child of an interior node is stored immediately after it, so only the right
+// child needs an explicit link. `axis` lets traversal visit the near child
+// first, shrinking `closestT` faster and pruning more sub-trees.
 struct CompactBVH {
 	glm::vec3 min;
 	glm::vec3 max;
 
 	union {
-		uint32_t startIndex;
-		uint32_t missLink;
+		uint32_t startIndex;   // leaf: first triangle in triIsect
+		uint32_t secondChild;  // interior: index of the right child
 	};
 
-	uint32_t triCount;
+	uint16_t triCount;         // 0 => interior node
+	uint8_t axis;              // interior: split axis (0/1/2) for ordered traversal
+	uint8_t pad;
 };

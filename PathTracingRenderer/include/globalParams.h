@@ -8,6 +8,7 @@
 
 struct Data {
 	std::vector<Tri> tris;
+	std::vector<TriIntersect> triIsect;
 	std::vector<Tri> emTris;
 	std::vector<PBRMaterial> materials;
 	std::vector<RenderPixel> frameBuffer;
@@ -26,6 +27,12 @@ struct Params {
 	int maxSamples = 50000;
 	int raysPerPixel = 1;
 	int currentSample = 0;
+
+	// Russian roulette: probabilistically terminate low-energy paths after a few
+	// bounces. Unbiased (surviving paths are reweighted by 1/p), so the converged
+	// image is unchanged while average path length drops.
+	bool russianRoulette = true;
+	int rrMinBounces = 3;
 	bool enableSky = true;
 	float skyIntensity = 0.75f;
 	float blur = 1.0f;

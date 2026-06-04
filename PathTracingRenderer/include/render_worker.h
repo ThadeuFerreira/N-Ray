@@ -17,6 +17,7 @@ struct RenderWorkload {
 	Screen screen;
 	RenderEnvironment environment;
 	std::vector<Tri> tris;
+	std::vector<TriIntersect> triIsect;
 	std::vector<PBRMaterial> materials;
 	std::vector<CompactBVH> flatBVH;
 };

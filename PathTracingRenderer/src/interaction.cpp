@@ -21,7 +21,8 @@ void traceDebugRay(const RenderEnvironment& environment) {
 		PathRayState mRayState = mRayGen.mouseRayState();
 		RenderRng rng = makeRenderRng(0, static_cast<uint32_t>(params.currentSample), 0);
 
-		debugRays = pt.rayLogic(mRay, mRayState, data.tris, data.materials, globalCompactBVH, params, environment, rng, true);
+		debugRays.clear();
+		pt.rayLogic(mRay, mRayState, data.tris, data.triIsect, data.materials, globalCompactBVH, params, environment, rng, &debugRays);
 	}
 
 	for (size_t i = 0; i < debugRays.size(); i++) {
@@ -53,7 +54,7 @@ void setDofDist() {
 	dofRayState.hit = false;
 	dofRayState.triIdx = UINT32_MAX;
 
-	pt.traverseFlatBVH(dofRay, dofRayState, closestT, data.tris, globalCompactBVH);
+	pt.traverseFlatBVH(dofRay, dofRayState, closestT, data.triIsect, globalCompactBVH);
 
 	if (!dofRayState.hit) {
 		myCam.focusDist = closestT;
@@ -72,7 +73,7 @@ void selectModel() {
 		selecRayState.hit = false;
 		selecRayState.triIdx = UINT32_MAX;
 
-		pt.traverseFlatBVH(selecRay, selecRayState, closestT, data.tris, globalCompactBVH);
+		pt.traverseFlatBVH(selecRay, selecRayState, closestT, data.triIsect, globalCompactBVH);
 
 		for (size_t i = 0; i < data.models.size(); i++) {
 			data.models[i].selected = false;

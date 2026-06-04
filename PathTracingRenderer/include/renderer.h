@@ -51,7 +51,7 @@ RenderRng makeRenderRng(uint32_t pixelIndex, uint32_t sampleIndex, uint32_t rayI
 
 struct PathTracer {
 
-	bool RayIntersectsTriangle(PathRay& ray, const Tri& tri, float& t, float& hitU, float& hitV);
+	bool RayIntersectsTriangle(PathRay& ray, const TriIntersect& tri, float& t, float& hitU, float& hitV);
 
 	bool rayAABB(const PathRay& ray, const glm::vec3& boxMin, const glm::vec3& boxMax, float maxT);
 
@@ -65,9 +65,9 @@ struct PathTracer {
 
 	void refractionLighting(PathRay& ray, PathRayState& rayState, glm::vec3 normal, const std::vector<Tri>& tris, const std::vector<PBRMaterial>& materials);
 
-	void flattenBVH(uint32_t buildNodeIdx, const std::vector<BVH>& buildNodes, std::vector<CompactBVH>& flatNodes);
+	uint32_t flattenBVH(uint32_t buildNodeIdx, const std::vector<BVH>& buildNodes, std::vector<CompactBVH>& flatNodes);
 
-	void traverseFlatBVH(PathRay& ray, PathRayState& rayState, float& closestT, const std::vector<Tri>& tris, const std::vector<CompactBVH>& flatBVH);
+	void traverseFlatBVH(PathRay& ray, PathRayState& rayState, float& closestT, const std::vector<TriIntersect>& triIsect, const std::vector<CompactBVH>& flatBVH);
 
 	void directLight(PathRay& ray, glm::vec3 normal, std::vector<Tri>& tris, Params& params);
 
@@ -75,7 +75,7 @@ struct PathTracer {
 
 	void sampleSun(PathRay& ray, std::vector<Tri>& tris, Params& params, bool& isShadow); // CURRENTLY UNUSED
 
-	std::vector<DebugRay> rayLogic(PathRay& ray, PathRayState& rayState, const std::vector<Tri>& tris, const std::vector<PBRMaterial>& materials, const std::vector<CompactBVH>& flatBVH, Params& params, const RenderEnvironment& environment, RenderRng& rng, bool debug = false);
+	void rayLogic(PathRay& ray, PathRayState& rayState, const std::vector<Tri>& tris, const std::vector<TriIntersect>& triIsect, const std::vector<PBRMaterial>& materials, const std::vector<CompactBVH>& flatBVH, Params& params, const RenderEnvironment& environment, RenderRng& rng, std::vector<DebugRay>* debugOut = nullptr);
 
 	void generatePixelRay(uint32_t pixelIndex, PathRay& ray, PathRayState& rayState, const PTCam& myCam, const Screen& screen, const Params& params, RenderRng& rng);
 

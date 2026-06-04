@@ -53,6 +53,7 @@ void AsyncRenderWorker::start(const Params& sourceParams, const Data& sourceData
 		sourceScreen,
 		sourceEnvironment,
 		sourceData.tris,
+		sourceData.triIsect,
 		sourceData.materials,
 		sourceFlatBVH
 	};
@@ -217,6 +218,7 @@ void AsyncRenderWorker::run(RenderWorkload workload) {
 	const size_t pixelCount = static_cast<size_t>(workerScreen.resX) * static_cast<size_t>(workerScreen.resY);
 	const uint64_t raysPerSample = static_cast<uint64_t>(pixelCount) * static_cast<uint64_t>(workerParams.raysPerPixel);
 	workerData.tris = std::move(workload.tris);
+	workerData.triIsect = std::move(workload.triIsect);
 	workerData.materials = std::move(workload.materials);
 	workerData.frameBuffer.resize(pixelCount);
 	workerData.accumBuffer.resize(pixelCount, glm::vec3(0.0f));
@@ -227,13 +229,16 @@ void AsyncRenderWorker::run(RenderWorkload workload) {
 
 	while (!cancelRequested.load() && workerParams.currentSample < workerParams.maxSamples) {
 		for (int rays = 0; rays < workerParams.raysPerPixel && !cancelRequested.load(); rays++) {
-#pragma omp parallel for schedule(static) num_threads(workerThreadCount)
+			// Per-pixel cost varies wildly (glass/volume paths vs. background), so
+			// dynamic scheduling keeps every worker thread busy instead of letting
+			// one straggler with the expensive pixels stall the whole sample.
+#pragma omp parallel for schedule(dynamic, 1024) num_threads(workerThreadCount)
 			for (int i = 0; i < static_cast<int>(workerData.accumBuffer.size()); i++) {
 				PathRay ray;
 				PathRayState rayState;
 				RenderRng rng = makeRenderRng(static_cast<uint32_t>(i), static_cast<uint32_t>(workerParams.currentSample), static_cast<uint32_t>(rays));
 				workerTracer.generatePixelRay(static_cast<uint32_t>(i), ray, rayState, workerCamera, workerScreen, workerParams, rng);
-				workerTracer.rayLogic(ray, rayState, workerData.tris, workerData.materials, flatBVH, workerParams, workerEnvironment, rng);
+				workerTracer.rayLogic(ray, rayState, workerData.tris, workerData.triIsect, workerData.materials, flatBVH, workerParams, workerEnvironment, rng);
 				workerData.accumBuffer[i] += rayState.col;
 			}
 		}

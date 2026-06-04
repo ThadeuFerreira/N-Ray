@@ -1,3 +1,15 @@
 [submodule "vendor/raylib"]
 	path = vendor/raylib
 	url = https://github.com/raysan5/raylib.git
+[submodule "vendor/volk"]
+	path = vendor/volk
+	url = https://github.com/zeux/volk.git
+[submodule "vendor/VulkanMemoryAllocator"]
+	path = vendor/VulkanMemoryAllocator
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
+[submodule "vendor/glm"]
+	path = vendor/glm
+	url = https://github.com/g-truc/glm.git
+[submodule "vendor/slang"]
+	path = vendor/slang
+	url = https://github.com/shader-slang/slang.git
