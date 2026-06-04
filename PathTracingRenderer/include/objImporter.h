@@ -3,7 +3,7 @@
 #include <fstream>
 #include <sstream>
 #include <memory>
-#include <model.h>
+#include <pbr_model.h>
 
 struct ObjImporter {
 
@@ -39,19 +39,39 @@ struct ObjImporter {
 
 		std::string line;
 
+		uint32_t materialIdx = uint32_t(data.materials.size());
+		uint32_t modelIdx = uint32_t(data.models.size());
+
+		data.materials.push_back({
+			albedo,
+			specularCol,
+			emissionCol,
+			absorptionCol,
+			volumeCol,
+			IOR,
+			roughness,
+			emissionIntensity,
+			refraction,
+			absorption,
+			volume,
+			density,
+			metalness
+		});
+
 		data.models.push_back({
-					albedo, specularCol, emissionCol, absorptionCol, volumeCol,
-					IOR,
-					roughness,
-					emissionIntensity,
-					refraction,
-					absorption,
-					volume,
-					density,
-					metalness,
-					doubleSided,
-					uint32_t(data.models.size())
-			});
+			albedo, specularCol, emissionCol, absorptionCol, volumeCol,
+			IOR,
+			roughness,
+			emissionIntensity,
+			refraction,
+			absorption,
+			volume,
+			density,
+			metalness,
+			doubleSided,
+			modelIdx,
+			materialIdx
+		});
 
 		while (std::getline(file, line)) {
 			std::stringstream ss(line);
@@ -143,12 +163,6 @@ struct ObjImporter {
 						cN = normals[nC];
 
 					data.tris.push_back({
-						albedo,
-						specularCol,
-						emissionCol,
-						absorptionCol,
-						volumeCol,
-
 						vertices[iA] * sceneScale,
 						vertices[iB] * sceneScale,
 						vertices[iC] * sceneScale,
@@ -157,18 +171,12 @@ struct ObjImporter {
 						bN,
 						cN,
 
-						IOR,
-						roughness,
-						emissionIntensity,
-						refraction,
-						absorption,
-						volume,
-						density,
-						metalness,
+						materialIdx,
+						modelIdx,
 						doubleSided
 						});
 
-					data.tris.back().modelIdx = uint32_t(data.models.size() - 1);
+					data.tris.back().modelIdx = modelIdx;
 				}
 			}
 		}

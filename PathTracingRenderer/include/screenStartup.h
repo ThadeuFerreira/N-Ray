@@ -2,6 +2,7 @@
 
 #include <glm/glm.hpp>
 #include <raylib.h>
+#include <render_types.h>
 
 struct Screen {
 
@@ -17,7 +18,7 @@ struct Screen {
 		screenSizeX(screenSizeX), screenSizeY(screenSizeY) {
 	}
 
-	void initScreen(int& res, std::vector<Color>& framebuffer, std::vector<glm::vec3>& accumBuffer) {
+	void initScreen(int& res, std::vector<RenderPixel>& framebuffer, std::vector<glm::vec3>& accumBuffer) {
 
 		screenSizeX = float(GetScreenWidth());
 		screenSizeY = float(GetScreenHeight());

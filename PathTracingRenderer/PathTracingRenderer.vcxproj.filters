@@ -39,11 +39,53 @@
     <ClCompile Include="include\ui.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\model.cpp">
+    <ClCompile Include="include\ui_camera_settings.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="include\ui_debug_settings.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="include\ui_environment_settings.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="include\ui_render_settings.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="include\ui_scene_settings.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="include\ui_stats.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="include\ui_widgets.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\app_loop.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\app_state.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\interaction.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\pbr_model.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\render_worker.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\startup_layers.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\viewport_preview.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="include\app.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="include\screenStartup.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -65,6 +107,9 @@
     <ClInclude Include="include\objImporter.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="include\render_types.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="include\ui.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -77,7 +122,10 @@
     <ClInclude Include="include\scene.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="include\model.h">
+    <ClInclude Include="include\pbr_model.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="include\render_worker.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

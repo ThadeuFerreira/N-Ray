@@ -1,5 +1,5 @@
 workspace "NRay"
-    configurations { "Debug", "Release" }
+    configurations { "Debug", "Release", "Performance" }
     platforms { "x64" }
     -- Generate makefiles/project files under build/ so they don't clobber the
     -- hand-written wrapper Makefile at the repo root.
@@ -12,6 +12,10 @@ workspace "NRay"
     filter "configurations:Release"
         defines { "NDEBUG" }
         optimize "On"
+
+    filter "configurations:Performance"
+        defines { "NDEBUG", "NRAY_PERFORMANCE_BUILD" }
+        optimize "Full"
 
     filter "platforms:x64"
         architecture "x86_64"
@@ -57,13 +61,25 @@ project "PathTracingRenderer"
         libdirs { "PathTracingRenderer/external/raylib/Release" }
         buildoptions { "/openmp", "/arch:AVX2" }
 
+    filter { "system:windows", "configurations:Performance" }
+        buildoptions { "/O2", "/GL", "/fp:fast", "/arch:AVX2" }
+        linkoptions { "/LTCG" }
+
     filter "system:linux"
         links { "raylib", "GL", "m", "pthread", "dl", "rt", "X11" }
         libdirs { "vendor/raylib/src" }
         buildoptions { "-fopenmp", "-mavx2" }
         linkoptions { "-fopenmp" }
 
+    filter { "system:linux", "configurations:Performance" }
+        buildoptions { "-O3", "-march=native", "-ffast-math", "-flto" }
+        linkoptions { "-flto" }
+
     filter "system:macosx"
         links { "raylib", "OpenGL.framework", "Cocoa.framework", "IOKit.framework", "CoreVideo.framework", "CoreFoundation.framework" }
         buildoptions { "-Xpreprocessor -fopenmp", "-mavx2" }
         linkoptions { "-lomp" }
+
+    filter { "system:macosx", "configurations:Performance" }
+        buildoptions { "-O3", "-march=native", "-ffast-math", "-flto" }
+        linkoptions { "-flto" }

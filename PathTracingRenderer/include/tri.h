@@ -2,11 +2,6 @@
 #include <glm/glm.hpp>
 
 struct Tri {
-	glm::vec3 albedo;
-	glm::vec3 specularCol;
-	glm::vec3 emissionCol;
-	glm::vec3 absorptionCol;
-	glm::vec3 volumeCol;
 	glm::vec3 a; 
 	glm::vec3 b;
 	glm::vec3 c;
@@ -19,22 +14,21 @@ struct Tri {
 	glm::vec3 min;
 	glm::vec3 max;
 	glm::vec3 center;
-	float IOR;
-	float roughness;
-	float emissionIntensity;
-	float refraction;
-	float absorption;
-	float volume;
-	float density;
-	float metalness;
 	uint32_t idx;
+	uint32_t materialIdx;
 	bool doubleSided;
 	uint32_t modelIdx;
 
 	Tri(glm::vec3 albedo, glm::vec3 specularCol, glm::vec3 emissionCol, glm::vec3 absorptionCol, glm::vec3 volumeCol, glm::vec3 a, glm::vec3 b, glm::vec3 c, glm::vec3 aN, glm::vec3 bN, glm::vec3 cN,
 		float IOR, float roughness, float emissionIntensity, float refraction, float absorption, float volume, float density, float metalness, bool doubleSided)
-		: albedo(albedo), specularCol(specularCol), emissionCol(emissionCol), absorptionCol(absorptionCol), volumeCol(volumeCol), a(a), b(b), c(c), aN(aN), bN(bN), cN(cN), IOR(IOR),
-		roughness(roughness), emissionIntensity(emissionIntensity), refraction(refraction), absorption(absorption), volume(volume), density(density), metalness(metalness), doubleSided(doubleSided) {
+		: a(a), b(b), c(c), aN(aN), bN(bN), cN(cN), idx(0), materialIdx(0), doubleSided(doubleSided), modelIdx(0) {
+		calculateNormal();
+		calculateAABB();
+		calculateCenter();
+	}
+
+	Tri(glm::vec3 a, glm::vec3 b, glm::vec3 c, glm::vec3 aN, glm::vec3 bN, glm::vec3 cN, uint32_t materialIdx, uint32_t modelIdx, bool doubleSided)
+		: a(a), b(b), c(c), aN(aN), bN(bN), cN(cN), idx(0), materialIdx(materialIdx), doubleSided(doubleSided), modelIdx(modelIdx) {
 		calculateNormal();
 		calculateAABB();
 		calculateCenter();

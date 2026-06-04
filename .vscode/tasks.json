@@ -31,12 +31,37 @@
             "problemMatcher": "$gcc"
         },
         {
+            "label": "Build Performance Release",
+            "type": "shell",
+            "command": "make",
+            "args": [
+                "build-performance"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "build",
+            "problemMatcher": "$gcc"
+        },
+        {
             "label": "Run Debug",
             "type": "shell",
             "command": "make",
             "args": [
                 "CONFIG=debug_x64",
                 "run"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Run Performance Release",
+            "type": "shell",
+            "command": "make",
+            "args": [
+                "run-performance"
             ],
             "options": {
                 "cwd": "${workspaceFolder}"

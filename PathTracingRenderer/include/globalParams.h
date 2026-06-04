@@ -3,18 +3,14 @@
 #include <glm/glm.hpp>
 #include <raylib.h>
 #include <tri.h>
-
-
-struct PathRay;
-struct PathRayState;
-struct PTModel;
+#include <render_types.h>
+#include <pbr_model.h>
 
 struct Data {
 	std::vector<Tri> tris;
 	std::vector<Tri> emTris;
-	std::vector<PathRay> rays;
-	std::vector<PathRayState> rayStates;
-	std::vector<Color> frameBuffer;
+	std::vector<PBRMaterial> materials;
+	std::vector<RenderPixel> frameBuffer;
 	std::vector<glm::vec3> accumBuffer;
 	std::vector<PTModel> models;
 };
@@ -43,8 +39,18 @@ struct Params {
 	float sunAngle = 7.53f;
 	size_t emissiveAmount = 0;
 
-	float totalMs = 0.0f;
-	int totalFrames = 0;
+	bool renderStatsActive = false;
+	bool renderStatsComplete = false;
+	int renderStatsSample = 0;
+	unsigned long long renderStatsTotalRays = 0;
+	double renderStatsElapsedSec = 0.0;
+	double renderStatsRaysPerSec = 0.0;
+	double renderStatsMsPerSample = 0.0;
+	unsigned long long renderStatsPublishedFrames = 0;
+	double renderStatsPublishMs = 0.0;
+	double renderStatsSamplesPerSec = 0.0;
+	int renderWorkerThreads = 0;
+	int renderPublishHz = 30;
 
 	bool shouldSample = true;
 	bool enableSampling = true;

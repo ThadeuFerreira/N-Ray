@@ -2,6 +2,8 @@
 #
 #   make            # build Release (default)
 #   make CONFIG=debug_x64
+#   make build-performance # build Performance with aggressive CPU flags
+#   make run-performance   # build + run the Performance binary
 #   make raylib     # (re)build vendor/raylib/src/libraylib.a only
 #   make generate   # regenerate build/ project files only
 #   make run        # build + run from PathTracingRenderer/ (needs models/ + textures/)
@@ -10,9 +12,10 @@
 #
 # premake5.lua sets `location "build"`, so generated makefiles live under build/.
 
-.PHONY: all generate build raylib run clean distclean
+.PHONY: all generate build build-performance raylib run run-performance clean distclean
 
 CONFIG     ?= release_x64
+PERF_CONFIG := performance_x64
 RAYLIB_DIR := vendor/raylib/src
 RAYLIB_LIB := $(RAYLIB_DIR)/libraylib.a
 
@@ -36,8 +39,14 @@ generate:
 build: raylib generate
 	$(MAKE) -C build config=$(CONFIG)
 
+build-performance: raylib generate
+	$(MAKE) -C build config=$(PERF_CONFIG)
+
 run: build
 	cd PathTracingRenderer && ../bin/$(if $(findstring debug,$(CONFIG)),Debug,Release)/PathTracingRenderer
+
+run-performance: build-performance
+	cd PathTracingRenderer && ../bin/Performance/PathTracingRenderer
 
 clean:
 	rm -rf build bin obj

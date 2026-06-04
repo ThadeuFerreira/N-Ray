@@ -25,17 +25,33 @@
     <ClCompile Include="external\imgui\imgui_widgets.cpp" />
     <ClCompile Include="external\rlImGui\rlImGui.cpp" />
     <ClCompile Include="include\ui.cpp" />
-    <ClCompile Include="src\model.cpp" />
+    <ClCompile Include="include\ui_camera_settings.cpp" />
+    <ClCompile Include="include\ui_debug_settings.cpp" />
+    <ClCompile Include="include\ui_environment_settings.cpp" />
+    <ClCompile Include="include\ui_render_settings.cpp" />
+    <ClCompile Include="include\ui_scene_settings.cpp" />
+    <ClCompile Include="include\ui_stats.cpp" />
+    <ClCompile Include="include\ui_widgets.cpp" />
+    <ClCompile Include="src\app_loop.cpp" />
+    <ClCompile Include="src\app_state.cpp" />
+    <ClCompile Include="src\interaction.cpp" />
+    <ClCompile Include="src\pbr_model.cpp" />
+    <ClCompile Include="src\render_worker.cpp" />
     <ClCompile Include="src\renderer.cpp" />
+    <ClCompile Include="src\startup_layers.cpp" />
+    <ClCompile Include="src\viewport_preview.cpp" />
     <ClCompile Include="src\Main.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="include\app.h" />
     <ClInclude Include="include\bvh.h" />
     <ClInclude Include="include\camera.h" />
     <ClInclude Include="include\globalParams.h" />
-    <ClInclude Include="include\model.h" />
+    <ClInclude Include="include\pbr_model.h" />
     <ClInclude Include="include\mouseRay.h" />
     <ClInclude Include="include\objImporter.h" />
+    <ClInclude Include="include\render_types.h" />
+    <ClInclude Include="include\render_worker.h" />
     <ClInclude Include="include\renderer.h" />
     <ClInclude Include="include\saveSystem.h" />
     <ClInclude Include="include\scene.h" />
