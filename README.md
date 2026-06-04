@@ -1,6 +1,6 @@
-# Introduction
+# N-Ray
 
-## N-Ray is a path tracing renderer made for learning purposes by Narcis Calin
+N-Ray is a learning-focused CPU path tracing renderer by Narcis Calin. This fork keeps the current renderer on the CPU while preparing the dependency surface for a future Vulkan path. The app uses raylib for windowing/input/texture display, Dear ImGui through rlImGui for tools, GLM for math, and OpenMP for CPU parallelism.
 
 <img width="1907" height="1049" alt="nraygit1" src="https://github.com/user-attachments/assets/47c8204e-2707-4daa-8590-5df1636e7441" />
 
@@ -10,57 +10,110 @@
 
 <img width="640" height="720" alt="Git1GifPt" src="https://github.com/user-attachments/assets/b879ecbe-55df-41e9-986f-6e30aa0848f7" />
 
-
 <img width="640" height="720" alt="Git2GifPt" src="https://github.com/user-attachments/assets/6b48117d-5eae-4c6b-95a2-d44bd4a28e84" />
 
-## Developer Guide & Testing
+## Dependencies
 
-### Prerequisites
+Use submodules when cloning:
 
-- **C++ Compiler**: A compiler supporting C++20 (Visual Studio 2022, GCC 11+, or Clang 13+).
-- **Raylib**: The project depends on Raylib. On Linux/macOS, ensure it is installed or accessible via your library path.
-- **Premake5**: Used for cross-platform project generation.
-- **OpenMP**: Required for multi-threaded path tracing.
+```bash
+git clone --recurse-submodules https://github.com/ThadeuFerreira/N-Ray.git
+cd N-Ray
+```
 
-### Building the Project
+For an existing checkout:
 
-#### Windows (Visual Studio)
-1. Open `PathTracingRenderer.sln` in Visual Studio 2022.
-2. Select the `x64` platform.
-3. Choose `Release` or `Debug` configuration.
-4. Press `F5` to build and run.
+```bash
+git submodule update --init --recursive
+```
 
-#### Cross-Platform (Premake5)
-1. Run `premake5 [action]` where `[action]` is `vs2022`, `gmake2`, or `xcode4`.
-2. For example, on Linux/macOS:
-   ```bash
-   make
-   ```
-   This will generate Makefiles in the `build` directory and compile the project. The executable will be placed in `bin/Release` or `bin/Debug`.
+Vendored dependencies live under `vendor/`:
 
-### Manual Testing & Controls
+- `raylib`: active window/input/display backend.
+- `volk`, `VulkanMemoryAllocator`, `glm`, `slang`: Vulkan-port dependencies, staged for future GPU work.
 
-Once the renderer is running, you can use the following controls to test its functionality:
+The Linux Makefile builds `vendor/raylib/src/libraylib.a` from source and patches raylib HDR support on (`SUPPORT_FILEFORMAT_HDR 1`) before compiling it.
 
-#### Camera Movement
-- **W / A / S / D**: Move forward, left, backward, and right.
-- **Left Ctrl**: Move downward.
-- **Left Shift**: Move upward.
-- **Right Mouse Button (Hold)**: Rotate the camera to look around.
+## Build With Makefile
 
-#### Interaction
-- **Left Mouse Button**: 
-  - Click on the scene to trace a **Debug Ray** (visualized as a cylinder showing the ray path).
-  - Click on a model to **Select** it (useful for checking material assignments).
-  - If "Click DoF" is enabled in settings, click on an object to set the **Focal Distance**.
+The root `Makefile` wraps raylib build, Premake generation, and the generated Makefiles. It is the simplest path on Linux.
 
-#### UI (ImGui)
-- **Settings Panel**: Adjust rendering resolution, max bounces, samples per pixel, and environment lighting (HDRI).
-- **Stats Panel**: Monitor frames per second (FPS) and accumulation progress.
-- **Material Editing**: When a model is selected, its material properties (color, roughness, emission, etc.) can be modified in real-time.
+```bash
+make                    # Release build
+make CONFIG=debug_x64   # Debug build
+make build-performance  # Performance build: O3/native/fast-math/LTO where supported
+make run                # Build Release and run from PathTracingRenderer/
+make run-performance    # Build and run bin/Performance/PathTracingRenderer
+make raylib             # Rebuild only vendor/raylib/src/libraylib.a
+make generate           # Regenerate build/ project files
+make clean              # Remove build/, bin/, obj/
+make distclean          # Also clean raylib objects/library
+```
 
-### Testing Workflow
-1. **Load Scene**: The project loads `models/scene.obj` by default. Ensure the `models` folder exists in the working directory.
-2. **Verify Rendering**: Move the camera; the accumulation should reset and restart.
-3. **Debug Rays**: Use LMB to verify ray-triangle intersections and bounce logic.
-4. **Performance**: Check the "Stats" panel to ensure the renderer is utilizing OpenMP effectively (all CPU cores should show high usage during rendering).
+Run commands intentionally use `PathTracingRenderer/` as the working directory because assets are loaded from relative paths such as `models/scene.obj` and `textures/HDRI.hdr`.
+
+## Build With Premake
+
+`premake5.lua` is the source of truth for project files, include paths, source globs, links, and compiler flags. It generates project files under `build/` so it does not overwrite the hand-written root `Makefile`.
+
+Linux/macOS Makefiles:
+
+```bash
+make raylib
+premake5 gmake2
+make -C build config=release_x64
+make -C build config=debug_x64
+make -C build config=performance_x64
+```
+
+Windows Visual Studio:
+
+```bash
+premake5 vs2022
+```
+
+Open the generated Visual Studio solution under `build/`, select `x64`, then choose `Debug`, `Release`, or `Performance`. The older root solution may exist, but `premake5.lua` should be treated as the maintained configuration.
+
+## Build Configurations
+
+- `Debug`: symbols enabled, no release optimization.
+- `Release`: `NDEBUG`, Premake optimization enabled, OpenMP, AVX2 on supported platforms.
+- `Performance`: aggressive CPU path tracer build. Linux/macOS add `-O3 -march=native -ffast-math -flto`; Windows adds `/O2 /GL /fp:fast /arch:AVX2` and `/LTCG`.
+
+`Performance` is intended for throughput testing. `-ffast-math` / `/fp:fast` can slightly change floating-point behavior and noise patterns.
+
+## Runtime Controls
+
+- `W/A/S/D`: move camera.
+- `Left Ctrl`: move down.
+- `Left Shift`: move up.
+- Hold `Right Mouse Button`: rotate camera.
+- `Left Mouse Button`: debug ray, model selection, or click-to-focus when Pick DOF is enabled.
+- Settings panel: render resolution, bounces, samples, rays per pixel, Russian roulette, worker threads, publish rate, camera, sky/sun, tone mapping, and selected material properties.
+- Stats panel: UI timing, displayed samples, worker samples, rays/sec, samples/sec, publish cost, and render progress.
+
+There are no automated tests yet. Current verification is compile plus manual runtime inspection.
+
+## Current CPU Path Trace Architecture
+
+The UI/main thread owns raylib, input, ImGui frame layout, texture upload, and viewport drawing. Path tracing runs on `AsyncRenderWorker` in a background `std::thread`. Each worker launch snapshots render parameters, camera, screen, HDRI environment view, triangles, compact intersection data, materials, and flat BVH nodes into a `RenderWorkload`.
+
+The worker traces progressively into a float `accumBuffer`. It only publishes composed frames at the first few samples, at the configured `Publish Hz`, or at completion. Display-only changes such as Exposure and Contrast recompose the last published accumulation buffer without restarting the render. Integrand changes such as camera movement, geometry/material edits, bounces, resolution, and rays per pixel invalidate and restart sampling.
+
+## CPU Optimization Highlights
+
+This fork includes several high-level CPU path tracing optimizations:
+
+- **Async worker decoupling**: ImGui stays responsive while rendering continues on a worker thread.
+- **Fused sample loop**: ray generation, tracing, and accumulation happen inside one OpenMP pixel loop, avoiding old full-frame ray/state staging passes.
+- **Thread control**: worker loops use explicit `num_threads(...)`; by default one hardware thread is reserved for the UI.
+- **Dynamic OpenMP scheduling**: `schedule(dynamic, 1024)` balances expensive glass/volume pixels against cheap background pixels.
+- **Small deterministic RNG**: hot-path `mt19937`/distribution construction was replaced by a lightweight per pixel/sample/ray generator.
+- **Binned SAH BVH build**: BVH construction uses 8-bin surface-area heuristic splitting with a leaf target of 6 triangles.
+- **Flat ordered BVH traversal**: flattened nodes store child metadata so traversal can visit the near child first and shrink `closestT` earlier.
+- **Compact intersection records**: `TriIntersect` mirrors only the geometry needed for intersection, so traversal avoids streaming the full material-heavy `Tri`.
+- **Material indirection**: triangles store `materialIdx`; material data lives once in `data.materials`.
+- **Russian roulette**: optional unbiased low-energy path termination reduces average bounce depth.
+- **Publication throttling**: the worker does not tone-map and copy a full display frame after every sample unless the viewport needs it.
+
+These optimizations are still CPU-only. Vulkan dependencies are present so the next renderer can be introduced behind explicit render workload/data boundaries instead of coupling GPU work to the ImGui loop.
