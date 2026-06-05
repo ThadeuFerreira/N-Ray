@@ -11,13 +11,14 @@ The goal is memory safety **and** stable frame times. Achieve both by deciding o
 
 **Own at the boundary, borrow in the loop.**
 - Ownership/management layer (asset registry, resource manager, scene load): smart pointers or value containers.
-- Hot path (BVH traversal, `rayLogic`, `rayGeneration`, framebuffer/tonemap loops, draw submission): raw `const T&`, `T*`, `std::vector<T>`, or `uint32_t` handles. **No `shared_ptr` copies, no allocations, no refcount traffic here.**
+- Hot path (BVH traversal, `rayLogic`, `generatePixelRay`, framebuffer/tonemap loops, draw submission): raw `const T&`, `T*`, `std::vector<T>`, or `uint32_t` handles. **No `shared_ptr` copies, no allocations, no refcount traffic here.**
 
 ## Ownership decision table
 
 | Scenario | Use | Why |
 | --- | --- | --- |
-| Homogeneous bulk data (triangles, rays, framebuffer) | `std::vector<T>` (contiguous) + `uint32_t` index handles | Cache-friendly sequential access; RAII; no per-element heap allocs. **This is already how N-Ray stores `tris`/`models`/BVH.** |
+| Homogeneous bulk data (triangles, rays, framebuffer) | `std::vector<T>` (contiguous) + `uint32_t` index handles | Cache-friendly sequential access; RAII; no per-element heap allocs. **This is already how N-Ray stores `tris`/`triIsect`/`materials`/`models`/BVH.** |
+| Hot-loop view of a fat record (intersection test) | a **separate compact `std::vector`** holding only the loop's fields + a `uint32_t` back-reference | Streams less per element; the fat record is read once on the result. N-Ray's `TriIntersect` (44 B: `a,eA,eB,idx,doubleSided`) mirrors the ~160 B `Tri` for exactly this. |
 | Single heap-owned or polymorphic object (one owner) | `std::unique_ptr<T>` | Pointer-sized, no atomics, frees on scope exit. |
 | Asset registry keyed by name/UUID | `std::unordered_map<Key, std::unique_ptr<T>>`, hand out `T*` via `.get()` | One owner; consumers borrow without lifetime control. |
 | Genuinely shared, lifetime-ambiguous resource | `std::shared_ptr<T>` — only at the management layer | Atomic refcount + heap control block; never copy it inside a frame loop. |
@@ -40,8 +41,9 @@ The goal is memory safety **and** stable frame times. Achieve both by deciding o
 
 ## N-Ray specifics
 
-- N-Ray today uses **no** smart pointers and **no** raw `new`/`delete` — bulk data is `std::vector` + `uint32_t` handles (`tri.idx`, `modelIdx`, BVH `children[]`, `CompactBVH.startIndex`/`missLink`), and the hot paths (`traverseFlatBVH`, `rayLogic`, `rayGeneration`, the tonemap loop) take raw references/arrays. **Keep it that way** — it already embodies "borrow in the loop."
-- The async render worker copies a `std::vector<Tri>` snapshot once per render *start* (off the hot path, into a worker thread) and hands frames over by buffer, not by smart pointer — correct.
+- N-Ray today uses **no** smart pointers and **no** raw `new`/`delete` — bulk data is `std::vector` + `uint32_t` handles (`tri.idx`, `materialIdx`, `modelIdx`, BVH `children[]`, `CompactBVH.startIndex`/`secondChild`), and the hot paths (`traverseFlatBVH`, `rayLogic`, `generatePixelRay`, the tonemap loop) take raw references/arrays. **Keep it that way** — it already embodies "borrow in the loop."
+- `traverseFlatBVH` is the model case: it iterates the compact `std::vector<TriIntersect>` (borrowed by `const&`), and only on the closest hit does shading dereference the fat `std::vector<Tri>` / `std::vector<PBRMaterial>` via the `idx`/`materialIdx` handles. Don't reintroduce the fat `Tri` into the traversal loop.
+- The async render worker copies `std::vector<Tri>` + the compact `std::vector<TriIntersect>` snapshots once per render *start* (off the hot path, into a worker thread) and hands frames over by buffer, not by smart pointer — correct.
 - If you later add **polymorphic materials, an asset/texture registry, or optional heap-owned subsystems**, that is where `std::unique_ptr` (and a registry handing out `.get()` raw pointers) belongs — never `shared_ptr` reaching into the per-ray/per-pixel loop.
 - raylib resources (`Texture2D`, `Image`) are C handles freed via `UnloadTexture`/`UnloadImage`; don't wrap them in smart pointers unless you write a custom deleter — keep the existing explicit `shutdown` calls.
 
