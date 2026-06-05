@@ -45,6 +45,7 @@ The goal is memory safety **and** stable frame times. Achieve both by deciding o
 - `traverseFlatBVH` is the model case: it iterates the compact `std::vector<TriIntersect>` (borrowed by `const&`), and only on the closest hit does shading dereference the fat `std::vector<Tri>` / `std::vector<PBRMaterial>` via the `idx`/`materialIdx` handles. Don't reintroduce the fat `Tri` into the traversal loop.
 - The async render worker copies `std::vector<Tri>` + the compact `std::vector<TriIntersect>` snapshots once per render *start* (off the hot path, into a worker thread) and hands frames over by buffer, not by smart pointer — correct.
 - If you later add **polymorphic materials, an asset/texture registry, or optional heap-owned subsystems**, that is where `std::unique_ptr` (and a registry handing out `.get()` raw pointers) belongs — never `shared_ptr` reaching into the per-ray/per-pixel loop.
+- When validating future glTF model, texture, or material registry work, use top-level `assets/*/scene.gltf` or `.glb` bundles as the local source models. Keep their binary buffers, textures, and license/source files co-located, and keep the imported runtime representation as contiguous arrays or handles before it reaches hot traversal/shading loops.
 - raylib resources (`Texture2D`, `Image`) are C handles freed via `UnloadTexture`/`UnloadImage`; don't wrap them in smart pointers unless you write a custom deleter — keep the existing explicit `shutdown` calls.
 
 ## Reference architecture

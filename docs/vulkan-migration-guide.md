@@ -23,6 +23,7 @@ Path-tracers require high-fidelity asset loading (especially material metadata l
 
 ### Rework Areas:
 *   **Flatten renderer-owned scene data first:** Today, `ObjImporter` already converts OBJ files into `Data::tris`, `Data::triIsect`, `Data::materials`, `Data::models`, and `globalCompactBVH`. The first Vulkan path should upload those existing arrays to storage buffers before replacing the asset loader.
+*   **Use the local glTF validation corpus:** Top-level `assets/` contains the project-owned validation models for importer work. Use `assets/*/scene.gltf` or `.glb` bundles, with their folder-local buffers and textures, when validating glTF parsing, PBR material conversion, texture color-space policy, tangent generation, and Vulkan upload layouts. These assets are separate from the current `PathTracingRenderer/models/` OBJ runtime scene.
 *   **Replace `ObjImporter` later:** Currently, `PathTracingRenderer/include/objImporter.h` uses a manual `ifstream` parser. Once the GPU buffer contract is stable, this should be replaced with:
     *   **[tinygltf](https://github.com/syoyo/tinygltf):** A lightweight glTF 2.0 parser. Prefer the stable v2 C++ header for production importer work until the experimental v3 C runtime settles, and keep the parser isolated from N-Ray's renderer-owned GPU upload structs.
     *   **[assimp](https://github.com/assimp/assimp):** If support for legacy formats (FBX, OBJ) is still required, Assimp can process complex hierarchical scene graphs into clean vertex and index arrays.

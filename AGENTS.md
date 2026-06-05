@@ -37,6 +37,8 @@ make distclean         # also clean the vendored raylib objects/lib
 
 **Run from a directory containing `models/` and `textures/`** (use `make run`, or `cd PathTracingRenderer`). Asset paths are relative to the working directory (CWD), not the binary, and these assets live under `PathTracingRenderer/`. The scene is composed in `loadSceneLayer()` as a series of `ObjImporter{...}` declarations; a missing OBJ prints "Could not open file" and is skipped rather than aborting (e.g. `models/dragon.obj`, referenced but not present). Note `SetTraceLogLevel(LOG_NONE)` suppresses raylib's own warnings, so asset-load failures are otherwise silent.
 
+**Top-level `assets/` is the validation corpus for glTF/Vulkan importer work.** Use local `assets/*/scene.gltf` or `.glb` bundles as the first source of validation models before downloading external samples. Keep each bundle's scene file, binary buffers, textures, and license/source files co-located. These validation assets are separate from the current `PathTracingRenderer/models/` OBJ runtime scene and should be used when checking future glTF parsing, PBR material conversion, texture color-space handling, and Vulkan upload paths.
+
 There are **no automated tests** — verification is manual (run the renderer, move the camera, use the debug ray / stats panel). For a quick headless throughput check, `src/renderer.cpp` can be compiled against a tiny standalone harness with no window (leave `RenderEnvironment` invalid to use the procedural sky). See README.md for controls (WASD + RMB camera, LMB debug ray / model select / click-DoF).
 
 ## Architecture

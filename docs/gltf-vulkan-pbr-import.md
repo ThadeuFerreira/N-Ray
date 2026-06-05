@@ -28,6 +28,27 @@ transition, treat it as an import frontend only: copy CPU mesh data into N-Ray's
 native Vulkan staging structs and do not bind raylib/OpenGL mesh buffers to the
 compute renderer.
 
+## Local Validation Corpus
+
+The top-level `assets/` directory is N-Ray's local glTF validation corpus. Use
+these bundles as the first importer/PBR validation source before reaching for
+external sample repositories:
+
+- `assets/2018_garage_mak_nissan_s15_silvia_-_reggie_mah/scene.gltf`
+- `assets/accurate_torvosaurus_tanneri/scene.gltf`
+- `assets/beretta_arx160/scene.gltf`
+- `assets/beretta_m9_gameready/scene.gltf`
+
+Each validation bundle should keep its `scene.gltf` or `.glb`, binary buffers,
+textures, and license/source files together in the same subfolder. Folders under
+`assets/` that do not contain a glTF/GLB scene file are source material only
+until an importable scene entry point is added.
+
+These assets are separate from the current `PathTracingRenderer/models/` and
+`PathTracingRenderer/textures/` runtime assets used by the OBJ-based CPU path.
+They should drive validation for glTF accessor decoding, PBR material mapping,
+texture color-space handling, tangent generation, and Vulkan upload layout.
+
 ## Geometry Contract
 
 For a compute path tracer, shader access is global and data-oriented. Rays do not
@@ -225,8 +246,9 @@ The importer should be staged and explicit:
 
 ## Validation Checklist
 
-- Load Khronos glTF sample assets that exercise base color, metallic-roughness,
-  normal maps, occlusion, emissive, alpha mask, and alpha blend.
+- Load the local `assets/*/scene.gltf` validation corpus first, then add Khronos
+  glTF sample assets for specific coverage gaps such as alpha mask/blend,
+  emissive, occlusion, or tangent edge cases.
 - Verify base color/emissive textures are sampled as sRGB and data textures are
   sampled as linear.
 - Verify roughness comes from G and metallic from B.

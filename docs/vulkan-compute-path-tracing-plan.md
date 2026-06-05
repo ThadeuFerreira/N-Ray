@@ -198,13 +198,17 @@ Progressive path tracing needs separate accumulation state:
    a Vulkan-native display path or a deliberate graphics interop layer.
 6. **Asset expansion:** only after the buffer contract is stable, add glTF/Assimp
    loaders or raylib `Mesh` import paths that flatten into the same GPU structs.
-   glTF imports must preserve metallic-roughness channel packing, texture
-   color-space policy, normal-map tangent basis, and texture descriptor indices.
+   Use the top-level `assets/*/scene.gltf` bundles as the local validation source
+   for this work before external samples. glTF imports must preserve
+   metallic-roughness channel packing, texture color-space policy, normal-map
+   tangent basis, and texture descriptor indices.
 
 ## Validation Checklist
 
 - Build with `make`.
 - Run `make run` and confirm the Vulkan preview status line.
+- For importer/Vulkan asset work, validate against local `assets/*/scene.gltf`
+  bundles and keep their folder-local buffers/textures beside the scene file.
 - Add debug shader modes before full PBR:
   - UV-free normal visualization.
   - Triangle/material id color.

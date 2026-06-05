@@ -23,8 +23,28 @@ High-value references:
 - `tutorials/ogldev/Vulkan/Tutorial29` and later - more advanced rendering/data-flow examples after compute.
 - `docs/vulkan-migration-guide.md` - N-Ray-specific Vulkan migration direction and dependency choices.
 - `docs/vulkan-compute-path-tracing-plan.md` - concrete compute-shader path tracing buffer contract, BVH upload strategy, and staged GPU migration plan.
+- `assets/` - local glTF validation corpus for future importer, PBR material, texture color-space, tangent, and Vulkan upload work. Prefer `assets/*/scene.gltf` or `.glb` before external model downloads.
 - `vendor/volk/` - Vulkan function loader only; it still includes Vulkan API headers such as `<vulkan/vulkan_core.h>` and does not replace `libvulkan-dev` or the LunarG SDK headers.
 - `vendor/VulkanMemoryAllocator/include/vk_mem_alloc.h` - VMA also includes `<vulkan/vulkan.h>`, so it requires Vulkan headers too.
+
+## glTF Validation Assets
+
+Use top-level `assets/` as N-Ray's local model validation source for glTF,
+Vulkan, and PBR import work. Importable validation bundles should expose
+`assets/<name>/scene.gltf` or a `.glb` file and keep folder-local `scene.bin`,
+`textures/`, and license/source files beside that scene file.
+
+Current local glTF entry points:
+
+- `assets/2018_garage_mak_nissan_s15_silvia_-_reggie_mah/scene.gltf`
+- `assets/accurate_torvosaurus_tanneri/scene.gltf`
+- `assets/beretta_arx160/scene.gltf`
+- `assets/beretta_m9_gameready/scene.gltf`
+
+Do not use `PathTracingRenderer/models/` or `PathTracingRenderer/textures/` as
+the glTF validation source; those are the current OBJ/HDRI runtime assets for
+the CPU scene. If an `assets/` subfolder lacks a glTF/GLB scene file, treat it as
+source material only until an importable scene entry point is added.
 
 ## Compute Shader Smoke Test
 

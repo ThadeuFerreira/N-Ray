@@ -52,6 +52,19 @@ make distclean          # Also clean raylib objects/library
 
 Run commands intentionally use `PathTracingRenderer/` as the working directory because assets are loaded from relative paths such as `models/scene.obj` and `textures/HDRI.hdr`.
 
+## Validation Assets
+
+The top-level `assets/` directory is the local glTF validation corpus for future Vulkan importer and PBR material work. Use `assets/*/scene.gltf` or `.glb` bundles as the first source of validation models before downloading external samples. Keep each bundle's scene file, binary buffers, textures, and license/source files together in its subfolder.
+
+Current glTF entry points include:
+
+- `assets/2018_garage_mak_nissan_s15_silvia_-_reggie_mah/scene.gltf`
+- `assets/accurate_torvosaurus_tanneri/scene.gltf`
+- `assets/beretta_arx160/scene.gltf`
+- `assets/beretta_m9_gameready/scene.gltf`
+
+These validation assets are separate from the current OBJ-based CPU runtime scene under `PathTracingRenderer/models/` and `PathTracingRenderer/textures/`; they are not loaded by `make run` until a glTF import path is explicitly added.
+
 ## Build With Premake
 
 `premake5.lua` is the source of truth for project files, include paths, source globs, links, and compiler flags. It generates project files under `build/` so it does not overwrite the hand-written root `Makefile`.
