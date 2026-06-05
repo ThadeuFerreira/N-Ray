@@ -12,7 +12,7 @@ The current Vulkan milestone is `VulkanComputePreview`:
 - `PathTracingRenderer/src/vulkan_compute_preview.cpp` initializes Vulkan through
   header-only `volk`.
 - `PathTracingRenderer/shaders/vulkan_triangle.comp` writes a triangle into a
-  host-visible storage buffer.
+  manually allocated, host-visible storage buffer.
 - The CPU copies that RGBA buffer into the existing raylib `Texture2D`, so the
   app can keep its raylib/rlImGui window while Vulkan compute is proven inside
   the real runtime.
@@ -20,6 +20,11 @@ The current Vulkan milestone is `VulkanComputePreview`:
 This is intentionally a bridge. The next steps should replace the toy pixel
 buffer with scene buffers and, later, replace CPU readback with a Vulkan storage
 image/display path.
+
+For the memory allocation policy behind those future resources, see
+[`docs/vulkan-memory-allocator-integration.md`](vulkan-memory-allocator-integration.md).
+For the later glTF asset and PBR material import policy, see
+[`docs/gltf-vulkan-pbr-import.md`](gltf-vulkan-pbr-import.md).
 
 ## Important Data Model Correction
 
@@ -113,8 +118,9 @@ upload structs and assert the C++ sizes/offsets.
    - `PBRMaterial` -> `GpuMaterial`
    - `CompactBVH` -> `GpuBvhNode`
 3. Allocate Vulkan storage buffers with `VK_BUFFER_USAGE_STORAGE_BUFFER_BIT`.
-   Use host-visible buffers for the first implementation; move to staged
-   device-local buffers after correctness is proven.
+   Host-visible buffers are acceptable for first correctness bring-up, but the
+   real renderer should use VMA-backed resources and move mostly-static scene
+   data to staged, device-local buffers after correctness is proven.
 4. Re-upload scene buffers only when geometry/materials change. Per-frame camera
    and accumulation state should be separate from mostly-static scene buffers.
 
@@ -164,9 +170,9 @@ There are two display stages:
 1. Current bridge: compute writes RGBA data into a host-visible buffer, then the
    CPU calls `UpdateTexture()` on the raylib texture. This is useful for bring-up
    but will bottleneck real rendering.
-2. Target path: compute writes to a Vulkan `rgba32f` accumulation storage image
-   or storage buffer. A display pass samples/tonemaps that output. If the app
-   keeps raylib/OpenGL presentation, interop/readback must be designed
+2. Target path: compute writes to a VMA-backed Vulkan `rgba32f` accumulation
+   storage image or storage buffer. A display pass samples/tonemaps that output.
+   If the app keeps raylib/OpenGL presentation, interop/readback must be designed
    deliberately; otherwise migrate display to a Vulkan fullscreen quad similar
    to the Tutorial28 path.
 
@@ -180,8 +186,8 @@ Progressive path tracing needs separate accumulation state:
 ## Migration Phases
 
 1. **Scene SSBO upload:** keep the current triangle preview, but allocate and
-   populate scene buffers from `Data`, `data.triIsect`, `data.materials`, and
-   `globalCompactBVH`.
+   populate VMA-backed scene buffers from `Data`, `data.triIsect`,
+   `data.materials`, and `globalCompactBVH`.
 2. **Closest-hit debug shader:** render a flat color, normal visualization, or
    material id using BVH traversal. No bounces yet.
 3. **One-bounce material shader:** port diffuse/specular/refraction pieces from
@@ -192,6 +198,8 @@ Progressive path tracing needs separate accumulation state:
    a Vulkan-native display path or a deliberate graphics interop layer.
 6. **Asset expansion:** only after the buffer contract is stable, add glTF/Assimp
    loaders or raylib `Mesh` import paths that flatten into the same GPU structs.
+   glTF imports must preserve metallic-roughness channel packing, texture
+   color-space policy, normal-map tangent basis, and texture descriptor indices.
 
 ## Validation Checklist
 

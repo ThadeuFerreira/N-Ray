@@ -68,5 +68,5 @@ struct Params {
 	bool enableDebugRay = false;
 	bool enableSelection = true;
 	bool useVulkanPreview = true;
-	bool render = true;
+	bool render = false;
 };

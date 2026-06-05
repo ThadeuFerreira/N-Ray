@@ -3,7 +3,7 @@
 void UI::drawRenderSettings(Params& params, const LayoutSizes& sizes) {
 	sectionHeader("Render Settings");
 
-	if (buttonHelper("Render", "Renders scene with path tracing", sizes.button, params.render)) {
+	if (buttonHelper("CPU Path Trace", "Enable CPU path tracer (auto-enabled as fallback if Vulkan fails)", sizes.button, params.render)) {
 		markRenderDirty(params);
 	}
 

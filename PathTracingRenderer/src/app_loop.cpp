@@ -119,13 +119,8 @@ bool updatePathTraceRender(RuntimeResources& runtime) {
 		return true;
 	}
 
-	if (params.useVulkanPreview && runtime.vulkanPreview.isAvailable()) {
-		suspendCpuRendererForVulkan(runtime);
-		resetRenderStats(params);
-		return false;
-	}
-
-	if (!params.render) {
+	bool cpuFallback = params.useVulkanPreview && !runtime.vulkanPreview.isAvailable();
+	if (!params.render && !cpuFallback) {
 		runtime.renderWorker.shutdown();
 		runtime.renderWorker.discardFrame();
 		resetRenderStats(params);
@@ -192,7 +187,8 @@ void drawViewport(RuntimeResources& runtime, bool vulkanFrameDrawn) {
 		traceDebugRay(makeRenderEnvironment(runtime.hdri));
 	}
 
-	if (!params.render && !vulkanFrameDrawn) {
+	bool cpuActive = params.render || (params.useVulkanPreview && !runtime.vulkanPreview.isAvailable());
+	if (!cpuActive && !vulkanFrameDrawn) {
 		drawRasterPreview();
 	}
 
@@ -208,7 +204,33 @@ void drawVulkanPreviewPanel(RuntimeResources& runtime, bool vulkanFrameDrawn) {
 	ImGui::TextWrapped("%s", runtime.vulkanPreview.statusMessage().c_str());
 
 	if (runtime.vulkanPreview.isAvailable()) {
-		ImGui::Text("Resolution: %d x %d", runtime.vulkanPreview.width(), runtime.vulkanPreview.height());
+		ImGui::Separator();
+
+		GpuStats gs = runtime.vulkanPreview.gpuStats();
+		ImGui::Text("Resolution:  %d x %d", runtime.vulkanPreview.width(), runtime.vulkanPreview.height());
+		ImGui::Text("Frames:      %u", gs.frameCount);
+
+		if (gs.timestampAvailable) {
+			float frameDeltaMs = params.dt * 1000.0f;
+			float gpuLoad = frameDeltaMs > 0.0f ? static_cast<float>(gs.gpuDispatchMs / frameDeltaMs * 100.0) : 0.0f;
+			ImGui::Text("GPU dispatch: %.3f ms", gs.gpuDispatchMs);
+			ImGui::Text("GPU load est: %.1f%%", gpuLoad);
+		} else {
+			ImGui::TextDisabled("GPU timing: not supported");
+		}
+
+		if (gs.localHeapBytes > 0) {
+			ImGui::Text("VRAM total:  %.1f MB", gs.localHeapBytes / (1024.0 * 1024.0));
+			if (gs.memBudgetAvailable) {
+				ImGui::Text("VRAM used:   %.1f MB", gs.localHeapUsed / (1024.0 * 1024.0));
+			} else {
+				ImGui::TextDisabled("VRAM used: budget ext unavailable");
+			}
+		}
+		ImGui::Text("Pixel buf:   %.1f MB", gs.pixelBufferBytes / (1024.0 * 1024.0));
+
+		ImGui::Separator();
+
 		if (!params.useVulkanPreview || !vulkanFrameDrawn) {
 			ImGui::TextDisabled("Preview image is not current this frame");
 		}
@@ -222,6 +244,33 @@ void drawVulkanPreviewPanel(RuntimeResources& runtime, bool vulkanFrameDrawn) {
 			imageWidth = imageHeight * aspect;
 		}
 		rlImGuiImageSizeV(&runtime.render, Vector2{ imageWidth, imageHeight });
+	}
+
+	ImGui::End();
+}
+
+void drawShaderSelectorPanel(RuntimeResources& runtime) {
+	ImGui::SetNextWindowSize(ImVec2(280.0f, 80.0f), ImGuiCond_Once);
+	ImGui::SetNextWindowPos(ImVec2(650.0f, 20.0f), ImGuiCond_Once);
+	ImGui::Begin("Shader Selector");
+
+	if (runtime.vulkanPreview.isAvailable()) {
+		int current = runtime.vulkanPreview.shaderIndex();
+		int count   = VulkanComputePreview::shaderCount();
+
+		// Build label list for ImGui combo
+		std::string allLabels;
+		for (int i = 0; i < count; i++) {
+			allLabels += VulkanComputePreview::shaderName(i);
+			allLabels += '\0';
+		}
+		allLabels += '\0';
+
+		if (ImGui::Combo("##shader", &current, allLabels.c_str())) {
+			runtime.vulkanPreview.setShader(current);
+		}
+	} else {
+		ImGui::TextDisabled("Vulkan unavailable");
 	}
 
 	ImGui::End();
@@ -248,6 +297,7 @@ void runMainLoop(RuntimeResources& runtime) {
 		params.shouldSample = true;
 		ui.logic(params, data, myCam);
 		drawVulkanPreviewPanel(runtime, vulkanFrameDrawn);
+		drawShaderSelectorPanel(runtime);
 
 		rlImGuiEnd();
 

@@ -8,6 +8,11 @@
 #include <sstream>
 
 #include "vulkan_triangle_spv.h"
+#include "tut28_star_nest_comp_spv.h"
+#include "tut28_lets_self_reflect_comp_spv.h"
+#include "tut28_spiral_galaxy_comp_spv.h"
+#include "tut28_battered_alien_planet_comp_spv.h"
+#include "tut28_flux_core_comp_spv.h"
 
 namespace {
 struct PushConstants {
@@ -48,6 +53,22 @@ uint32_t ceilDiv(uint32_t value, uint32_t divisor) {
 	return (value + divisor - 1) / divisor;
 }
 
+struct ShaderEntry {
+	const char* name;
+	const unsigned char* spv;
+	unsigned int len;
+};
+
+static const ShaderEntry kShaders[] = {
+	{ "Hello World Triangle",       nray_vulkan_triangle_comp_spv,          nray_vulkan_triangle_comp_spv_len          },
+	{ "Star Nest",                  tut28_star_nest_comp_spv,               tut28_star_nest_comp_spv_len               },
+	{ "Lets Self Reflect",          tut28_lets_self_reflect_comp_spv,       tut28_lets_self_reflect_comp_spv_len       },
+	{ "Spiral Galaxy",              tut28_spiral_galaxy_comp_spv,           tut28_spiral_galaxy_comp_spv_len           },
+	{ "Battered Alien Planet",      tut28_battered_alien_planet_comp_spv,   tut28_battered_alien_planet_comp_spv_len   },
+	{ "Flux Core",                  tut28_flux_core_comp_spv,               tut28_flux_core_comp_spv_len               },
+};
+static const int kShaderCount = static_cast<int>(sizeof(kShaders) / sizeof(kShaders[0]));
+
 }
 
 struct VulkanComputePreview::Impl {
@@ -74,6 +95,17 @@ struct VulkanComputePreview::Impl {
 	VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 	VkFence fence = VK_NULL_HANDLE;
 
+	VkQueryPool timestampPool = VK_NULL_HANDLE;
+	float timestampPeriod = 0.0f;
+	bool timestampSupported = false;
+	bool memBudgetSupported = false;
+	uint64_t localHeapBytes = 0;
+	uint32_t localHeapIndex = UINT32_MAX;
+	uint64_t localHeapUsed = 0;
+	double lastGpuMs = 0.0;
+	uint32_t frameCount = 0;
+
+	int selectedShader = 0;
 	int renderWidth = 0;
 	int renderHeight = 0;
 	bool initialized = false;
@@ -194,10 +226,19 @@ struct VulkanComputePreview::Impl {
 			0.0f
 		};
 
+		if (timestampSupported && timestampPool != VK_NULL_HANDLE) {
+			vkCmdResetQueryPool(commandBuffer, timestampPool, 0, 2);
+			vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampPool, 0);
+		}
+
 		vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
 		vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
 		vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pushConstants);
 		vkCmdDispatch(commandBuffer, ceilDiv(static_cast<uint32_t>(renderWidth), 16), ceilDiv(static_cast<uint32_t>(renderHeight), 16), 1);
+
+		if (timestampSupported && timestampPool != VK_NULL_HANDLE) {
+			vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestampPool, 1);
+		}
 
 		VkMemoryBarrier memoryBarrier{};
 		memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -252,6 +293,30 @@ struct VulkanComputePreview::Impl {
 			}
 		}
 
+		if (timestampSupported && timestampPool != VK_NULL_HANDLE) {
+			uint64_t timestamps[2] = {};
+			VkResult tsResult = vkGetQueryPoolResults(
+				device, timestampPool, 0, 2,
+				sizeof(timestamps), timestamps, sizeof(uint64_t),
+				VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT
+			);
+			if (tsResult == VK_SUCCESS) {
+				uint64_t delta = timestamps[1] - timestamps[0];
+				lastGpuMs = static_cast<double>(delta) * static_cast<double>(timestampPeriod) / 1e6;
+			}
+		}
+
+		if (memBudgetSupported && localHeapIndex != UINT32_MAX) {
+			VkPhysicalDeviceMemoryBudgetPropertiesEXT budgetProps{};
+			budgetProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+			VkPhysicalDeviceMemoryProperties2 memProps2{};
+			memProps2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+			memProps2.pNext = &budgetProps;
+			vkGetPhysicalDeviceMemoryProperties2(physicalDevice, &memProps2);
+			localHeapUsed = budgetProps.heapUsage[localHeapIndex];
+		}
+
+		frameCount++;
 		pixels.resize(static_cast<size_t>(renderWidth) * static_cast<size_t>(renderHeight));
 		std::memcpy(pixels.data(), mappedPixels, pixelBufferSize);
 		return true;
@@ -267,6 +332,10 @@ struct VulkanComputePreview::Impl {
 			vkDeviceWaitIdle(device);
 		}
 
+		if (timestampPool != VK_NULL_HANDLE) {
+			vkDestroyQueryPool(device, timestampPool, nullptr);
+			timestampPool = VK_NULL_HANDLE;
+		}
 		if (fence != VK_NULL_HANDLE) {
 			vkDestroyFence(device, fence, nullptr);
 			fence = VK_NULL_HANDLE;
@@ -314,6 +383,11 @@ struct VulkanComputePreview::Impl {
 		pixelBufferSize = 0;
 		pixelMemoryCoherent = false;
 		initialized = false;
+		lastGpuMs = 0.0;
+		localHeapUsed = 0;
+		frameCount = 0;
+		timestampSupported = false;
+		memBudgetSupported = false;
 	}
 
 	void abandonUnsafePartialInstance() {
@@ -367,7 +441,7 @@ struct VulkanComputePreview::Impl {
 		appInfo.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
 		appInfo.pEngineName = "N-Ray";
 		appInfo.engineVersion = VK_MAKE_VERSION(0, 1, 0);
-		appInfo.apiVersion = VK_API_VERSION_1_0;
+		appInfo.apiVersion = VK_API_VERSION_1_1;
 
 		VkInstanceCreateInfo createInfo{};
 		createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -418,7 +492,40 @@ struct VulkanComputePreview::Impl {
 			}
 		}
 
-		return physicalDevice != VK_NULL_HANDLE || fail("No Vulkan compute queue family found");
+		if (physicalDevice == VK_NULL_HANDLE) {
+			return fail("No Vulkan compute queue family found");
+		}
+
+		VkPhysicalDeviceProperties selectedProps{};
+		vkGetPhysicalDeviceProperties(physicalDevice, &selectedProps);
+		timestampPeriod = selectedProps.limits.timestampPeriod;
+
+		{
+			uint32_t count = 0;
+			vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &count, nullptr);
+			std::vector<VkQueueFamilyProperties> families(count);
+			vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &count, families.data());
+			if (queueFamily < count) {
+				timestampSupported = families[queueFamily].timestampValidBits > 0 && timestampPeriod > 0.0f;
+			}
+		}
+
+		{
+			VkPhysicalDeviceMemoryProperties memProps{};
+			vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
+			localHeapIndex = UINT32_MAX;
+			localHeapBytes = 0;
+			for (uint32_t i = 0; i < memProps.memoryHeapCount; i++) {
+				if ((memProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+					if (localHeapIndex == UINT32_MAX || memProps.memoryHeaps[i].size > localHeapBytes) {
+						localHeapIndex = i;
+						localHeapBytes = memProps.memoryHeaps[i].size;
+					}
+				}
+			}
+		}
+
+		return true;
 	}
 
 	bool findComputeQueueFamily(VkPhysicalDevice candidate, uint32_t& familyIndex) const {
@@ -456,10 +563,30 @@ struct VulkanComputePreview::Impl {
 		queueCreateInfo.queueCount = 1;
 		queueCreateInfo.pQueuePriorities = &queuePriority;
 
+		memBudgetSupported = false;
+		{
+			uint32_t extCount = 0;
+			vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, nullptr);
+			std::vector<VkExtensionProperties> exts(extCount);
+			vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, exts.data());
+			for (const auto& ext : exts) {
+				if (strcmp(ext.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0) {
+					memBudgetSupported = true;
+					break;
+				}
+			}
+		}
+
+		const char* memBudgetExt = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+
 		VkDeviceCreateInfo createInfo{};
 		createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 		createInfo.queueCreateInfoCount = 1;
 		createInfo.pQueueCreateInfos = &queueCreateInfo;
+		if (memBudgetSupported) {
+			createInfo.enabledExtensionCount = 1;
+			createInfo.ppEnabledExtensionNames = &memBudgetExt;
+		}
 
 		VkResult result = vkCreateDevice(physicalDevice, &createInfo, nullptr, &device);
 		if (result != VK_SUCCESS) {
@@ -606,10 +733,11 @@ struct VulkanComputePreview::Impl {
 	}
 
 	bool createPipeline() {
+		const ShaderEntry& entry = kShaders[selectedShader < kShaderCount ? selectedShader : 0];
 		VkShaderModuleCreateInfo shaderInfo{};
 		shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-		shaderInfo.codeSize = nray_vulkan_triangle_comp_spv_len;
-		shaderInfo.pCode = reinterpret_cast<const uint32_t*>(nray_vulkan_triangle_comp_spv);
+		shaderInfo.codeSize = entry.len;
+		shaderInfo.pCode = reinterpret_cast<const uint32_t*>(entry.spv);
 
 		VkResult result = vkCreateShaderModule(device, &shaderInfo, nullptr, &shaderModule);
 		if (result != VK_SUCCESS) {
@@ -682,6 +810,47 @@ struct VulkanComputePreview::Impl {
 			return failVk("vkCreateFence", result);
 		}
 
+		if (timestampSupported) {
+			VkQueryPoolCreateInfo queryPoolInfo{};
+			queryPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+			queryPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+			queryPoolInfo.queryCount = 2;
+			result = vkCreateQueryPool(device, &queryPoolInfo, nullptr, &timestampPool);
+			if (result != VK_SUCCESS) {
+				timestampSupported = false;
+			}
+		}
+
+		return true;
+	}
+
+	bool switchPipeline(int index) {
+		if (!initialized || index < 0 || index >= kShaderCount) {
+			return false;
+		}
+		if (index == selectedShader) {
+			return true;
+		}
+
+		vkDeviceWaitIdle(device);
+
+		if (pipeline != VK_NULL_HANDLE) {
+			vkDestroyPipeline(device, pipeline, nullptr);
+			pipeline = VK_NULL_HANDLE;
+		}
+		if (shaderModule != VK_NULL_HANDLE) {
+			vkDestroyShaderModule(device, shaderModule, nullptr);
+			shaderModule = VK_NULL_HANDLE;
+		}
+
+		selectedShader = index;
+		if (!createPipeline()) {
+			initialized = false;
+			return false;
+		}
+
+		frameCount = 0;
+		lastGpuMs = 0.0;
 		return true;
 	}
 };
@@ -724,4 +893,33 @@ int VulkanComputePreview::height() const {
 
 const std::string& VulkanComputePreview::statusMessage() const {
 	return m_impl->status;
+}
+
+bool VulkanComputePreview::setShader(int index) {
+	return m_impl->switchPipeline(index);
+}
+
+int VulkanComputePreview::shaderIndex() const {
+	return m_impl->selectedShader;
+}
+
+int VulkanComputePreview::shaderCount() {
+	return kShaderCount;
+}
+
+const char* VulkanComputePreview::shaderName(int index) {
+	if (index < 0 || index >= kShaderCount) return "Unknown";
+	return kShaders[index].name;
+}
+
+GpuStats VulkanComputePreview::gpuStats() const {
+	GpuStats s{};
+	s.gpuDispatchMs = m_impl->lastGpuMs;
+	s.frameCount = m_impl->frameCount;
+	s.localHeapBytes = m_impl->localHeapBytes;
+	s.localHeapUsed = m_impl->localHeapUsed;
+	s.pixelBufferBytes = m_impl->pixelBufferSize;
+	s.memBudgetAvailable = m_impl->memBudgetSupported;
+	s.timestampAvailable = m_impl->timestampSupported;
+	return s;
 }

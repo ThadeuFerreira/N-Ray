@@ -13,3 +13,6 @@
 [submodule "vendor/slang"]
 	path = vendor/slang
 	url = https://github.com/shader-slang/slang.git
+[submodule "vendor/tinygltf"]
+	path = vendor/tinygltf
+	url = https://github.com/syoyo/tinygltf.git
