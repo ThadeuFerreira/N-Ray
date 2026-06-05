@@ -18,6 +18,7 @@ struct PushConstants {
 };
 
 static_assert(sizeof(PushConstants) == 16, "Push constants must match vulkan_triangle.comp.");
+static_assert(nray_vulkan_triangle_comp_spv_len % 4 == 0, "SPIR-V bytecode size must be a multiple of 4.");
 
 const char* vkResultName(VkResult result) {
 	switch (result) {
@@ -46,6 +47,7 @@ std::string vkErrorMessage(const char* op, VkResult result) {
 uint32_t ceilDiv(uint32_t value, uint32_t divisor) {
 	return (value + divisor - 1) / divisor;
 }
+
 }
 
 struct VulkanComputePreview::Impl {
@@ -76,6 +78,7 @@ struct VulkanComputePreview::Impl {
 	int renderHeight = 0;
 	bool initialized = false;
 	bool volkReady = false;
+	bool instanceCleanupUnsafe = false;
 	std::string status = "Vulkan preview not initialized";
 	std::string deviceName = "unknown device";
 
@@ -89,22 +92,31 @@ struct VulkanComputePreview::Impl {
 
 		renderWidth = width;
 		renderHeight = height;
+		instanceCleanupUnsafe = false;
 
-		VkResult result = volkInitialize();
-		if (result != VK_SUCCESS) {
-			status = vkErrorMessage("volkInitialize", result);
-			return false;
+		if (!volkReady) {
+			VkResult result = volkInitialize();
+			if (result != VK_SUCCESS) {
+				status = vkErrorMessage("volkInitialize", result);
+				return false;
+			}
+			volkReady = true;
 		}
-		volkReady = true;
 
 		if (!createInstance() ||
 			!selectPhysicalDevice() ||
 			!createDevice() ||
 			!createPixelBuffer() ||
-			!createDescriptorResources() ||
+			!createDescriptorSetLayout() ||
+			!createDescriptorPoolAndSet() ||
 			!createPipeline() ||
 			!createCommandResources()) {
-			destroyResources();
+			if (instanceCleanupUnsafe) {
+				abandonUnsafePartialInstance();
+			}
+			else {
+				destroyResources();
+			}
 			return false;
 		}
 
@@ -117,7 +129,36 @@ struct VulkanComputePreview::Impl {
 		if (initialized && width == renderWidth && height == renderHeight) {
 			return true;
 		}
-		return initialize(width, height);
+		if (!initialized) {
+			return initialize(width, height);
+		}
+		return resizePixelResources(width, height);
+	}
+
+	bool resizePixelResources(int width, int height) {
+		if (width <= 0 || height <= 0) {
+			return fail("Vulkan preview disabled: invalid render size");
+		}
+
+		VkResult result = vkDeviceWaitIdle(device);
+		if (result != VK_SUCCESS) {
+			return failVk("vkDeviceWaitIdle", result);
+		}
+
+		destroyDescriptorPool();
+		destroyPixelBuffer();
+
+		renderWidth = width;
+		renderHeight = height;
+		if (!createPixelBuffer() || !createDescriptorPoolAndSet()) {
+			destroyDescriptorPool();
+			destroyPixelBuffer();
+			initialized = false;
+			return false;
+		}
+
+		status = "Vulkan compute preview active on " + deviceName;
+		return true;
 	}
 
 	bool render(float timeSeconds, std::vector<RenderPixel>& pixels) {
@@ -247,15 +288,52 @@ struct VulkanComputePreview::Impl {
 			vkDestroyShaderModule(device, shaderModule, nullptr);
 			shaderModule = VK_NULL_HANDLE;
 		}
+		destroyDescriptorPool();
+		if (descriptorSetLayout != VK_NULL_HANDLE) {
+			vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
+			descriptorSetLayout = VK_NULL_HANDLE;
+		}
+		destroyPixelBuffer();
+		if (device != VK_NULL_HANDLE) {
+			vkDestroyDevice(device, nullptr);
+			device = VK_NULL_HANDLE;
+			queue = VK_NULL_HANDLE;
+		}
+		if (instance != VK_NULL_HANDLE) {
+			vkDestroyInstance(instance, nullptr);
+			instance = VK_NULL_HANDLE;
+		}
+		// Keep the Vulkan loader open for process lifetime. Some loader/driver
+		// stacks can still own background state after a failed enumeration, and
+		// dlclose via volkFinalize() has proven unsafe on that failure path.
+
+		physicalDevice = VK_NULL_HANDLE;
+		renderWidth = 0;
+		renderHeight = 0;
+		pixelAllocationSize = 0;
+		pixelBufferSize = 0;
+		pixelMemoryCoherent = false;
+		initialized = false;
+	}
+
+	void abandonUnsafePartialInstance() {
+		instance = VK_NULL_HANDLE;
+		physicalDevice = VK_NULL_HANDLE;
+		renderWidth = 0;
+		renderHeight = 0;
+		initialized = false;
+		instanceCleanupUnsafe = false;
+	}
+
+	void destroyDescriptorPool() {
 		if (descriptorPool != VK_NULL_HANDLE) {
 			vkDestroyDescriptorPool(device, descriptorPool, nullptr);
 			descriptorPool = VK_NULL_HANDLE;
 			descriptorSet = VK_NULL_HANDLE;
 		}
-		if (descriptorSetLayout != VK_NULL_HANDLE) {
-			vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
-			descriptorSetLayout = VK_NULL_HANDLE;
-		}
+	}
+
+	void destroyPixelBuffer() {
 		if (mappedPixels != nullptr) {
 			vkUnmapMemory(device, pixelMemory);
 			mappedPixels = nullptr;
@@ -268,25 +346,9 @@ struct VulkanComputePreview::Impl {
 			vkFreeMemory(device, pixelMemory, nullptr);
 			pixelMemory = VK_NULL_HANDLE;
 		}
-		if (device != VK_NULL_HANDLE) {
-			vkDestroyDevice(device, nullptr);
-			device = VK_NULL_HANDLE;
-			queue = VK_NULL_HANDLE;
-		}
-		if (instance != VK_NULL_HANDLE) {
-			vkDestroyInstance(instance, nullptr);
-			instance = VK_NULL_HANDLE;
-		}
-		if (volkReady) {
-			volkFinalize();
-			volkReady = false;
-		}
-
-		physicalDevice = VK_NULL_HANDLE;
 		pixelAllocationSize = 0;
 		pixelBufferSize = 0;
 		pixelMemoryCoherent = false;
-		initialized = false;
 	}
 
 	bool fail(const std::string& message) {
@@ -324,6 +386,7 @@ struct VulkanComputePreview::Impl {
 		uint32_t deviceCount = 0;
 		VkResult result = vkEnumeratePhysicalDevices(instance, &deviceCount, nullptr);
 		if (result != VK_SUCCESS) {
+			instanceCleanupUnsafe = true;
 			return failVk("vkEnumeratePhysicalDevices count", result);
 		}
 		if (deviceCount == 0) {
@@ -333,29 +396,55 @@ struct VulkanComputePreview::Impl {
 		std::vector<VkPhysicalDevice> devices(deviceCount);
 		result = vkEnumeratePhysicalDevices(instance, &deviceCount, devices.data());
 		if (result != VK_SUCCESS) {
+			instanceCleanupUnsafe = true;
 			return failVk("vkEnumeratePhysicalDevices", result);
 		}
 
+		int bestScore = -1;
 		for (VkPhysicalDevice candidate : devices) {
-			uint32_t queueFamilyCount = 0;
-			vkGetPhysicalDeviceQueueFamilyProperties(candidate, &queueFamilyCount, nullptr);
-			std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
-			vkGetPhysicalDeviceQueueFamilyProperties(candidate, &queueFamilyCount, queueFamilies.data());
+			uint32_t candidateQueueFamily = 0;
+			if (!findComputeQueueFamily(candidate, candidateQueueFamily)) {
+				continue;
+			}
 
-			for (uint32_t i = 0; i < queueFamilyCount; i++) {
-				if ((queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
-					physicalDevice = candidate;
-					queueFamily = i;
-
-					VkPhysicalDeviceProperties props{};
-					vkGetPhysicalDeviceProperties(physicalDevice, &props);
-					deviceName = props.deviceName;
-					return true;
-				}
+			VkPhysicalDeviceProperties props{};
+			vkGetPhysicalDeviceProperties(candidate, &props);
+			int score = physicalDeviceScore(props);
+			if (score > bestScore) {
+				bestScore = score;
+				physicalDevice = candidate;
+				queueFamily = candidateQueueFamily;
+				deviceName = props.deviceName;
 			}
 		}
 
-		return fail("No Vulkan compute queue family found");
+		return physicalDevice != VK_NULL_HANDLE || fail("No Vulkan compute queue family found");
+	}
+
+	bool findComputeQueueFamily(VkPhysicalDevice candidate, uint32_t& familyIndex) const {
+		uint32_t queueFamilyCount = 0;
+		vkGetPhysicalDeviceQueueFamilyProperties(candidate, &queueFamilyCount, nullptr);
+		std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+		vkGetPhysicalDeviceQueueFamilyProperties(candidate, &queueFamilyCount, queueFamilies.data());
+
+		for (uint32_t i = 0; i < queueFamilyCount; i++) {
+			if ((queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
+				familyIndex = i;
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	int physicalDeviceScore(const VkPhysicalDeviceProperties& props) const {
+		if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+			return 3;
+		}
+		if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+			return 2;
+		}
+		return 1;
 	}
 
 	bool createDevice() {
@@ -448,7 +537,7 @@ struct VulkanComputePreview::Impl {
 		return true;
 	}
 
-	bool createDescriptorResources() {
+	bool createDescriptorSetLayout() {
 		VkDescriptorSetLayoutBinding binding{};
 		binding.binding = 0;
 		binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -465,6 +554,14 @@ struct VulkanComputePreview::Impl {
 			return failVk("vkCreateDescriptorSetLayout", result);
 		}
 
+		return true;
+	}
+
+	bool createDescriptorPoolAndSet() {
+		if (descriptorSetLayout == VK_NULL_HANDLE) {
+			return fail("Vulkan descriptor set layout missing");
+		}
+
 		VkDescriptorPoolSize poolSize{};
 		poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 		poolSize.descriptorCount = 1;
@@ -475,7 +572,7 @@ struct VulkanComputePreview::Impl {
 		poolInfo.poolSizeCount = 1;
 		poolInfo.pPoolSizes = &poolSize;
 
-		result = vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool);
+		VkResult result = vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool);
 		if (result != VK_SUCCESS) {
 			return failVk("vkCreateDescriptorPool", result);
 		}

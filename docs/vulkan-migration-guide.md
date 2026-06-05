@@ -2,9 +2,14 @@
 
 This document outlines the strategic roadmap for migrating the **N-Ray** project from its current CPU-based path-tracing implementation to a fully GPU-accelerated renderer using **Vulkan**.
 
+For the concrete compute-shader path tracing buffer contract and staged migration
+plan, see [`docs/vulkan-compute-path-tracing-plan.md`](vulkan-compute-path-tracing-plan.md).
+
 ## Architectural Overview
 
-The current architecture relies on `omp.h` (OpenMP) for CPU parallelism and custom OBJ parsing. Migrating to Vulkan requires shifting from software-managed loops to hardware-accelerated pipelines (Compute or Ray Tracing) and explicit GPU memory management.
+The current architecture relies on `omp.h` (OpenMP) for CPU parallelism and custom OBJ parsing. Migrating to Vulkan requires shifting from software-managed loops to hardware-accelerated pipelines and explicit GPU memory management.
+
+The current migration direction is Vulkan **compute shaders** (`VK_PIPELINE_BIND_POINT_COMPUTE`) rather than `VK_KHR_ray_tracing_pipeline`. Compute shaders do not consume automatic vertex inputs or hardware triangle state; the CPU must flatten scene geometry, materials, and BVH nodes into descriptor-bound storage buffers.
 
 ---
 
@@ -13,7 +18,8 @@ The current architecture relies on `omp.h` (OpenMP) for CPU parallelism and cust
 Path-tracers require high-fidelity asset loading (especially material metadata like roughness, metallic, albedo maps, and normal maps).
 
 ### Rework Areas:
-*   **Replace `ObjImporter`:** Currently, `PathTracingRenderer/include/objImporter.h` uses a manual `ifstream` parser. This should be replaced with:
+*   **Flatten renderer-owned scene data first:** Today, `ObjImporter` already converts OBJ files into `Data::tris`, `Data::triIsect`, `Data::materials`, `Data::models`, and `globalCompactBVH`. The first Vulkan path should upload those existing arrays to storage buffers before replacing the asset loader.
+*   **Replace `ObjImporter` later:** Currently, `PathTracingRenderer/include/objImporter.h` uses a manual `ifstream` parser. Once the GPU buffer contract is stable, this should be replaced with:
     *   **[tinygltf](https://github.com/syoyo/tinygltf):** A header-only C++ library for loading glTF 2.0 files. glTF is the gold standard for PBR because its material definitions natively conform to standard PBR metallic-roughness models.
     *   **[assimp](https://github.com/assimp/assimp):** If support for legacy formats (FBX, OBJ) is still required, Assimp can process complex hierarchical scene graphs into clean vertex and index arrays.
 *   **Texture Management:**
@@ -36,7 +42,7 @@ Vulkan is extremely verbose regarding resource synchronization and memory alloca
 Since the goal is migrating the CPU logic (found in `renderer.cpp` and `render_worker.cpp`) to the GPU, we need robust bytecode tools.
 
 ### Strategies:
-*   **Target:** Likely **Compute Shaders** (for compatibility) or **Vulkan Ray Tracing extensions** (`VK_KHR_ray_tracing_pipeline`).
+*   **Target:** **Compute Shaders** for the current migration. Hardware ray tracing extensions can be revisited later, but the immediate renderer must manually traverse flattened triangle and BVH storage buffers.
 *   **Compilers:**
     *   **[DirectXShaderCompiler (DXC)](https://github.com/microsoft/DirectXShaderCompiler):** Recommended for writing shaders in modern HLSL rather than GLSL. DXC provides robust SPIR-V code generation.
     *   **[Slang](https://github.com/shader-slang/slang):** An advanced alternative shading language that simplifies modularity in large raytracing pipelines.
@@ -66,5 +72,5 @@ Vulkan drivers do not perform hand-holding. To safely validate render loops, uti
 
 1.  **Initialize Vulkan Instance:** Integrate `volk` and set up the basic Vulkan boilerplate.
 2.  **Integrate VMA:** Replace manual buffer management with VMA-backed allocations.
-3.  **Implement Compute Shader Path:** Port the logic in `PathTracer::RayIntersectsTriangle` and `PathTracer::CalculatePath` to HLSL/GLSL compute shaders.
-4.  **Transition Scene Data:** Update `Scene` and `Data` structures to be compatible with GPU Buffer/Texture descriptors.
+3.  **Transition Scene Data:** Convert `Data::triIsect`, triangle shading data, `PBRMaterial`, and `globalCompactBVH` into GPU upload structs and Vulkan storage buffers.
+4.  **Implement Compute Shader Path:** Port the primary-ray closest-hit path first (`rayAABB`, `RayIntersectsTriangle`, `traverseFlatBVH`), then add material evaluation, bounces, and progressive accumulation.

@@ -1,6 +1,7 @@
 #include <app.h>
 
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <rlImGui.h>
 #include <objImporter.h>
@@ -78,8 +79,14 @@ void startupRuntimeLayer(RuntimeResources& runtime) {
 	runtime.prevRes = params.res;
 
 	runtime.render = createRenderTexture();
-	runtime.vulkanPreview.initialize(screen.resX, screen.resY);
-	std::cout << runtime.vulkanPreview.statusMessage() << '\n';
+	try {
+		bool vulkanReady = runtime.vulkanPreview.initialize(screen.resX, screen.resY);
+		(vulkanReady ? std::cout : std::cerr) << runtime.vulkanPreview.statusMessage() << '\n';
+	}
+	catch (const std::exception& e) {
+		runtime.vulkanPreview.shutdown();
+		std::cerr << "Vulkan preview initialization failed: " << e.what() << '\n';
+	}
 
 	runtime.hdri = LoadImage("textures/HDRI.hdr");
 	if (runtime.hdri.data == nullptr) {

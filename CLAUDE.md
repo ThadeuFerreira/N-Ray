@@ -6,6 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 N-Ray is a CPU path tracing renderer (educational project). It uses **raylib** for windowing/input/texture display, **Dear ImGui** (via rlImGui) for the UI, **glm** for math, and **OpenMP** for multithreading. Rendering is progressive and runs on a **background worker thread**: samples accumulate until the camera moves or a render setting changes. The long-term goal is a Vulkan GPU port — the CPU path has been optimized as far as it reasonably goes (see **Performance** below).
 
+## Skills
+
+Project skills live in `.claude/skills/` as one folder per skill, each with a `SKILL.md` using the same frontmatter/body model as Codex skills. Treat this as the single repo-local skill source for Claude Code and other agents, and keep these links in sync between `CLAUDE.md` and `AGENTS.md`.
+
+- `.claude/skills/nray-vulkan-tutorials/SKILL.md` - use for Vulkan issues, compute shader experiments, Tutorial28/VulkanCore references, descriptor/synchronization/debugging work, and porting the CPU path tracer toward Vulkan compute.
+- `.claude/skills/cpp-smart-pointers/SKILL.md` - use for C++ ownership/lifetime changes, asset/resource registry design, buffer/texture/mesh lifetime reviews, or audits for hidden allocations and smart-pointer traffic in hot render paths.
+
+When a skill applies, read its `SKILL.md` before designing or changing code.
+
 ## Build & Run
 
 Requires a C++20 compiler, `premake5`, OpenMP, and raylib. Builds with AVX2 (`-mavx2`).
