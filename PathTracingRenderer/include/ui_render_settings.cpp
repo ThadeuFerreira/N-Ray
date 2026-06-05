@@ -7,6 +7,10 @@ void UI::drawRenderSettings(Params& params, const LayoutSizes& sizes) {
 		markRenderDirty(params);
 	}
 
+	if (buttonHelper("Vulkan Preview", "Uses the Vulkan compute preview in place of the CPU render scene", sizes.button, params.useVulkanPreview)) {
+		markRenderDirty(params);
+	}
+
 	if (sliderHelper("Bounces Amount", "Amount of times a ray can bounce", sizes.slider, params.maxBounces, 0, 50)) {
 		markRenderDirty(params);
 	}

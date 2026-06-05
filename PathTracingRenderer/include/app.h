@@ -10,14 +10,17 @@
 #include <ui.h>
 #include <mouseRay.h>
 #include <render_worker.h>
+#include <vulkan_compute_preview.h>
 
 struct RuntimeResources {
 	int prevRes = 0;
 	Texture2D render = {};
 	Image hdri = {};
 	AsyncRenderWorker renderWorker;
+	VulkanComputePreview vulkanPreview;
 	std::vector<RenderPixel> asyncFrame;
 	std::vector<glm::vec3> asyncAccum;
+	std::vector<RenderPixel> vulkanFrame;
 	int asyncRaysPerPixel = 1;
 };
 

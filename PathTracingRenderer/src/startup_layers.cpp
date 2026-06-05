@@ -65,7 +65,7 @@ void initializeRenderLayer() {
 		data.triIsect[i] = { t.a, t.eA, t.eB, t.idx, t.doubleSided ? 1u : 0u };
 	}
 
-	std::cout << data.models.size();
+	std::cout << data.models.size() << '\n';
 
 	cam3D.position = { myCam.camPos.x, myCam.camPos.y, myCam.camPos.z };
 	cam3D.target = { myCam.camTarget.x, myCam.camTarget.y, myCam.camTarget.z };
@@ -78,6 +78,8 @@ void startupRuntimeLayer(RuntimeResources& runtime) {
 	runtime.prevRes = params.res;
 
 	runtime.render = createRenderTexture();
+	runtime.vulkanPreview.initialize(screen.resX, screen.resY);
+	std::cout << runtime.vulkanPreview.statusMessage() << '\n';
 
 	runtime.hdri = LoadImage("textures/HDRI.hdr");
 	if (runtime.hdri.data == nullptr) {
@@ -93,6 +95,7 @@ void startupRuntimeLayer(RuntimeResources& runtime) {
 
 void shutdownRuntimeLayer(RuntimeResources& runtime) {
 	runtime.renderWorker.shutdown();
+	runtime.vulkanPreview.shutdown();
 	rlImGuiShutdown();
 	UnloadTexture(runtime.render);
 	UnloadImage(runtime.hdri);

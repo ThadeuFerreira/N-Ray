@@ -1,5 +1,6 @@
 #include <app.h>
 
+#include <algorithm>
 #include <imgui.h>
 #include <rlImGui.h>
 
@@ -20,6 +21,7 @@ void rebuildRenderTarget(RuntimeResources& runtime) {
 
 	UnloadTexture(runtime.render);
 	runtime.render = createRenderTexture();
+	runtime.vulkanPreview.resize(screen.resX, screen.resY);
 
 	params.shouldSample = false;
 	params.renderInvalidated = false;
@@ -75,7 +77,33 @@ void recomposeDisplayedFrame(RuntimeResources& runtime) {
 	UpdateTexture(runtime.render, runtime.asyncFrame.data());
 }
 
+bool updateVulkanComputePreview(RuntimeResources& runtime) {
+	if (!params.useVulkanPreview || !runtime.vulkanPreview.isAvailable()) {
+		return false;
+	}
+
+	runtime.renderWorker.shutdown();
+	runtime.renderWorker.discardFrame();
+	runtime.asyncFrame.clear();
+	runtime.asyncAccum.clear();
+
+	if (!runtime.vulkanPreview.render(static_cast<float>(GetTime()), runtime.vulkanFrame)) {
+		return false;
+	}
+
+	UpdateTexture(runtime.render, runtime.vulkanFrame.data());
+	resetRenderStats(params);
+	params.currentSample = 1;
+	params.renderStatsComplete = true;
+	drawRenderTexture(runtime.render, screen);
+	return true;
+}
+
 void updatePathTraceRender(RuntimeResources& runtime) {
+	if (updateVulkanComputePreview(runtime)) {
+		return;
+	}
+
 	if (!params.render) {
 		runtime.renderWorker.shutdown();
 		runtime.renderWorker.discardFrame();
@@ -142,11 +170,36 @@ void drawViewport(RuntimeResources& runtime) {
 		traceDebugRay(makeRenderEnvironment(runtime.hdri));
 	}
 
-	if (!params.render) {
+	if (!params.render && !(params.useVulkanPreview && runtime.vulkanPreview.isAvailable())) {
 		drawRasterPreview();
 	}
 
 	EndMode3D();
+}
+
+void drawVulkanPreviewPanel(RuntimeResources& runtime) {
+	ImGui::SetNextWindowSize(ImVec2(420.0f, 340.0f), ImGuiCond_Once);
+	ImGui::SetNextWindowPos(ImVec2(220.0f, 20.0f), ImGuiCond_Once);
+	ImGui::Begin("Vulkan Compute");
+
+	ImGui::Text("Preview: %s", params.useVulkanPreview ? "enabled" : "disabled");
+	ImGui::TextWrapped("%s", runtime.vulkanPreview.statusMessage().c_str());
+
+	if (runtime.vulkanPreview.isAvailable()) {
+		ImGui::Text("Resolution: %d x %d", runtime.vulkanPreview.width(), runtime.vulkanPreview.height());
+		ImVec2 available = ImGui::GetContentRegionAvail();
+		float aspect = static_cast<float>(runtime.vulkanPreview.width()) / static_cast<float>(std::max(runtime.vulkanPreview.height(), 1));
+		float imageWidth = std::max(1.0f, available.x);
+		float imageHeight = imageWidth / aspect;
+		float maxHeight = std::max(1.0f, available.y);
+		if (imageHeight > maxHeight) {
+			imageHeight = maxHeight;
+			imageWidth = imageHeight * aspect;
+		}
+		rlImGuiImageSizeV(&runtime.render, Vector2{ imageWidth, imageHeight });
+	}
+
+	ImGui::End();
 }
 }
 
@@ -169,6 +222,7 @@ void runMainLoop(RuntimeResources& runtime) {
 
 		params.shouldSample = true;
 		ui.logic(params, data, myCam);
+		drawVulkanPreviewPanel(runtime);
 
 		rlImGuiEnd();
 

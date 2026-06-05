@@ -30,6 +30,7 @@ project "PathTracingRenderer"
     files
     {
         "PathTracingRenderer/src/**.cpp",
+        "PathTracingRenderer/src/**.h",
         "PathTracingRenderer/include/**.h",
         "PathTracingRenderer/include/**.cpp",
         "PathTracingRenderer/external/imgui/*.cpp",
@@ -47,6 +48,7 @@ project "PathTracingRenderer"
         "PathTracingRenderer/external/imgui/backends",
         "PathTracingRenderer/external/glm",
         "PathTracingRenderer/external/rlImGui",
+        "vendor/volk",
         "vendor/raylib/src",
         "PathTracingRenderer/external/raylib/include"
     }
