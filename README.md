@@ -54,7 +54,7 @@ Run commands intentionally use `PathTracingRenderer/` as the working directory b
 
 ## Validation Assets
 
-The top-level `assets/` directory is the local glTF validation corpus for future Vulkan importer and PBR material work. Use `assets/*/scene.gltf` or `.glb` bundles as the first source of validation models before downloading external samples. Keep each bundle's scene file, binary buffers, textures, and license/source files together in its subfolder.
+The top-level `assets/` directory is the local glTF validation corpus for Vulkan importer and PBR material work. Use `assets/*/scene.gltf` or `.glb` bundles as the first source of validation models before downloading external samples. Keep each bundle's scene file, binary buffers, textures, and license/source files together in its subfolder.
 
 Current glTF entry points include:
 
@@ -62,8 +62,27 @@ Current glTF entry points include:
 - `assets/accurate_torvosaurus_tanneri/scene.gltf`
 - `assets/beretta_arx160/scene.gltf`
 - `assets/beretta_m9_gameready/scene.gltf`
+- `assets/hulk_infinity_hulk/scene.gltf`
+- `assets/luna_snow_-_sonic_trailblazer/scene.gltf`
+- `assets/wolverine_-_wolverine_-_x-2099_bundle/scene.gltf`
 
-These validation assets are separate from the current OBJ-based CPU runtime scene under `PathTracingRenderer/models/` and `PathTracingRenderer/textures/`; they are not loaded by `make run` until a glTF import path is explicitly added.
+These validation assets are separate from the current OBJ-based CPU runtime scene under `PathTracingRenderer/models/` and `PathTracingRenderer/textures/`. The Vulkan compute preview exposes these glTF scenes through the model selector, while the CPU path still uses the OBJ scene.
+
+## PBR And Vulkan Direction
+
+PBR material import does not require ray tracing. A Vulkan graphics/raster
+pipeline can evaluate Cook-Torrance PBR in a fragment shader using direct lights,
+shadow maps, probes, lightmaps, or IBL for incoming light. Path tracing is the
+separate transport algorithm that traces rays and bounces through the scene.
+
+N-Ray is combining them because the Vulkan target is a compute path tracer: once
+the shader finds a surface hit, it still needs physically plausible glTF material
+data to decide how light is absorbed, reflected, refracted, emitted, or scattered
+into the next ray. The current flat glTF Vulkan preview only validates scene
+flattening, material indexing, and BVH traversal; full PBR evaluation, texture
+sampling, bounces, and accumulation come later. See
+[`docs/gltf-vulkan-pbr-import.md`](docs/gltf-vulkan-pbr-import.md#pbr-is-the-material-model-not-the-transport-algorithm)
+for the detailed comparison.
 
 ## Build With Premake
 

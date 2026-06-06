@@ -5,6 +5,15 @@ That choice means the GPU has no vertex-input or triangle-primitive context. The
 shader sees only descriptor-bound buffers and images, so the CPU must flatten the
 scene into explicit storage-buffer layouts.
 
+PBR and path tracing are separate layers in this plan. PBR is the local material
+BRDF evaluated at a surface hit; path tracing is the global light-transport loop
+that chooses rays, bounces, visibility, and accumulation. A raster Vulkan
+graphics pipeline could also evaluate the same glTF PBR materials in fragment
+shaders. N-Ray combines them because the compute path tracer needs physically
+plausible material interactions once traversal finds a closest hit. See
+[`docs/gltf-vulkan-pbr-import.md`](gltf-vulkan-pbr-import.md#pbr-is-the-material-model-not-the-transport-algorithm)
+for the full distinction.
+
 ## Current Baseline
 
 The current Vulkan milestone is `VulkanComputePreview`:
@@ -13,13 +22,19 @@ The current Vulkan milestone is `VulkanComputePreview`:
   header-only `volk`.
 - `PathTracingRenderer/shaders/vulkan_triangle.comp` writes a triangle into a
   manually allocated, host-visible storage buffer.
+- `PathTracingRenderer/shaders/vulkan_gltf_flat.comp` is the first scene-buffer
+  preview mode: TinyGLTF loads the local Nissan S15 validation asset, the CPU
+  flattens it into `TriIntersect`, triangle shading, material, and compact BVH
+  storage buffers, and the shader performs primary-ray BVH traversal with simple
+  one-hit lighting.
 - The CPU copies that RGBA buffer into the existing raylib `Texture2D`, so the
   app can keep its raylib/rlImGui window while Vulkan compute is proven inside
   the real runtime.
 
-This is intentionally a bridge. The next steps should replace the toy pixel
-buffer with scene buffers and, later, replace CPU readback with a Vulkan storage
-image/display path.
+This is intentionally a bridge. The next steps should move scene buffers from
+host-visible bring-up allocations toward staged device-local resources, expand
+material evaluation, and replace CPU readback with a Vulkan storage image/display
+path.
 
 For the memory allocation policy behind those future resources, see
 [`docs/vulkan-memory-allocator-integration.md`](vulkan-memory-allocator-integration.md).
@@ -185,11 +200,13 @@ Progressive path tracing needs separate accumulation state:
 
 ## Migration Phases
 
-1. **Scene SSBO upload:** keep the current triangle preview, but allocate and
-   populate VMA-backed scene buffers from `Data`, `data.triIsect`,
-   `data.materials`, and `globalCompactBVH`.
-2. **Closest-hit debug shader:** render a flat color, normal visualization, or
-   material id using BVH traversal. No bounces yet.
+1. **Scene SSBO upload:** the glTF preview now uploads host-visible scene SSBOs
+   for one validation asset. Next, populate the same contract from `Data`,
+   `data.triIsect`, `data.materials`, and `globalCompactBVH`, then move mostly
+   static scene data to VMA-backed device-local buffers.
+2. **Closest-hit debug shader:** the glTF preview now renders flat one-hit
+   lighting through BVH traversal. Add debug modes for normal, material id, and
+   traversal heat visualization before bounces.
 3. **One-bounce material shader:** port diffuse/specular/refraction pieces from
    `rayLogic` after the closest-hit path is stable.
 4. **Progressive accumulation:** add sample index, RNG, accumulation image, and

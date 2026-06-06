@@ -1,0 +1,499 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer PixelBuffer {
+	uint pixels[];
+};
+
+struct GpuTriIntersect {
+	vec4 a;
+	vec4 eA;
+	vec4 eB;
+	uvec4 ids;
+};
+
+struct GpuTriShading {
+	vec4 aN;
+	vec4 bN;
+	vec4 cN;
+	uvec4 ids;
+};
+
+struct GpuMaterial {
+	vec4 baseColor;
+	vec4 params;
+	vec4 emissionIor;
+};
+
+struct GpuBvhNode {
+	vec4 minBounds;
+	vec4 maxBounds;
+	uvec4 meta;
+};
+
+struct GpuSettings {
+	vec4 renderParams;
+	vec4 skyParams;
+	vec4 sunDir;
+	vec4 sunColor;
+};
+
+layout(std430, binding = 1) readonly buffer TriIntersectBuffer {
+	GpuTriIntersect triIsect[];
+};
+
+layout(std430, binding = 2) readonly buffer TriShadingBuffer {
+	GpuTriShading triShading[];
+};
+
+layout(std430, binding = 3) readonly buffer MaterialBuffer {
+	GpuMaterial materials[];
+};
+
+layout(std430, binding = 4) readonly buffer BvhBuffer {
+	GpuBvhNode bvhNodes[];
+};
+
+layout(std430, binding = 5) buffer AccumBuffer {
+	vec4 accum[];
+};
+
+layout(std430, binding = 6) readonly buffer SettingsBuffer {
+	GpuSettings cfg;
+};
+
+layout(push_constant) uniform PushConstants {
+	int width;
+	int height;
+	float time;
+	uint sampleIndex;
+	vec4 cameraPos;
+	vec4 cameraForward;
+	vec4 cameraRight;
+	vec4 cameraUp;
+	vec4 cameraParams;
+	uvec4 sceneCounts;
+} pc;
+
+const float PI = 3.14159265358979323846;
+const float EPSILON = 0.0000001;
+const float RAY_EPSILON = 0.001;
+const float INF_T = 3.402823466e+38;
+
+bool invalidVec3(vec3 value) {
+	return any(isnan(value)) || any(isinf(value));
+}
+
+vec3 safeNormalize(vec3 value, vec3 fallback) {
+	float lenSq = dot(value, value);
+	if (invalidVec3(value) || !(lenSq > 0.00000001)) {
+		return fallback;
+	}
+	return normalize(value);
+}
+
+float maxComponent(vec3 value) {
+	return max(value.x, max(value.y, value.z));
+}
+
+uint packRgba(vec3 color) {
+	if (invalidVec3(color)) {
+		color = vec3(1.0, 0.0, 1.0);
+	}
+	uvec3 rgb = uvec3(clamp(color, 0.0, 1.0) * 255.0 + 0.5);
+	return rgb.r | (rgb.g << 8) | (rgb.b << 16) | (255u << 24);
+}
+
+uint pcgHash(uint inputValue) {
+	uint state = inputValue * 747796405u + 2891336453u;
+	uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+	return (word >> 22u) ^ word;
+}
+
+uint seedRng(uint pixelIndex, uint sampleIndex) {
+	return pcgHash(pixelIndex ^ pcgHash(sampleIndex + 0x9E3779B9u));
+}
+
+uint rngU32(inout uint state) {
+	state = state * 747796405u + 2891336453u;
+	uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+	return (word >> 22u) ^ word;
+}
+
+float rngFloat(inout uint state) {
+	return float(rngU32(state) >> 8u) * (1.0 / 16777216.0);
+}
+
+vec3 sampleCosineHemisphere(vec3 normal, vec3 faceNormal, float u1, float u2) {
+	float r = sqrt(max(u1, 0.0));
+	float phi = 2.0 * PI * u2;
+	vec3 localDir = vec3(
+		r * cos(phi),
+		r * sin(phi),
+		sqrt(max(1.0 - u1, 0.0))
+	);
+
+	vec3 up = abs(normal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+	vec3 tangent = safeNormalize(cross(up, normal), vec3(1.0, 0.0, 0.0));
+	vec3 bitangent = cross(normal, tangent);
+	vec3 worldDir = safeNormalize(
+		localDir.x * tangent +
+		localDir.y * bitangent +
+		localDir.z * normal,
+		normal
+	);
+
+	if (dot(worldDir, faceNormal) < 0.0) {
+		worldDir = -worldDir;
+	}
+	return worldDir;
+}
+
+vec3 sampleGGX(vec3 normal, float roughness, float r1, float r2) {
+	float a = roughness * roughness;
+	float theta = atan(a * sqrt(max(r1, 0.0)) / sqrt(max(1.0 - r1, 0.000001)));
+	float phi = 2.0 * PI * r2;
+
+	vec3 h = vec3(
+		sin(theta) * cos(phi),
+		sin(theta) * sin(phi),
+		cos(theta)
+	);
+
+	vec3 up = abs(normal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+	vec3 tangent = safeNormalize(cross(up, normal), vec3(1.0, 0.0, 0.0));
+	vec3 bitangent = cross(normal, tangent);
+	return safeNormalize(tangent * h.x + bitangent * h.y + normal * h.z, normal);
+}
+
+vec3 sky(vec3 dir) {
+	vec3 skyCol = vec3(cfg.skyParams.x);
+
+	if (cfg.skyParams.y > 0.5) {
+		vec3 worldUp = vec3(0.0, 0.0, 1.0);
+		vec3 skyTop = vec3(0.263, 0.553, 0.769);
+		vec3 skyBase = vec3(0.89, 0.824, 0.698);
+		float upAmount = pow(max(dot(dir, worldUp), 0.0), 0.5);
+		skyCol = mix(skyBase, skyTop, upAmount) * cfg.skyParams.x;
+	}
+
+	if (cfg.skyParams.z > 0.5) {
+		vec3 sunDirection = safeNormalize(cfg.sunDir.xyz, vec3(0.0, 0.0, 1.0));
+		float sunDot = clamp(dot(dir, sunDirection), -1.0, 1.0);
+		float sunAngle = degrees(acos(sunDot));
+		if (sunAngle < cfg.sunDir.w) {
+			skyCol = cfg.sunColor.rgb * cfg.sunColor.w;
+		}
+	}
+
+	return skyCol;
+}
+
+float contrastCurve(float v, float c) {
+	v = clamp(v, 0.0, 1.0);
+	if (v < 0.5) {
+		return 0.5 * pow(2.0 * v, 1.0 + c);
+	}
+	return 1.0 - 0.5 * pow(2.0 * (1.0 - v), 1.0 + c);
+}
+
+vec3 contrastSCurve(vec3 color, float c) {
+	return clamp(vec3(
+		contrastCurve(color.r, c),
+		contrastCurve(color.g, c),
+		contrastCurve(color.b, c)
+	), 0.0, 1.0);
+}
+
+bool rayAabb(vec3 origin, vec3 invDir, vec3 boxMin, vec3 boxMax, float maxT) {
+	vec3 t0 = (boxMin - origin) * invDir;
+	vec3 t1 = (boxMax - origin) * invDir;
+	vec3 tSmall = min(t0, t1);
+	vec3 tBig = max(t0, t1);
+	float tmin = max(max(tSmall.x, tSmall.y), max(tSmall.z, 0.0));
+	float tmax = min(min(tBig.x, tBig.y), min(tBig.z, maxT));
+	return tmax >= tmin;
+}
+
+bool rayIntersectsTriangle(
+	vec3 origin,
+	vec3 dir,
+	GpuTriIntersect tri,
+	out float t,
+	out float hitU,
+	out float hitV
+) {
+	vec3 h = cross(dir, tri.eB.xyz);
+	float det = dot(tri.eA.xyz, h);
+
+	if (tri.ids.y != 0u) {
+		if (det > -EPSILON && det < EPSILON) {
+			return false;
+		}
+	}
+	else if (det < EPSILON) {
+		return false;
+	}
+
+	float invDet = 1.0 / det;
+	vec3 s = origin - tri.a.xyz;
+	float u = invDet * dot(s, h);
+	if (u < 0.0 || u > 1.0) {
+		return false;
+	}
+
+	vec3 q = cross(s, tri.eA.xyz);
+	float v = invDet * dot(dir, q);
+	if (v < 0.0 || u + v > 1.0) {
+		return false;
+	}
+
+	t = invDet * dot(tri.eB.xyz, q);
+	if (t > EPSILON) {
+		hitU = u;
+		hitV = v;
+		return true;
+	}
+
+	return false;
+}
+
+bool dirIsNegativeOnAxis(vec3 invDir, uint axis) {
+	if (axis == 0u) {
+		return invDir.x < 0.0;
+	}
+	if (axis == 1u) {
+		return invDir.y < 0.0;
+	}
+	return invDir.z < 0.0;
+}
+
+bool traverseBvh(
+	vec3 origin,
+	vec3 dir,
+	vec3 invDir,
+	out uint hitTriIdx,
+	out float closestT,
+	out float hitU,
+	out float hitV,
+	out bool stackOverflow
+) {
+	hitTriIdx = 0u;
+	closestT = INF_T;
+	hitU = 0.0;
+	hitV = 0.0;
+	stackOverflow = false;
+
+	uint bvhCount = pc.sceneCounts.y;
+	uint triCount = pc.sceneCounts.x;
+	if (bvhCount == 0u || triCount == 0u) {
+		return false;
+	}
+
+	uint stack[64];
+	int stackPtr = 0;
+	uint current = 0u;
+	bool hit = false;
+
+	while (true) {
+		if (current >= bvhCount) {
+			stackOverflow = true;
+			break;
+		}
+
+		GpuBvhNode node = bvhNodes[current];
+		if (rayAabb(origin, invDir, node.minBounds.xyz, node.maxBounds.xyz, closestT)) {
+			uint triStart = node.meta.x;
+			uint triNodeCount = node.meta.y;
+			if (triNodeCount > 0u) {
+				for (uint i = 0u; i < triNodeCount; ++i) {
+					uint triBufferIndex = triStart + i;
+					if (triBufferIndex >= triCount) {
+						continue;
+					}
+
+					float t;
+					float u;
+					float v;
+					GpuTriIntersect tri = triIsect[triBufferIndex];
+					if (rayIntersectsTriangle(origin, dir, tri, t, u, v) && t < closestT) {
+						closestT = t;
+						hitTriIdx = tri.ids.x;
+						hitU = u;
+						hitV = v;
+						hit = true;
+					}
+				}
+
+				if (stackPtr == 0) {
+					break;
+				}
+				current = stack[--stackPtr];
+			}
+			else {
+				uint firstChild = current + 1u;
+				uint secondChild = node.meta.x;
+				if (stackPtr >= 64) {
+					stackOverflow = true;
+					break;
+				}
+
+				if (dirIsNegativeOnAxis(invDir, node.meta.z)) {
+					stack[stackPtr++] = firstChild;
+					current = secondChild;
+				}
+				else {
+					stack[stackPtr++] = secondChild;
+					current = firstChild;
+				}
+			}
+		}
+		else {
+			if (stackPtr == 0) {
+				break;
+			}
+			current = stack[--stackPtr];
+		}
+	}
+
+	return hit && hitTriIdx < triCount;
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	if (pixel.x >= pc.width || pixel.y >= pc.height) {
+		return;
+	}
+
+	uint pixelIndex = uint(pixel.y * pc.width + pixel.x);
+	uint rng = seedRng(pixelIndex, pc.sampleIndex);
+
+	vec2 jitter = vec2(rngFloat(rng), rngFloat(rng));
+	vec2 uv = (vec2(pixel) + jitter) / vec2(pc.width, pc.height);
+	float verticalScale = pc.cameraParams.x;
+	float aspect = pc.cameraParams.y;
+	vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+	vec3 origin = pc.cameraPos.xyz;
+	vec3 dir = safeNormalize(
+		pc.cameraForward.xyz +
+		pc.cameraRight.xyz * ndc.x * aspect * verticalScale +
+		pc.cameraUp.xyz * ndc.y * verticalScale,
+		pc.cameraForward.xyz
+	);
+	vec3 invDir = 1.0 / dir;
+
+	vec3 radiance = vec3(0.0);
+	vec3 throughput = vec3(1.0);
+	int maxBounces = max(0, int(cfg.renderParams.x + 0.5));
+	int rrMinBounces = max(0, int(cfg.renderParams.y + 0.5));
+	bool useRussianRoulette = cfg.renderParams.z > 0.5;
+
+	for (int bounce = 0; bounce <= maxBounces; ++bounce) {
+		uint hitTriIdx;
+		float closestT;
+		float hitU;
+		float hitV;
+		bool stackOverflow;
+		bool hit = traverseBvh(origin, dir, invDir, hitTriIdx, closestT, hitU, hitV, stackOverflow);
+
+		if (stackOverflow) {
+			radiance += throughput * sky(dir);
+			break;
+		}
+
+		if (!hit) {
+			radiance += throughput * sky(dir);
+			break;
+		}
+
+		GpuTriIntersect hitTri = triIsect[hitTriIdx];
+		GpuTriShading shading = triShading[hitTriIdx];
+		float hitW = 1.0 - hitU - hitV;
+		vec3 faceNormal = safeNormalize(cross(hitTri.eA.xyz, hitTri.eB.xyz), -dir);
+		if (dot(faceNormal, -dir) < 0.0) {
+			faceNormal = -faceNormal;
+		}
+		vec3 normal = safeNormalize(shading.aN.xyz * hitW + shading.bN.xyz * hitU + shading.cN.xyz * hitV, faceNormal);
+		if (dot(normal, -dir) < 0.0) {
+			normal = -normal;
+		}
+
+		uint materialIndex = shading.ids.x;
+		vec3 albedo = vec3(0.8);
+		float roughness = 0.5;
+		float metalness = 0.0;
+		float emissionIntensity = 0.0;
+		vec3 emissionColor = vec3(0.0);
+		float ior = 1.5;
+		if (materialIndex < pc.sceneCounts.z) {
+			GpuMaterial material = materials[materialIndex];
+			albedo = max(material.baseColor.rgb, vec3(0.0));
+			roughness = clamp(material.params.x, 0.02, 1.0);
+			metalness = clamp(material.params.y, 0.0, 1.0);
+			emissionIntensity = max(material.params.z, 0.0);
+			emissionColor = max(material.emissionIor.rgb, vec3(0.0));
+			ior = max(material.emissionIor.a, 1.001);
+		}
+
+		if (emissionIntensity > 0.0 && maxComponent(emissionColor) > 0.0) {
+			radiance += throughput * emissionColor * emissionIntensity;
+		}
+
+		vec3 hitPos = origin + dir * closestT;
+		vec3 microfacetNormal = sampleGGX(normal, roughness, rngFloat(rng), rngFloat(rng));
+		float r0Dielectric = (1.0 - ior) / (1.0 + ior);
+		r0Dielectric *= r0Dielectric;
+		float r0 = mix(r0Dielectric, 1.0, metalness);
+		float cosThetaI = clamp(-dot(dir, microfacetNormal), 0.0, 1.0);
+		float rTheta = r0 + (1.0 - r0) * pow(1.0 - cosThetaI, 5.0);
+
+		bool isSpecular = false;
+		vec3 nextDir = normal;
+		if (rngFloat(rng) <= rTheta) {
+			vec3 reflectedDir = safeNormalize(reflect(dir, microfacetNormal), normal);
+			if (dot(reflectedDir, normal) > 0.0 && dot(reflectedDir, faceNormal) > 0.0) {
+				nextDir = reflectedDir;
+				isSpecular = true;
+			}
+		}
+
+		if (isSpecular) {
+			throughput *= mix(vec3(1.0), albedo, metalness);
+		}
+		else {
+			throughput *= albedo;
+			nextDir = sampleCosineHemisphere(normal, faceNormal, rngFloat(rng), rngFloat(rng));
+		}
+
+		if (invalidVec3(throughput) || maxComponent(throughput) <= 0.000001) {
+			break;
+		}
+
+		origin = hitPos + normal * RAY_EPSILON;
+		dir = safeNormalize(nextDir, normal);
+		invDir = 1.0 / dir;
+
+		if (useRussianRoulette && bounce >= rrMinBounces) {
+			float pSurvive = clamp(maxComponent(throughput), 0.05, 1.0);
+			if (rngFloat(rng) > pSurvive) {
+				break;
+			}
+			throughput /= pSurvive;
+		}
+	}
+
+	if (invalidVec3(radiance)) {
+		radiance = vec3(1.0, 0.0, 1.0);
+	}
+
+	vec3 sum = accum[pixelIndex].rgb + radiance;
+	accum[pixelIndex] = vec4(sum, 1.0);
+
+	vec3 color = sum / float(pc.sampleIndex + 1u);
+	color *= cfg.renderParams.w;
+	color = clamp(color, 0.0, 1.0);
+	color = contrastSCurve(color, cfg.skyParams.w);
+	color = pow(max(color, vec3(0.0)), vec3(1.0 / 2.2));
+	pixels[pixelIndex] = packRgba(color);
+}

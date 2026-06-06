@@ -45,7 +45,7 @@ struct BVH {
 
 		if (count > BVH_LEAF_TRIANGLE_COUNT) {
 			createChildren(tris, globalBVH);
-			calculateNextNeighbor();
+			calculateNextNeighbor(globalBVH);
 		}
 	}
 
@@ -90,7 +90,7 @@ struct BVH {
 		splitPoint /= float(count);
 	}
 
-	void createChildren(std::vector<Tri>& tris, std::vector<BVH>& globalBVH) {
+	void createChildren(std::vector<Tri>& tris, std::vector<BVH>& buildNodes) {
 
 		glm::vec3 extent = max - min;
 		uint32_t clampedEnd = std::min<uint32_t>(endIndex, uint32_t(tris.size() - 1));
@@ -239,19 +239,19 @@ struct BVH {
 			return;
 		}
 
-		uint32_t childAIdx = uint32_t(globalBVH.size());
-		globalBVH.emplace_back();
-		globalBVH[childAIdx] = BVH(startIndex, aIdx - 1, tris, globalBVH);
+		uint32_t childAIdx = uint32_t(buildNodes.size());
+		buildNodes.emplace_back();
+		buildNodes[childAIdx] = BVH(startIndex, aIdx - 1, tris, buildNodes);
 
-		uint32_t childBIdx = uint32_t(globalBVH.size());
-		globalBVH.emplace_back();
-		globalBVH[childBIdx] = BVH(aIdx, endIndex, tris, globalBVH);
+		uint32_t childBIdx = uint32_t(buildNodes.size());
+		buildNodes.emplace_back();
+		buildNodes[childBIdx] = BVH(aIdx, endIndex, tris, buildNodes);
 
 		children[0] = childAIdx;
 		children[1] = childBIdx;
 	}
 
-	inline void calculateNextNeighbor() {
+	inline void calculateNextNeighbor(const std::vector<BVH>& buildNodes) {
 
 		next = 0;
 
@@ -260,7 +260,7 @@ struct BVH {
 
 			if (idx == UINT32_MAX) continue;
 
-			BVH& child = globalBVH[idx];
+			const BVH& child = buildNodes[idx];
 
 			next += child.next;
 

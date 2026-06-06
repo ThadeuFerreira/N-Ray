@@ -48,6 +48,7 @@ project "PathTracingRenderer"
         "PathTracingRenderer/external/imgui/backends",
         "PathTracingRenderer/external/glm",
         "PathTracingRenderer/external/rlImGui",
+        "vendor/tinygltf",
         "vendor/volk",
         "vendor/raylib/src",
         "PathTracingRenderer/external/raylib/include"

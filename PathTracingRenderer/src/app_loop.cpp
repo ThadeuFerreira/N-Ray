@@ -1,6 +1,7 @@
 #include <app.h>
 
 #include <algorithm>
+#include <cmath>
 #include <exception>
 #include <imgui.h>
 #include <iostream>
@@ -19,6 +20,9 @@ void rebuildRenderTarget(RuntimeResources& runtime) {
 	screen.initScreen(params.res, data.frameBuffer, data.accumBuffer);
 	runtime.asyncFrame.clear();
 	runtime.asyncAccum.clear();
+	runtime.vulkanFrame.clear();
+	runtime.vulkanFrameValid = false;
+	runtime.vulkanFrameDispatched = false;
 	runtime.asyncRaysPerPixel = params.raysPerPixel;
 
 	UnloadTexture(runtime.render);
@@ -70,6 +74,70 @@ void handleViewportActions() {
 	}
 }
 
+VulkanPreviewCamera makeVulkanPreviewCamera() {
+	VulkanPreviewCamera camera{};
+	camera.position = myCam.camPos;
+	camera.forward = myCam.camNormal;
+	camera.right = myCam.right;
+	camera.up = myCam.up;
+	camera.verticalScale = myCam.verticalScale;
+	camera.aspect = screen.resY > 0 ? static_cast<float>(screen.resX) / static_cast<float>(screen.resY) : 1.0f;
+	return camera;
+}
+
+VulkanPreviewSettings makeVulkanPreviewSettings() {
+	VulkanPreviewSettings settings{};
+	settings.maxSamples = std::max(1, params.maxSamples);
+	settings.maxBounces = std::max(0, params.maxBounces);
+	settings.rrMinBounces = std::max(0, params.rrMinBounces);
+	settings.russianRoulette = params.russianRoulette;
+	settings.exposure = params.exposure;
+	settings.contrast = params.contrast;
+	settings.skyIntensity = params.skyIntensity;
+	settings.enableSky = params.enableSky;
+	settings.enableSun = params.enableSun;
+	settings.sunDir = params.sunDir;
+	settings.sunAngle = params.sunAngle;
+	settings.sunColor = params.sunColor;
+	settings.sunIntensity = params.sunIntensity;
+	return settings;
+}
+
+void frameVulkanPreviewModel(RuntimeResources& runtime) {
+	glm::vec3 boundsMin;
+	glm::vec3 boundsMax;
+	if (!runtime.vulkanPreview.modelBounds(boundsMin, boundsMax)) {
+		return;
+	}
+
+	glm::vec3 center = (boundsMin + boundsMax) * 0.5f;
+	glm::vec3 extent = boundsMax - boundsMin;
+	myCam.orbitCenter = center;
+
+	float radius = std::max(
+		glm::length(extent) * 0.5f,
+		glm::length(center - myCam.orbitCenter) + glm::length(extent) * 0.5f
+	);
+	if (!std::isfinite(radius) || radius <= 0.0001f) {
+		radius = 1.0f;
+	}
+
+	float halfFov = glm::radians(myCam.fov) * 0.5f;
+	float fovScale = std::max(std::tan(halfFov), 0.1f);
+	float distance = (radius / fovScale) * 1.45f;
+
+	myCam.camPos = myCam.orbitCenter + glm::vec3(0.0f, -distance, radius * 0.35f);
+	myCam.camTarget = myCam.orbitCenter;
+	myCam.targetNormal = glm::normalize(myCam.camTarget - myCam.camPos);
+	myCam.focusDist = glm::length(myCam.camTarget - myCam.camPos);
+	myCam.targetDist = myCam.focusDist;
+	myCam.camSpeed = std::max(1.0f, radius * 0.6f);
+	runtime.vulkanFrameValid = false;
+	runtime.vulkanFrameDispatched = false;
+	params.renderInvalidated = true;
+	params.shouldSample = false;
+}
+
 bool displayedFrameMatchesTarget(const RuntimeResources& runtime) {
 	size_t pixelCount = static_cast<size_t>(screen.resX) * static_cast<size_t>(screen.resY);
 	return params.currentSample > 0 &&
@@ -93,23 +161,48 @@ void recomposeDisplayedFrame(RuntimeResources& runtime) {
 		1
 	);
 	UpdateTexture(runtime.render, runtime.asyncFrame.data());
+	runtime.vulkanFrameValid = false;
 }
 
 bool updateVulkanComputePreview(RuntimeResources& runtime) {
 	if (!params.useVulkanPreview || !runtime.vulkanPreview.isAvailable()) {
+		runtime.vulkanFrameDispatched = false;
 		return false;
 	}
 
 	suspendCpuRendererForVulkan(runtime);
 
-	if (!runtime.vulkanPreview.render(static_cast<float>(GetTime()), runtime.vulkanFrame)) {
-		return false;
-	}
+	size_t pixelCount = static_cast<size_t>(screen.resX) * static_cast<size_t>(screen.resY);
+	bool modelPreview = VulkanComputePreview::isModelPreviewIndex(runtime.vulkanPreview.shaderIndex());
+	bool resetAccumulation = params.renderInvalidated || runtime.vulkanFrame.size() != pixelCount;
+	bool convergedModelFrame =
+		modelPreview &&
+		runtime.vulkanFrameValid &&
+		runtime.vulkanFrame.size() == pixelCount &&
+		!resetAccumulation;
 
-	UpdateTexture(runtime.render, runtime.vulkanFrame.data());
+	if (!convergedModelFrame) {
+		VulkanPreviewSettings settings = makeVulkanPreviewSettings();
+		settings.resetAccumulation = resetAccumulation;
+		if (!runtime.vulkanPreview.render(static_cast<float>(GetTime()), makeVulkanPreviewCamera(), settings, runtime.vulkanFrame)) {
+			runtime.vulkanFrameValid = false;
+			runtime.vulkanFrameDispatched = false;
+			return false;
+		}
+
+		UpdateTexture(runtime.render, runtime.vulkanFrame.data());
+		runtime.vulkanFrameValid = modelPreview && runtime.vulkanPreview.converged();
+		runtime.vulkanFrameDispatched = true;
+		params.renderInvalidated = false;
+	}
+	else {
+		runtime.vulkanFrameDispatched = false;
+	}
 	resetRenderStats(params);
-	params.currentSample = 1;
-	params.renderStatsComplete = true;
+	params.currentSample = static_cast<int>(runtime.vulkanPreview.samplesAccumulated());
+	params.renderStatsSample = params.currentSample;
+	params.renderStatsActive = modelPreview && !runtime.vulkanPreview.converged();
+	params.renderStatsComplete = runtime.vulkanPreview.converged();
 	drawRenderTexture(runtime.render, screen);
 	return true;
 }
@@ -162,6 +255,7 @@ bool updatePathTraceRender(RuntimeResources& runtime) {
 			runtime.asyncRaysPerPixel = frameRaysPerPixel;
 			params.currentSample = frameSample;
 			UpdateTexture(runtime.render, runtime.asyncFrame.data());
+			runtime.vulkanFrameValid = false;
 		}
 	}
 
@@ -209,12 +303,23 @@ void drawVulkanPreviewPanel(RuntimeResources& runtime, bool vulkanFrameDrawn) {
 		GpuStats gs = runtime.vulkanPreview.gpuStats();
 		ImGui::Text("Resolution:  %d x %d", runtime.vulkanPreview.width(), runtime.vulkanPreview.height());
 		ImGui::Text("Frames:      %u", gs.frameCount);
+		if (VulkanComputePreview::isModelPreviewIndex(runtime.vulkanPreview.shaderIndex())) {
+			ImGui::Text("Sample:      %u / %u", gs.samplesAccumulated, gs.maxSamples);
+		}
 
 		if (gs.timestampAvailable) {
-			float frameDeltaMs = params.dt * 1000.0f;
-			float gpuLoad = frameDeltaMs > 0.0f ? static_cast<float>(gs.gpuDispatchMs / frameDeltaMs * 100.0) : 0.0f;
-			ImGui::Text("GPU dispatch: %.3f ms", gs.gpuDispatchMs);
-			ImGui::Text("GPU load est: %.1f%%", gpuLoad);
+			if (!runtime.vulkanFrameDispatched &&
+				runtime.vulkanFrameValid &&
+				VulkanComputePreview::isModelPreviewIndex(runtime.vulkanPreview.shaderIndex())) {
+				ImGui::Text("GPU dispatch: cached");
+				ImGui::Text("GPU load est: 0.0%%");
+			}
+			else {
+				float frameDeltaMs = params.dt * 1000.0f;
+				float gpuLoad = frameDeltaMs > 0.0f ? static_cast<float>(gs.gpuDispatchMs / frameDeltaMs * 100.0) : 0.0f;
+				ImGui::Text("GPU dispatch: %.3f ms", gs.gpuDispatchMs);
+				ImGui::Text("GPU load est: %.1f%%", gpuLoad);
+			}
 		} else {
 			ImGui::TextDisabled("GPU timing: not supported");
 		}
@@ -250,9 +355,9 @@ void drawVulkanPreviewPanel(RuntimeResources& runtime, bool vulkanFrameDrawn) {
 }
 
 void drawShaderSelectorPanel(RuntimeResources& runtime) {
-	ImGui::SetNextWindowSize(ImVec2(280.0f, 80.0f), ImGuiCond_Once);
+	ImGui::SetNextWindowSize(ImVec2(360.0f, 120.0f), ImGuiCond_Once);
 	ImGui::SetNextWindowPos(ImVec2(650.0f, 20.0f), ImGuiCond_Once);
-	ImGui::Begin("Shader Selector");
+	ImGui::Begin("Vulkan Mode");
 
 	if (runtime.vulkanPreview.isAvailable()) {
 		int current = runtime.vulkanPreview.shaderIndex();
@@ -266,8 +371,37 @@ void drawShaderSelectorPanel(RuntimeResources& runtime) {
 		}
 		allLabels += '\0';
 
-		if (ImGui::Combo("##shader", &current, allLabels.c_str())) {
-			runtime.vulkanPreview.setShader(current);
+		if (ImGui::Combo("##mode", &current, allLabels.c_str())) {
+			if (runtime.vulkanPreview.setShader(current)) {
+				runtime.vulkanFrameValid = false;
+				runtime.vulkanFrameDispatched = false;
+				if (VulkanComputePreview::isModelPreviewIndex(current)) {
+					frameVulkanPreviewModel(runtime);
+				}
+			}
+		}
+
+		if (VulkanComputePreview::isModelPreviewIndex(runtime.vulkanPreview.shaderIndex())) {
+			int model = runtime.vulkanPreview.modelIndex();
+			int modelCount = VulkanComputePreview::modelCount();
+
+			std::string modelLabels;
+			for (int i = 0; i < modelCount; i++) {
+				modelLabels += VulkanComputePreview::modelName(i);
+				modelLabels += '\0';
+			}
+			modelLabels += '\0';
+
+			if (ImGui::Combo("##model", &model, modelLabels.c_str())) {
+				runtime.vulkanFrameValid = false;
+				runtime.vulkanFrameDispatched = false;
+				resetRenderStats(params);
+				params.renderInvalidated = true;
+				params.shouldSample = false;
+				if (runtime.vulkanPreview.setModel(model)) {
+					frameVulkanPreviewModel(runtime);
+				}
+			}
 		}
 	} else {
 		ImGui::TextDisabled("Vulkan unavailable");

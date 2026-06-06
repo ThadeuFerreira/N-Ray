@@ -1,11 +1,15 @@
 #define VOLK_IMPLEMENTATION
 #include <volk.h>
 
+#include <gltf_scene.h>
 #include <vulkan_compute_preview.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
+#include <glm/glm.hpp>
 #include <sstream>
+#include <vector>
 
 #include "vulkan_triangle_spv.h"
 #include "tut28_star_nest_comp_spv.h"
@@ -13,17 +17,66 @@
 #include "tut28_spiral_galaxy_comp_spv.h"
 #include "tut28_battered_alien_planet_comp_spv.h"
 #include "tut28_flux_core_comp_spv.h"
+#include "vulkan_gltf_flat_comp_spv.h"
 
 namespace {
 struct PushConstants {
 	int width = 0;
 	int height = 0;
 	float time = 0.0f;
-	float padding0 = 0.0f;
+	uint32_t sampleIndex = 0u;
+	glm::vec4 cameraPos = glm::vec4(0.0f);
+	glm::vec4 cameraForward = glm::vec4(0.0f);
+	glm::vec4 cameraRight = glm::vec4(0.0f);
+	glm::vec4 cameraUp = glm::vec4(0.0f);
+	glm::vec4 cameraParams = glm::vec4(0.0f);
+	glm::uvec4 sceneCounts = glm::uvec4(0u);
 };
 
-static_assert(sizeof(PushConstants) == 16, "Push constants must match vulkan_triangle.comp.");
+static_assert(sizeof(PushConstants) == 112, "Push constants must match Vulkan preview shaders.");
 static_assert(nray_vulkan_triangle_comp_spv_len % 4 == 0, "SPIR-V bytecode size must be a multiple of 4.");
+static_assert(nray_vulkan_gltf_flat_comp_spv_len % 4 == 0, "SPIR-V bytecode size must be a multiple of 4.");
+
+struct GpuTriIntersect {
+	glm::vec4 a;
+	glm::vec4 eA;
+	glm::vec4 eB;
+	glm::uvec4 ids;
+};
+
+struct GpuTriShading {
+	glm::vec4 aN;
+	glm::vec4 bN;
+	glm::vec4 cN;
+	glm::uvec4 ids;
+};
+
+struct GpuMaterial {
+	glm::vec4 baseColor;    // rgb albedo, a opacity
+	glm::vec4 params;       // roughness, metalness, emissionIntensity, transmission
+	glm::vec4 emissionIor;  // rgb emissionCol, a IOR
+};
+
+struct GpuBvhNode {
+	glm::vec4 minBounds;
+	glm::vec4 maxBounds;
+	glm::uvec4 meta;
+};
+
+// Per-dispatch render/sky settings, uploaded to the binding 6 SSBO. Mirrors the
+// `cfg` block in vulkan_gltf_flat.comp; keep the field packing in lockstep.
+struct GpuSettings {
+	glm::vec4 renderParams; // x=maxBounces, y=rrMinBounces, z=russianRoulette(0/1), w=exposure
+	glm::vec4 skyParams;    // x=skyIntensity, y=enableSky(0/1), z=enableSun(0/1), w=contrast
+	glm::vec4 sunDir;       // xyz direction, w=sunAngle (degrees)
+	glm::vec4 sunColor;     // xyz color, w=sunIntensity
+};
+
+static_assert(sizeof(GpuTriIntersect) == 64, "GpuTriIntersect must match std430 shader layout.");
+static_assert(sizeof(GpuTriShading) == 64, "GpuTriShading must match std430 shader layout.");
+static_assert(sizeof(GpuMaterial) == 48, "GpuMaterial must match std430 shader layout.");
+static_assert(sizeof(GpuBvhNode) == 48, "GpuBvhNode must match std430 shader layout.");
+static_assert(sizeof(GpuSettings) == 64, "GpuSettings must match std430 shader layout.");
 
 const char* vkResultName(VkResult result) {
 	switch (result) {
@@ -57,21 +110,53 @@ struct ShaderEntry {
 	const char* name;
 	const unsigned char* spv;
 	unsigned int len;
+	bool requiresModel;
+};
+
+struct ModelEntry {
+	const char* name;
+	const char* path;
 };
 
 static const ShaderEntry kShaders[] = {
-	{ "Hello World Triangle",       nray_vulkan_triangle_comp_spv,          nray_vulkan_triangle_comp_spv_len          },
-	{ "Star Nest",                  tut28_star_nest_comp_spv,               tut28_star_nest_comp_spv_len               },
-	{ "Lets Self Reflect",          tut28_lets_self_reflect_comp_spv,       tut28_lets_self_reflect_comp_spv_len       },
-	{ "Spiral Galaxy",              tut28_spiral_galaxy_comp_spv,           tut28_spiral_galaxy_comp_spv_len           },
-	{ "Battered Alien Planet",      tut28_battered_alien_planet_comp_spv,   tut28_battered_alien_planet_comp_spv_len   },
-	{ "Flux Core",                  tut28_flux_core_comp_spv,               tut28_flux_core_comp_spv_len               },
+	{ "Hello World Triangle",       nray_vulkan_triangle_comp_spv,          nray_vulkan_triangle_comp_spv_len,          false },
+	{ "Star Nest",                  tut28_star_nest_comp_spv,               tut28_star_nest_comp_spv_len,               false },
+	{ "Lets Self Reflect",          tut28_lets_self_reflect_comp_spv,       tut28_lets_self_reflect_comp_spv_len,       false },
+	{ "Spiral Galaxy",              tut28_spiral_galaxy_comp_spv,           tut28_spiral_galaxy_comp_spv_len,           false },
+	{ "Battered Alien Planet",      tut28_battered_alien_planet_comp_spv,   tut28_battered_alien_planet_comp_spv_len,   false },
+	{ "Flux Core",                  tut28_flux_core_comp_spv,               tut28_flux_core_comp_spv_len,               false },
+	{ "Nissan S15 glTF Model",      nray_vulkan_gltf_flat_comp_spv,         nray_vulkan_gltf_flat_comp_spv_len,         true  },
 };
 static const int kShaderCount = static_cast<int>(sizeof(kShaders) / sizeof(kShaders[0]));
+static const int kModelShaderIndex = kShaderCount - 1;
+
+// Total descriptor set bindings: 0=pixels, 1-4=scene SSBOs, 5=accum, 6=settings.
+static constexpr uint32_t kTotalBindings = 7;
+// Scene SSBO bindings start at index 1 (binding 0 is the pixel buffer).
+static constexpr uint32_t kFirstSceneBinding = 1;
+
+static const ModelEntry kModels[] = {
+	{ "Nissan S15 Silvia", "assets/2018_garage_mak_nissan_s15_silvia_-_reggie_mah/scene.gltf" },
+	{ "Torvosaurus Tanneri", "assets/accurate_torvosaurus_tanneri/scene.gltf" },
+	{ "Beretta ARX160", "assets/beretta_arx160/scene.gltf" },
+	{ "Beretta M9", "assets/beretta_m9_gameready/scene.gltf" },
+	{ "Hulk Infinity Hulk", "assets/hulk_infinity_hulk/scene.gltf" },
+	{ "Luna Snow", "assets/luna_snow_-_sonic_trailblazer/scene.gltf" },
+	{ "Wolverine X-2099", "assets/wolverine_-_wolverine_-_x-2099_bundle/scene.gltf" },
+};
+static const int kModelCount = static_cast<int>(sizeof(kModels) / sizeof(kModels[0]));
 
 }
 
 struct VulkanComputePreview::Impl {
+	struct StorageBuffer {
+		VkBuffer buffer = VK_NULL_HANDLE;
+		VkDeviceMemory memory = VK_NULL_HANDLE;
+		VkDeviceSize allocationSize = 0;
+		size_t size = 0;
+		bool memoryCoherent = false;
+	};
+
 	VkInstance instance = VK_NULL_HANDLE;
 	VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
 	VkDevice device = VK_NULL_HANDLE;
@@ -85,6 +170,50 @@ struct VulkanComputePreview::Impl {
 	size_t pixelBufferSize = 0;
 	bool pixelMemoryCoherent = false;
 
+	// HDR accumulation buffer (binding 5): one glm::vec4 per pixel in device-local
+	// storage. The shader sums radiance here across dispatches; command buffers
+	// clear it with vkCmdFillBuffer on reset. Never read back to the host.
+	VkBuffer accumBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory accumMemory = VK_NULL_HANDLE;
+	VkDeviceSize accumAllocationSize = 0;
+	size_t accumBufferSize = 0;
+
+	// Per-dispatch render/sky settings (binding 6): a single GpuSettings record,
+	// persistently mapped host-visible, rewritten each render().
+	VkBuffer settingsBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory settingsMemory = VK_NULL_HANDLE;
+	void* mappedSettings = nullptr;
+	VkDeviceSize settingsAllocationSize = 0;
+	size_t settingsBufferSize = 0;
+	bool settingsMemoryCoherent = false;
+
+	// Progressive accumulation lifecycle. currentSample counts completed samples;
+	// the next dispatch uses it as the push-constant sample index. accumNeedsClear
+	// records a GPU clear before the next dispatch.
+	uint32_t currentSample = 0;
+	uint32_t maxSamplesCached = 1;
+	bool accumNeedsClear = true;
+
+	// Scene storage buffers are bound to descriptor set bindings 1..4 (binding 0
+	// is the pixel buffer). The enum order is the (binding - 1) index, and must
+	// stay aligned with the shader's binding declarations and the sceneCounts
+	// packing in render().
+	enum SceneBuffer {
+		SCENE_TRI_ISECT = 0,
+		SCENE_TRI_SHADING,
+		SCENE_MATERIAL,
+		SCENE_BVH,
+		SCENE_BUFFER_COUNT
+	};
+
+	StorageBuffer dummyBuffer;
+	std::array<StorageBuffer, SCENE_BUFFER_COUNT> sceneBuffers;
+	GltfPreviewScene modelScene;
+	bool modelBuffersReady = false;
+	// triCount, bvhNodeCount, materialCount, modelReady — cached once at load so
+	// render() doesn't recompute the (constant) sizes every frame.
+	glm::uvec4 sceneCounts = glm::uvec4(0u);
+
 	VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
 	VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
 	VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
@@ -94,6 +223,8 @@ struct VulkanComputePreview::Impl {
 	VkCommandPool commandPool = VK_NULL_HANDLE;
 	VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 	VkFence fence = VK_NULL_HANDLE;
+
+	VkPhysicalDeviceMemoryProperties cachedMemoryProps{};
 
 	VkQueryPool timestampPool = VK_NULL_HANDLE;
 	float timestampPeriod = 0.0f;
@@ -106,6 +237,7 @@ struct VulkanComputePreview::Impl {
 	uint32_t frameCount = 0;
 
 	int selectedShader = 0;
+	int selectedModel = 0;
 	int renderWidth = 0;
 	int renderHeight = 0;
 	bool initialized = false;
@@ -139,6 +271,10 @@ struct VulkanComputePreview::Impl {
 			!selectPhysicalDevice() ||
 			!createDevice() ||
 			!createPixelBuffer() ||
+			!createDummySceneBuffer() ||
+			!loadModelSceneResources() ||
+			!createAccumBuffer() ||
+			!createSettingsBuffer() ||
 			!createDescriptorSetLayout() ||
 			!createDescriptorPoolAndSet() ||
 			!createPipeline() ||
@@ -153,7 +289,7 @@ struct VulkanComputePreview::Impl {
 		}
 
 		initialized = true;
-		status = "Vulkan compute preview active on " + deviceName;
+		setActiveStatus();
 		return true;
 	}
 
@@ -179,22 +315,51 @@ struct VulkanComputePreview::Impl {
 
 		destroyDescriptorPool();
 		destroyPixelBuffer();
+		destroyAccumBuffer();
 
 		renderWidth = width;
 		renderHeight = height;
-		if (!createPixelBuffer() || !createDescriptorPoolAndSet()) {
+		if (!createPixelBuffer() || !createAccumBuffer() || !createDescriptorPoolAndSet()) {
 			destroyDescriptorPool();
 			destroyPixelBuffer();
+			destroyAccumBuffer();
 			initialized = false;
 			return false;
 		}
 
-		status = "Vulkan compute preview active on " + deviceName;
+		setActiveStatus();
 		return true;
 	}
 
-	bool render(float timeSeconds, std::vector<RenderPixel>& pixels) {
+	bool render(float timeSeconds, const VulkanPreviewCamera& camera, const VulkanPreviewSettings& settings, std::vector<RenderPixel>& pixels) {
 		if (!initialized) {
+			return false;
+		}
+
+		maxSamplesCached = static_cast<uint32_t>(std::max(1, settings.maxSamples));
+		if (settings.resetAccumulation) {
+			currentSample = 0;
+			accumNeedsClear = true;
+		}
+
+		// Upload the per-dispatch render/sky settings (binding 6).
+		GpuSettings gpuSettings{};
+		gpuSettings.renderParams = glm::vec4(
+			static_cast<float>(settings.maxBounces),
+			static_cast<float>(settings.rrMinBounces),
+			settings.russianRoulette ? 1.0f : 0.0f,
+			settings.exposure
+		);
+		gpuSettings.skyParams = glm::vec4(
+			settings.skyIntensity,
+			settings.enableSky ? 1.0f : 0.0f,
+			settings.enableSun ? 1.0f : 0.0f,
+			settings.contrast
+		);
+		gpuSettings.sunDir = glm::vec4(settings.sunDir, settings.sunAngle);
+		gpuSettings.sunColor = glm::vec4(settings.sunColor, settings.sunIntensity);
+		std::memcpy(mappedSettings, &gpuSettings, sizeof(GpuSettings));
+		if (!flushMappedRange(settingsMemory, settingsMemoryCoherent, "vkFlushMappedMemoryRanges settings")) {
 			return false;
 		}
 
@@ -219,11 +384,68 @@ struct VulkanComputePreview::Impl {
 			return false;
 		}
 
+		if (accumNeedsClear) {
+			vkCmdFillBuffer(commandBuffer, accumBuffer, 0, VK_WHOLE_SIZE, 0);
+
+			VkBufferMemoryBarrier clearBarrier{};
+			clearBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+			clearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			clearBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+			clearBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			clearBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			clearBarrier.buffer = accumBuffer;
+			clearBarrier.offset = 0;
+			clearBarrier.size = VK_WHOLE_SIZE;
+			vkCmdPipelineBarrier(
+				commandBuffer,
+				VK_PIPELINE_STAGE_TRANSFER_BIT,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				0,
+				0,
+				nullptr,
+				1,
+				&clearBarrier,
+				0,
+				nullptr
+			);
+
+			accumNeedsClear = false;
+		}
+		else {
+			VkBufferMemoryBarrier sampleBarrier{};
+			sampleBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+			sampleBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+			sampleBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+			sampleBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			sampleBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			sampleBarrier.buffer = accumBuffer;
+			sampleBarrier.offset = 0;
+			sampleBarrier.size = VK_WHOLE_SIZE;
+			vkCmdPipelineBarrier(
+				commandBuffer,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				0,
+				0,
+				nullptr,
+				1,
+				&sampleBarrier,
+				0,
+				nullptr
+			);
+		}
+
 		PushConstants pushConstants{
 			renderWidth,
 			renderHeight,
 			timeSeconds,
-			0.0f
+			currentSample,
+			glm::vec4(camera.position, 0.0f),
+			glm::vec4(camera.forward, 0.0f),
+			glm::vec4(camera.right, 0.0f),
+			glm::vec4(camera.up, 0.0f),
+			glm::vec4(camera.verticalScale, camera.aspect, 0.0f, 0.0f),
+			sceneCounts
 		};
 
 		if (timestampSupported && timestampPool != VK_NULL_HANDLE) {
@@ -243,11 +465,11 @@ struct VulkanComputePreview::Impl {
 		VkMemoryBarrier memoryBarrier{};
 		memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
 		memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		memoryBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+		memoryBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 		vkCmdPipelineBarrier(
 			commandBuffer,
 			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			VK_PIPELINE_STAGE_HOST_BIT,
+			VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			0,
 			1,
 			&memoryBarrier,
@@ -317,6 +539,7 @@ struct VulkanComputePreview::Impl {
 		}
 
 		frameCount++;
+		currentSample++;
 		pixels.resize(static_cast<size_t>(renderWidth) * static_cast<size_t>(renderHeight));
 		std::memcpy(pixels.data(), mappedPixels, pixelBufferSize);
 		return true;
@@ -362,7 +585,13 @@ struct VulkanComputePreview::Impl {
 			vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
 			descriptorSetLayout = VK_NULL_HANDLE;
 		}
+		destroyStorageBuffer(dummyBuffer);
+		for (StorageBuffer& buffer : sceneBuffers) {
+			destroyStorageBuffer(buffer);
+		}
 		destroyPixelBuffer();
+		destroyAccumBuffer();
+		destroySettingsBuffer();
 		if (device != VK_NULL_HANDLE) {
 			vkDestroyDevice(device, nullptr);
 			device = VK_NULL_HANDLE;
@@ -382,6 +611,12 @@ struct VulkanComputePreview::Impl {
 		pixelAllocationSize = 0;
 		pixelBufferSize = 0;
 		pixelMemoryCoherent = false;
+		currentSample = 0;
+		maxSamplesCached = 1;
+		accumNeedsClear = true;
+		modelBuffersReady = false;
+		modelScene = {};
+		sceneCounts = glm::uvec4(0u);
 		initialized = false;
 		lastGpuMs = 0.0;
 		localHeapUsed = 0;
@@ -423,6 +658,164 @@ struct VulkanComputePreview::Impl {
 		pixelAllocationSize = 0;
 		pixelBufferSize = 0;
 		pixelMemoryCoherent = false;
+	}
+
+		// Create a persistently-mapped host-visible STORAGE_BUFFER for data the host
+		// updates every dispatch, unlike the create-once createStorageBuffer helper
+		// which unmaps after upload.
+	bool createMappedBuffer(VkBuffer& buffer, VkDeviceMemory& memory, void*& mapped,
+		VkDeviceSize& allocationSize, size_t byteSize, bool& coherent, const char* tag) {
+		VkBufferCreateInfo bufferInfo{};
+		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		bufferInfo.size = static_cast<VkDeviceSize>(byteSize);
+		bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+		VkResult result = vkCreateBuffer(device, &bufferInfo, nullptr, &buffer);
+		if (result != VK_SUCCESS) {
+			return failVk((std::string("vkCreateBuffer ") + tag).c_str(), result);
+		}
+
+		VkMemoryRequirements memoryReqs{};
+		vkGetBufferMemoryRequirements(device, buffer, &memoryReqs);
+
+		uint32_t memoryTypeIndex = 0;
+		coherent = true;
+		if (!findMemoryType(memoryReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, memoryTypeIndex)) {
+			coherent = false;
+			if (!findMemoryType(memoryReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memoryTypeIndex)) {
+				return fail(std::string("No host-visible memory type for Vulkan ") + tag + " buffer");
+			}
+		}
+
+		VkMemoryAllocateInfo allocateInfo{};
+		allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocateInfo.allocationSize = memoryReqs.size;
+		allocateInfo.memoryTypeIndex = memoryTypeIndex;
+
+		result = vkAllocateMemory(device, &allocateInfo, nullptr, &memory);
+		if (result != VK_SUCCESS) {
+			return failVk((std::string("vkAllocateMemory ") + tag).c_str(), result);
+		}
+		allocationSize = memoryReqs.size;
+
+		result = vkBindBufferMemory(device, buffer, memory, 0);
+		if (result != VK_SUCCESS) {
+			return failVk((std::string("vkBindBufferMemory ") + tag).c_str(), result);
+		}
+
+		result = vkMapMemory(device, memory, 0, allocationSize, 0, &mapped);
+		if (result != VK_SUCCESS) {
+			return failVk((std::string("vkMapMemory ") + tag).c_str(), result);
+		}
+		return true;
+	}
+
+	void destroyMappedBuffer(VkBuffer& buffer, VkDeviceMemory& memory, void*& mapped, VkDeviceSize& allocationSize) {
+		if (mapped != nullptr) {
+			vkUnmapMemory(device, memory);
+			mapped = nullptr;
+		}
+		if (buffer != VK_NULL_HANDLE) {
+			vkDestroyBuffer(device, buffer, nullptr);
+			buffer = VK_NULL_HANDLE;
+		}
+		if (memory != VK_NULL_HANDLE) {
+			vkFreeMemory(device, memory, nullptr);
+			memory = VK_NULL_HANDLE;
+		}
+		allocationSize = 0;
+	}
+
+	// Flush a host write to non-coherent mapped memory so the device sees it.
+	bool flushMappedRange(VkDeviceMemory memory, bool coherent, const char* op) {
+		if (coherent) {
+			return true;
+		}
+		VkMappedMemoryRange range{};
+		range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+		range.memory = memory;
+		range.offset = 0;
+		range.size = VK_WHOLE_SIZE;
+		VkResult result = vkFlushMappedMemoryRanges(device, 1, &range);
+		if (result != VK_SUCCESS) {
+			return failVk(op, result);
+		}
+		return true;
+	}
+
+	bool createAccumBuffer() {
+		accumBufferSize = static_cast<size_t>(renderWidth) * static_cast<size_t>(renderHeight) * sizeof(glm::vec4);
+
+		VkBufferCreateInfo bufferInfo{};
+		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		bufferInfo.size = static_cast<VkDeviceSize>(accumBufferSize);
+		bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+		VkResult result = vkCreateBuffer(device, &bufferInfo, nullptr, &accumBuffer);
+		if (result != VK_SUCCESS) {
+			return failVk("vkCreateBuffer accum", result);
+		}
+
+		VkMemoryRequirements memoryReqs{};
+		vkGetBufferMemoryRequirements(device, accumBuffer, &memoryReqs);
+
+		uint32_t memoryTypeIndex = 0;
+		if (!findMemoryType(memoryReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memoryTypeIndex)) {
+			destroyAccumBuffer();
+			return fail("No device-local memory type for Vulkan accumulation buffer");
+		}
+
+		VkMemoryAllocateInfo allocateInfo{};
+		allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocateInfo.allocationSize = memoryReqs.size;
+		allocateInfo.memoryTypeIndex = memoryTypeIndex;
+
+		result = vkAllocateMemory(device, &allocateInfo, nullptr, &accumMemory);
+		if (result != VK_SUCCESS) {
+			destroyAccumBuffer();
+			return failVk("vkAllocateMemory accum", result);
+		}
+		accumAllocationSize = memoryReqs.size;
+
+		result = vkBindBufferMemory(device, accumBuffer, accumMemory, 0);
+		if (result != VK_SUCCESS) {
+			destroyAccumBuffer();
+			return failVk("vkBindBufferMemory accum", result);
+		}
+
+		currentSample = 0;
+		accumNeedsClear = true;
+		return true;
+	}
+
+	void destroyAccumBuffer() {
+		if (accumBuffer != VK_NULL_HANDLE) {
+			vkDestroyBuffer(device, accumBuffer, nullptr);
+			accumBuffer = VK_NULL_HANDLE;
+		}
+		if (accumMemory != VK_NULL_HANDLE) {
+			vkFreeMemory(device, accumMemory, nullptr);
+			accumMemory = VK_NULL_HANDLE;
+		}
+		accumAllocationSize = 0;
+		accumBufferSize = 0;
+	}
+
+	bool createSettingsBuffer() {
+		settingsBufferSize = sizeof(GpuSettings);
+		if (!createMappedBuffer(settingsBuffer, settingsMemory, mappedSettings, settingsAllocationSize, settingsBufferSize, settingsMemoryCoherent, "settings")) {
+			return false;
+		}
+		std::memset(mappedSettings, 0, settingsBufferSize);
+		return flushMappedRange(settingsMemory, settingsMemoryCoherent, "vkFlushMappedMemoryRanges settings");
+	}
+
+	void destroySettingsBuffer() {
+		destroyMappedBuffer(settingsBuffer, settingsMemory, mappedSettings, settingsAllocationSize);
+		settingsBufferSize = 0;
+		settingsMemoryCoherent = false;
 	}
 
 	bool fail(const std::string& message) {
@@ -511,15 +904,14 @@ struct VulkanComputePreview::Impl {
 		}
 
 		{
-			VkPhysicalDeviceMemoryProperties memProps{};
-			vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
+			vkGetPhysicalDeviceMemoryProperties(physicalDevice, &cachedMemoryProps);
 			localHeapIndex = UINT32_MAX;
 			localHeapBytes = 0;
-			for (uint32_t i = 0; i < memProps.memoryHeapCount; i++) {
-				if ((memProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
-					if (localHeapIndex == UINT32_MAX || memProps.memoryHeaps[i].size > localHeapBytes) {
+			for (uint32_t i = 0; i < cachedMemoryProps.memoryHeapCount; i++) {
+				if ((cachedMemoryProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+					if (localHeapIndex == UINT32_MAX || cachedMemoryProps.memoryHeaps[i].size > localHeapBytes) {
 						localHeapIndex = i;
-						localHeapBytes = memProps.memoryHeaps[i].size;
+						localHeapBytes = cachedMemoryProps.memoryHeaps[i].size;
 					}
 				}
 			}
@@ -599,12 +991,9 @@ struct VulkanComputePreview::Impl {
 	}
 
 	bool findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags preferredFlags, uint32_t& memoryTypeIndex) const {
-		VkPhysicalDeviceMemoryProperties memoryProps{};
-		vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memoryProps);
-
-		for (uint32_t i = 0; i < memoryProps.memoryTypeCount; i++) {
+		for (uint32_t i = 0; i < cachedMemoryProps.memoryTypeCount; i++) {
 			bool typeSupported = (typeBits & (1u << i)) != 0;
-			bool flagsSupported = (memoryProps.memoryTypes[i].propertyFlags & preferredFlags) == preferredFlags;
+			bool flagsSupported = (cachedMemoryProps.memoryTypes[i].propertyFlags & preferredFlags) == preferredFlags;
 			if (typeSupported && flagsSupported) {
 				memoryTypeIndex = i;
 				return true;
@@ -612,6 +1001,208 @@ struct VulkanComputePreview::Impl {
 		}
 
 		return false;
+	}
+
+	void destroyStorageBuffer(StorageBuffer& resource) {
+		if (resource.buffer != VK_NULL_HANDLE) {
+			vkDestroyBuffer(device, resource.buffer, nullptr);
+			resource.buffer = VK_NULL_HANDLE;
+		}
+		if (resource.memory != VK_NULL_HANDLE) {
+			vkFreeMemory(device, resource.memory, nullptr);
+			resource.memory = VK_NULL_HANDLE;
+		}
+		resource.allocationSize = 0;
+		resource.size = 0;
+		resource.memoryCoherent = false;
+	}
+
+	bool createStorageBuffer(StorageBuffer& resource, const void* data, size_t byteSize) {
+		destroyStorageBuffer(resource);
+
+		if (byteSize == 0) {
+			byteSize = sizeof(uint32_t) * 4;
+			data = nullptr;
+		}
+
+		VkBufferCreateInfo bufferInfo{};
+		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		bufferInfo.size = static_cast<VkDeviceSize>(byteSize);
+		bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+		VkResult result = vkCreateBuffer(device, &bufferInfo, nullptr, &resource.buffer);
+		if (result != VK_SUCCESS) {
+			return failVk("vkCreateBuffer scene", result);
+		}
+
+		VkMemoryRequirements memoryReqs{};
+		vkGetBufferMemoryRequirements(device, resource.buffer, &memoryReqs);
+
+		uint32_t memoryTypeIndex = 0;
+		resource.memoryCoherent = true;
+		if (!findMemoryType(memoryReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, memoryTypeIndex)) {
+			resource.memoryCoherent = false;
+			if (!findMemoryType(memoryReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memoryTypeIndex)) {
+				destroyStorageBuffer(resource);
+				return fail("No host-visible memory type for Vulkan scene buffer");
+			}
+		}
+
+		VkMemoryAllocateInfo allocateInfo{};
+		allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocateInfo.allocationSize = memoryReqs.size;
+		allocateInfo.memoryTypeIndex = memoryTypeIndex;
+
+		result = vkAllocateMemory(device, &allocateInfo, nullptr, &resource.memory);
+		if (result != VK_SUCCESS) {
+			destroyStorageBuffer(resource);
+			return failVk("vkAllocateMemory scene", result);
+		}
+
+		resource.allocationSize = memoryReqs.size;
+		resource.size = byteSize;
+
+		result = vkBindBufferMemory(device, resource.buffer, resource.memory, 0);
+		if (result != VK_SUCCESS) {
+			destroyStorageBuffer(resource);
+			return failVk("vkBindBufferMemory scene", result);
+		}
+
+		void* mapped = nullptr;
+		result = vkMapMemory(device, resource.memory, 0, resource.allocationSize, 0, &mapped);
+		if (result != VK_SUCCESS) {
+			destroyStorageBuffer(resource);
+			return failVk("vkMapMemory scene", result);
+		}
+
+		if (data != nullptr) {
+			std::memcpy(mapped, data, byteSize);
+		}
+		else {
+			std::memset(mapped, 0, byteSize);
+		}
+
+		if (!resource.memoryCoherent) {
+			VkMappedMemoryRange range{};
+			range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+			range.memory = resource.memory;
+			range.offset = 0;
+			range.size = VK_WHOLE_SIZE;
+			result = vkFlushMappedMemoryRanges(device, 1, &range);
+			if (result != VK_SUCCESS) {
+				vkUnmapMemory(device, resource.memory);
+				destroyStorageBuffer(resource);
+				return failVk("vkFlushMappedMemoryRanges scene", result);
+			}
+		}
+
+		vkUnmapMemory(device, resource.memory);
+		return true;
+	}
+
+	bool createDummySceneBuffer() {
+		uint32_t zero[4] = {};
+		return createStorageBuffer(dummyBuffer, zero, sizeof(zero));
+	}
+
+	bool loadModelSceneResources() {
+		modelBuffersReady = false;
+		sceneCounts = glm::uvec4(0u);
+		modelScene = {};
+		for (StorageBuffer& buffer : sceneBuffers) {
+			destroyStorageBuffer(buffer);
+		}
+
+		int modelIndex = selectedModel >= 0 && selectedModel < kModelCount ? selectedModel : 0;
+		if (!loadGltfPreviewScene(kModels[modelIndex].path, modelScene)) {
+			if (!modelScene.status.empty()) {
+				modelScene.status = std::string(kModels[modelIndex].name) + ": " + modelScene.status;
+			}
+			return true;
+		}
+		modelScene.status = std::string(kModels[modelIndex].name) + ": " + modelScene.status;
+
+		std::vector<GpuTriIntersect> gpuTriIsect;
+		gpuTriIsect.reserve(modelScene.triIsect.size());
+		for (const TriIntersect& tri : modelScene.triIsect) {
+			gpuTriIsect.push_back({
+				glm::vec4(tri.a, 0.0f),
+				glm::vec4(tri.eA, 0.0f),
+				glm::vec4(tri.eB, 0.0f),
+				glm::uvec4(tri.idx, tri.doubleSided, 0u, 0u)
+			});
+		}
+
+		std::vector<GpuTriShading> gpuTriShading;
+		gpuTriShading.reserve(modelScene.tris.size());
+		for (const Tri& tri : modelScene.tris) {
+			gpuTriShading.push_back({
+				glm::vec4(tri.aN, 0.0f),
+				glm::vec4(tri.bN, 0.0f),
+				glm::vec4(tri.cN, 0.0f),
+				glm::uvec4(tri.materialIdx, tri.modelIdx, 0u, 0u)
+			});
+		}
+
+		std::vector<GpuMaterial> gpuMaterials;
+		gpuMaterials.reserve(modelScene.materials.size());
+		for (size_t i = 0; i < modelScene.materials.size(); ++i) {
+			const PBRMaterial& material = modelScene.materials[i];
+			float opacity = i < modelScene.materialOpacity.size() ? modelScene.materialOpacity[i] : 1.0f;
+			float transmission = i < modelScene.materialTransmission.size() ? modelScene.materialTransmission[i] : 0.0f;
+			gpuMaterials.push_back({
+				glm::vec4(material.albedo, opacity),
+				glm::vec4(material.roughness, material.metalness, material.emissionIntensity, transmission),
+				glm::vec4(material.emissionCol, material.IOR)
+			});
+		}
+
+		std::vector<GpuBvhNode> gpuBvh;
+		gpuBvh.reserve(modelScene.flatBvh.size());
+		for (const CompactBVH& node : modelScene.flatBvh) {
+			uint32_t startOrSecond = node.triCount > 0 ? node.startIndex : node.secondChild;
+			gpuBvh.push_back({
+				glm::vec4(node.min, 0.0f),
+				glm::vec4(node.max, 0.0f),
+				glm::uvec4(startOrSecond, node.triCount, node.axis, 0u)
+			});
+		}
+
+		if (!createStorageBuffer(sceneBuffers[SCENE_TRI_ISECT], gpuTriIsect.data(), gpuTriIsect.size() * sizeof(GpuTriIntersect)) ||
+			!createStorageBuffer(sceneBuffers[SCENE_TRI_SHADING], gpuTriShading.data(), gpuTriShading.size() * sizeof(GpuTriShading)) ||
+			!createStorageBuffer(sceneBuffers[SCENE_MATERIAL], gpuMaterials.data(), gpuMaterials.size() * sizeof(GpuMaterial)) ||
+			!createStorageBuffer(sceneBuffers[SCENE_BVH], gpuBvh.data(), gpuBvh.size() * sizeof(GpuBvhNode))) {
+			modelScene.status = "glTF model Vulkan upload failed: " + status;
+			for (StorageBuffer& buffer : sceneBuffers) {
+				destroyStorageBuffer(buffer);
+			}
+			return true;
+		}
+
+		sceneCounts = glm::uvec4(
+			static_cast<uint32_t>(modelScene.triIsect.size()),
+			static_cast<uint32_t>(modelScene.flatBvh.size()),
+			static_cast<uint32_t>(modelScene.materials.size()),
+			1u
+		);
+		modelBuffersReady = true;
+		return true;
+	}
+
+	const StorageBuffer& descriptorBufferForBinding(uint32_t binding) const {
+		if (!modelBuffersReady || binding < kFirstSceneBinding || binding >= kFirstSceneBinding + SCENE_BUFFER_COUNT) {
+			return dummyBuffer;
+		}
+		return sceneBuffers[binding - kFirstSceneBinding];
+	}
+
+	void setActiveStatus() {
+		status = "Vulkan compute preview active on " + deviceName;
+		if (!modelScene.status.empty()) {
+			status += "\n";
+			status += modelScene.status;
+		}
 	}
 
 	bool createPixelBuffer() {
@@ -665,16 +1256,18 @@ struct VulkanComputePreview::Impl {
 	}
 
 	bool createDescriptorSetLayout() {
-		VkDescriptorSetLayoutBinding binding{};
-		binding.binding = 0;
-		binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		binding.descriptorCount = 1;
-		binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+		std::array<VkDescriptorSetLayoutBinding, kTotalBindings> bindings{};
+		for (uint32_t i = 0; i < bindings.size(); ++i) {
+			bindings[i].binding = i;
+			bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			bindings[i].descriptorCount = 1;
+			bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+		}
 
 		VkDescriptorSetLayoutCreateInfo layoutInfo{};
 		layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-		layoutInfo.bindingCount = 1;
-		layoutInfo.pBindings = &binding;
+		layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+		layoutInfo.pBindings = bindings.data();
 
 		VkResult result = vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout);
 		if (result != VK_SUCCESS) {
@@ -691,7 +1284,7 @@ struct VulkanComputePreview::Impl {
 
 		VkDescriptorPoolSize poolSize{};
 		poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		poolSize.descriptorCount = 1;
+		poolSize.descriptorCount = kTotalBindings;
 
 		VkDescriptorPoolCreateInfo poolInfo{};
 		poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -715,20 +1308,37 @@ struct VulkanComputePreview::Impl {
 			return failVk("vkAllocateDescriptorSets", result);
 		}
 
-		VkDescriptorBufferInfo bufferInfo{};
-		bufferInfo.buffer = pixelBuffer;
-		bufferInfo.offset = 0;
-		bufferInfo.range = static_cast<VkDeviceSize>(pixelBufferSize);
+		std::array<VkDescriptorBufferInfo, kTotalBindings> bufferInfos{};
+		std::array<VkWriteDescriptorSet, kTotalBindings> writes{};
+		for (uint32_t binding = 0; binding < writes.size(); ++binding) {
+			if (binding == 0) {
+				bufferInfos[binding].buffer = pixelBuffer;
+				bufferInfos[binding].range = static_cast<VkDeviceSize>(pixelBufferSize);
+			}
+			else if (binding == 5) {
+				bufferInfos[binding].buffer = accumBuffer;
+				bufferInfos[binding].range = static_cast<VkDeviceSize>(accumBufferSize);
+			}
+			else if (binding == 6) {
+				bufferInfos[binding].buffer = settingsBuffer;
+				bufferInfos[binding].range = static_cast<VkDeviceSize>(settingsBufferSize);
+			}
+			else {
+				const StorageBuffer& buffer = descriptorBufferForBinding(binding);
+				bufferInfos[binding].buffer = buffer.buffer;
+				bufferInfos[binding].range = static_cast<VkDeviceSize>(buffer.size);
+			}
+			bufferInfos[binding].offset = 0;
 
-		VkWriteDescriptorSet write{};
-		write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		write.dstSet = descriptorSet;
-		write.dstBinding = 0;
-		write.descriptorCount = 1;
-		write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		write.pBufferInfo = &bufferInfo;
+			writes[binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			writes[binding].dstSet = descriptorSet;
+			writes[binding].dstBinding = binding;
+			writes[binding].descriptorCount = 1;
+			writes[binding].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			writes[binding].pBufferInfo = &bufferInfos[binding];
+		}
 
-		vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+		vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 		return true;
 	}
 
@@ -828,6 +1438,10 @@ struct VulkanComputePreview::Impl {
 		if (!initialized || index < 0 || index >= kShaderCount) {
 			return false;
 		}
+		if (kShaders[index].requiresModel && !modelBuffersReady) {
+			status = "Cannot select glTF model preview\n" + modelScene.status;
+			return false;
+		}
 		if (index == selectedShader) {
 			return true;
 		}
@@ -851,7 +1465,38 @@ struct VulkanComputePreview::Impl {
 
 		frameCount = 0;
 		lastGpuMs = 0.0;
+		setActiveStatus();
 		return true;
+	}
+
+	bool switchModel(int index) {
+		if (!initialized || index < 0 || index >= kModelCount) {
+			return false;
+		}
+		if (index == selectedModel) {
+			return true;
+		}
+
+		VkResult result = vkDeviceWaitIdle(device);
+		if (result != VK_SUCCESS) {
+			return failVk("vkDeviceWaitIdle model switch", result);
+		}
+
+		destroyDescriptorPool();
+		selectedModel = index;
+		if (!loadModelSceneResources() || !createDescriptorPoolAndSet()) {
+			destroyDescriptorPool();
+			modelBuffersReady = false;
+			sceneCounts = glm::uvec4(0u);
+			return false;
+		}
+
+		currentSample = 0;
+		accumNeedsClear = true;
+		frameCount = 0;
+		lastGpuMs = 0.0;
+		setActiveStatus();
+		return modelBuffersReady;
 	}
 };
 
@@ -871,8 +1516,16 @@ bool VulkanComputePreview::resize(int width, int height) {
 	return m_impl->resize(width, height);
 }
 
-bool VulkanComputePreview::render(float timeSeconds, std::vector<RenderPixel>& pixels) {
-	return m_impl->render(timeSeconds, pixels);
+bool VulkanComputePreview::render(float timeSeconds, const VulkanPreviewCamera& camera, const VulkanPreviewSettings& settings, std::vector<RenderPixel>& pixels) {
+	return m_impl->render(timeSeconds, camera, settings, pixels);
+}
+
+uint32_t VulkanComputePreview::samplesAccumulated() const {
+	return m_impl->currentSample;
+}
+
+bool VulkanComputePreview::converged() const {
+	return m_impl->currentSample >= m_impl->maxSamplesCached;
 }
 
 void VulkanComputePreview::shutdown() {
@@ -912,6 +1565,37 @@ const char* VulkanComputePreview::shaderName(int index) {
 	return kShaders[index].name;
 }
 
+bool VulkanComputePreview::isModelPreviewIndex(int index) {
+	return index == kModelShaderIndex;
+}
+
+bool VulkanComputePreview::setModel(int index) {
+	return m_impl->switchModel(index);
+}
+
+int VulkanComputePreview::modelIndex() const {
+	return m_impl->selectedModel;
+}
+
+int VulkanComputePreview::modelCount() {
+	return kModelCount;
+}
+
+const char* VulkanComputePreview::modelName(int index) {
+	if (index < 0 || index >= kModelCount) return "Unknown";
+	return kModels[index].name;
+}
+
+bool VulkanComputePreview::modelBounds(glm::vec3& boundsMin, glm::vec3& boundsMax) const {
+	if (!m_impl->modelBuffersReady) {
+		return false;
+	}
+
+	boundsMin = m_impl->modelScene.boundsMin;
+	boundsMax = m_impl->modelScene.boundsMax;
+	return true;
+}
+
 GpuStats VulkanComputePreview::gpuStats() const {
 	GpuStats s{};
 	s.gpuDispatchMs = m_impl->lastGpuMs;
@@ -921,5 +1605,7 @@ GpuStats VulkanComputePreview::gpuStats() const {
 	s.pixelBufferBytes = m_impl->pixelBufferSize;
 	s.memBudgetAvailable = m_impl->memBudgetSupported;
 	s.timestampAvailable = m_impl->timestampSupported;
+	s.samplesAccumulated = m_impl->currentSample;
+	s.maxSamples = m_impl->maxSamplesCached;
 	return s;
 }

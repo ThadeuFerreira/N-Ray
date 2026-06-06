@@ -35,7 +35,7 @@ void UI::drawRenderSettings(Params& params, const LayoutSizes& sizes) {
 		markDisplayDirty(params);
 	}
 
-	if (sliderHelper("Resolution", "Sets image resolution size", sizes.slider, params.res, 16, 1024)) {
+	if (sliderHelper("Resolution", "Sets image resolution size", sizes.slider, params.res, 512, 8192)) {
 		markRenderDirty(params);
 	}
 }

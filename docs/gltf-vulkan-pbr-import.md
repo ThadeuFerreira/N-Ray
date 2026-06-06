@@ -1,9 +1,9 @@
 # glTF PBR Import For The Vulkan Path
 
-This document describes how N-Ray should import glTF 2.0 assets into the future
-Vulkan path tracer while preserving physically based material intent. It is a
-documentation-only planning note; the current renderer still uses `ObjImporter`
-and CPU-owned arrays.
+This document describes how N-Ray should import glTF 2.0 assets into the Vulkan
+path while preserving physically based material intent. The current CPU path
+still uses the OBJ `ObjImporter` scene, while `VulkanComputePreview` has a
+flat glTF preview importer for local validation assets.
 
 References:
 
@@ -12,21 +12,82 @@ References:
 - [TinyGLTF](https://github.com/syoyo/tinygltf)
 - [Vulkan descriptor set specification](https://docs.vulkan.org/spec/latest/chapters/descriptorsets.html)
 - [Vulkan memory allocation guide](https://docs.vulkan.org/guide/latest/memory_allocation.html)
+- Local reference loaders: [`tutorials/saschawillems/gltf/`](../tutorials/saschawillems/gltf/) — vendored, reference-only copies of the
+  [`SaschaWillems/Vulkan`](https://github.com/SaschaWillems/Vulkan) `gltfloading` and `gltfscenerendering` examples (see
+  [Reference Implementations](#reference-implementations) below).
 
 ## Role In N-Ray
 
 glTF should become the preferred asset interchange format once the Vulkan GPU
-buffer contract is stable. It should not be the first Vulkan milestone. The
-first compute path should still upload the renderer-owned data that already
-exists today: `data.triIsect`, triangle shading data derived from `data.tris`,
-`data.materials`, and `globalCompactBVH`.
+buffer contract is stable. The first compute path should still upload the
+renderer-owned data that already exists today: `data.triIsect`, triangle shading
+data derived from `data.tris`, `data.materials`, and `globalCompactBVH`.
 
-After that contract is proven, a glTF importer should replace the hardcoded
-`ObjImporter` scene frontend by flattening glTF meshes and materials into the
-same GPU upload model. If raylib `Model` or `Mesh` loading is used during
-transition, treat it as an import frontend only: copy CPU mesh data into N-Ray's
-native Vulkan staging structs and do not bind raylib/OpenGL mesh buffers to the
-compute renderer.
+The current preview importer is a validation bridge: it parses one local glTF
+asset with TinyGLTF, flattens it into `Tri`/`TriIntersect`/`PBRMaterial`/compact
+BVH data, uploads explicit storage-buffer structs, and renders through the
+progressive Vulkan compute preview. It does not replace the CPU runtime scene or
+implement full PBR texture sampling yet.
+
+After that contract is proven in the renderer path, a glTF importer should
+replace the hardcoded `ObjImporter` scene frontend by flattening glTF meshes and
+materials into the same GPU upload model. If raylib `Model` or `Mesh` loading is
+used during transition, treat it as an import frontend only: copy CPU mesh data
+into N-Ray's native Vulkan staging structs and do not bind raylib/OpenGL mesh
+buffers to the compute renderer.
+
+## PBR Is The Material Model, Not The Transport Algorithm
+
+PBR does not require ray tracing or path tracing. Physically based rendering is a
+local shading model: it describes how light interacts with one surface hit point.
+The usual real-time model is a Cook-Torrance BRDF with GGX microfacets,
+Fresnel, roughness, metalness, and energy-conserving diffuse/specular terms.
+
+That local BRDF only needs the data available at the shaded pixel or hit point:
+
+- `V`: view direction.
+- `L`: incoming light direction.
+- `N`: geometric or normal-mapped surface normal.
+- Material parameters such as albedo, roughness, metalness, emission, normal
+  map, and sometimes transmission or absorption.
+
+A traditional rasterization renderer can evaluate those equations in a fragment
+shader. The renderer supplies direct lights, shadow maps, reflection probes,
+lightmaps, spherical harmonics, ambient cubes, or image-based lighting to
+approximate the incoming light. The PBR material math can still be physically
+plausible even when the global illumination source is approximated.
+
+Ray tracing and path tracing solve a different problem: global light transport.
+They ask where light came from, what it hit before this point, and where it
+continues after a bounce. In a path tracer, every surface hit still evaluates a
+material model like PBR. The BRDF determines how much energy is absorbed,
+emitted, reflected, refracted, or scattered into the next sampled ray direction.
+
+| Renderer abstraction | Direct lighting | Indirect GI | Reflection/refraction | Material shading math |
+| --- | --- | --- | --- | --- |
+| PBR rasterizer | Analytical lights and shadow maps | Approximated with IBL, probes, lightmaps, ambient cubes, or spherical harmonics | Approximated with SSR, probes, planar reflections, or cubemaps | Cook-Torrance PBR in a fragment shader |
+| PBR path tracer | Rays sampled toward lights or through the scene | Traced dynamically through many bounces | Traced through recursive/specular/transmissive paths | Cook-Torrance PBR at each ray hit |
+
+N-Ray is combining these ideas because the Vulkan target is a path tracer, and a
+path tracer needs a physically plausible material model to look correct. Using a
+non-physical model such as classic Blinn-Phong for bounce decisions would break
+energy conservation and make indirect light, metals, rough surfaces, and glass
+behave incorrectly. PBR supplies the micro-scale material interaction; path
+tracing supplies the macro-scale light transport.
+
+This also explains the staged implementation:
+
+- The glTF importer and `PBRMaterial` conversion are renderer data work, not
+  inherently ray-tracing work.
+- A Vulkan graphics/raster backend could use the same imported PBR material
+  factors and textures in fragment shaders.
+- The current Vulkan compute preview does not use a graphics fragment stage, so
+  it must evaluate material shading inside the compute shader after traversal
+  finds the closest hit.
+- The current glTF compute shader is still a validation step for scene
+  flattening, material indexing, BVH traversal, analytic material factors, and
+  progressive accumulation before texture sampling and full glTF material
+  coverage are added.
 
 ## Local Validation Corpus
 
@@ -38,6 +99,9 @@ external sample repositories:
 - `assets/accurate_torvosaurus_tanneri/scene.gltf`
 - `assets/beretta_arx160/scene.gltf`
 - `assets/beretta_m9_gameready/scene.gltf`
+- `assets/hulk_infinity_hulk/scene.gltf`
+- `assets/luna_snow_-_sonic_trailblazer/scene.gltf`
+- `assets/wolverine_-_wolverine_-_x-2099_bundle/scene.gltf`
 
 Each validation bundle should keep its `scene.gltf` or `.glb`, binary buffers,
 textures, and license/source files together in the same subfolder. Folders under
@@ -48,6 +112,16 @@ These assets are separate from the current `PathTracingRenderer/models/` and
 `PathTracingRenderer/textures/` runtime assets used by the OBJ-based CPU path.
 They should drive validation for glTF accessor decoding, PBR material mapping,
 texture color-space handling, tangent generation, and Vulkan upload layout.
+
+The preview importer also accepts skinned validation meshes. It does not upload
+animated joint palettes yet; instead, it evaluates the glTF bind pose on the CPU
+when a mesh node has `skin`, `JOINTS_0`, `WEIGHTS_0`, and inverse bind matrices.
+For each vertex it builds the usual linear-blend skin matrix from
+`jointWorld * inverseBindMatrix`, including the root node and N-Ray Z-up
+conversion, then flattens the skinned bind-pose triangle into the same BVH data
+as rigid meshes. This keeps assets with Blender/FBX root-axis correction nodes
+upright in the current static preview while leaving runtime skeletal animation
+and GPU joint-palette skinning as future work.
 
 ## Geometry Contract
 
@@ -179,6 +253,9 @@ is the bitangent handedness. When tangents exist:
 - Re-orthogonalize tangent against normal.
 - Compute bitangent as `cross(normal, tangent.xyz) * tangent.w`.
 
+See `tutorials/saschawillems/gltf/gltfscenerendering/` for the worked example of
+the `TANGENT` accessor load and this exact TBN reconstruction.
+
 When tangents are missing and a normal texture is used, the importer should
 generate tangents using MikkTSpace-compatible logic from positions, normals, and
 the selected texture coordinates. The glTF specification recommends MikkTSpace
@@ -189,6 +266,39 @@ Do not add a global "invert normal Y" default for glTF. glTF's normal convention
 is OpenGL-style +Y. If N-Ray later imports non-glTF source data or artist-authored
 DirectX normal bakes, carry an explicit material/import flag and flip the green
 channel only for those assets.
+
+## Reference Implementations
+
+Two canonical tinygltf-based loaders are vendored locally under
+[`tutorials/saschawillems/gltf/`](../tutorials/saschawillems/gltf/) as
+reference-only material (not built; they depend on the upstream example
+framework). Read them before writing or extending the importer — they are the
+worked examples for the rules above.
+
+- `tutorials/saschawillems/gltf/gltfloading/gltfloading.cpp` (`VulkanglTFModel`,
+  FlightHelmet) — minimal end-to-end loader: `LoadASCIIFromFile`, node hierarchy
+  with parent-matrix accumulation, TRS-vs-`matrix` local transforms,
+  POSITION/NORMAL/TEXCOORD_0 accessor decode via
+  `accessor.byteOffset + view.byteOffset`, the uint32/uint16/uint8 index
+  component-type switch, and embedded-image RGB→RGBA conversion.
+- `tutorials/saschawillems/gltf/gltfscenerendering/` (`VulkanglTFScene`, Sponza,
+  plus its tutorial `README.md`) — adds the production material layer: `TANGENT`
+  load + TBN reconstruction, `doubleSided`/`alphaMode`/`alphaCutoff`, per-material
+  pipelines via specialization constants, external texture loading, and node
+  visibility toggling.
+
+Mapping to N-Ray's current importer
+(`PathTracingRenderer/src/gltf_scene.cpp`): N-Ray already does node hierarchy +
+TRS, all three index types, and **bounds-checked** accessor decode (stricter
+than these examples), plus a Y-up→Z-up root rotation the Y-up examples do not
+need. The examples are the canonical pattern for N-Ray's current **gaps** —
+`TANGENT`/TBN, `TEXCOORD_0` decode, and normal/metallic-roughness/occlusion
+texture sampling (today N-Ray only averages a base-color texture to a flat
+albedo). When porting toward the compute path, treat them as import frontends:
+flatten their per-vertex/material data into N-Ray's native traversal/shading/
+material/BVH upload structs, not as graphics vertex buffers bound to compute.
+See [`tutorials/saschawillems/gltf/README.md`](../tutorials/saschawillems/gltf/README.md)
+for the full technique→`gltf_scene.cpp` map.
 
 ## TinyGLTF Choice
 
@@ -221,7 +331,9 @@ upload structs.
 
 ## Import Pipeline
 
-The importer should be staged and explicit:
+The importer should be staged and explicit (see
+`tutorials/saschawillems/gltf/gltfscenerendering/` for the worked
+primitive/material walk this mirrors):
 
 1. Parse `.gltf` or `.glb` with TinyGLTF.
 2. Validate required primitive attributes:

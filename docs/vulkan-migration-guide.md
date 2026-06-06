@@ -15,6 +15,16 @@ The current architecture relies on `omp.h` (OpenMP) for CPU parallelism and cust
 
 The current migration direction is Vulkan **compute shaders** (`VK_PIPELINE_BIND_POINT_COMPUTE`) rather than `VK_KHR_ray_tracing_pipeline`. Compute shaders do not consume automatic vertex inputs or hardware triangle state; the CPU must flatten scene geometry, materials, and BVH nodes into descriptor-bound storage buffers.
 
+PBR material work is not the same thing as ray tracing work. PBR is the
+micro-scale BRDF evaluated at one shaded point, and it can be used by a normal
+Vulkan graphics/raster pipeline just as well as by a path tracer. The Vulkan
+compute migration is about the macro-scale transport loop: generating rays,
+traversing BVHs, choosing bounces, accumulating samples, and displaying the
+result. N-Ray still needs glTF PBR import because those material parameters are
+what the path tracer will evaluate after each hit. See
+[`docs/gltf-vulkan-pbr-import.md`](gltf-vulkan-pbr-import.md#pbr-is-the-material-model-not-the-transport-algorithm)
+for the detailed explanation and comparison.
+
 ---
 
 ## 1. Asset & Scene Loading (The PBR Frontend)
@@ -25,7 +35,7 @@ Path-tracers require high-fidelity asset loading (especially material metadata l
 *   **Flatten renderer-owned scene data first:** Today, `ObjImporter` already converts OBJ files into `Data::tris`, `Data::triIsect`, `Data::materials`, `Data::models`, and `globalCompactBVH`. The first Vulkan path should upload those existing arrays to storage buffers before replacing the asset loader.
 *   **Use the local glTF validation corpus:** Top-level `assets/` contains the project-owned validation models for importer work. Use `assets/*/scene.gltf` or `.glb` bundles, with their folder-local buffers and textures, when validating glTF parsing, PBR material conversion, texture color-space policy, tangent generation, and Vulkan upload layouts. These assets are separate from the current `PathTracingRenderer/models/` OBJ runtime scene.
 *   **Replace `ObjImporter` later:** Currently, `PathTracingRenderer/include/objImporter.h` uses a manual `ifstream` parser. Once the GPU buffer contract is stable, this should be replaced with:
-    *   **[tinygltf](https://github.com/syoyo/tinygltf):** A lightweight glTF 2.0 parser. Prefer the stable v2 C++ header for production importer work until the experimental v3 C runtime settles, and keep the parser isolated from N-Ray's renderer-owned GPU upload structs.
+    *   **[tinygltf](https://github.com/syoyo/tinygltf):** A lightweight glTF 2.0 parser. Prefer the stable v2 C++ header for production importer work until the experimental v3 C runtime settles, and keep the parser isolated from N-Ray's renderer-owned GPU upload structs. For a proven tinygltf→engine conversion pattern (accessor decode, node/TRS traversal, index types, tangents, per-material handling), read the vendored reference loaders under [`tutorials/saschawillems/gltf/`](../tutorials/saschawillems/gltf/) and the rules in [`docs/gltf-vulkan-pbr-import.md`](gltf-vulkan-pbr-import.md) before designing the importer.
     *   **[assimp](https://github.com/assimp/assimp):** If support for legacy formats (FBX, OBJ) is still required, Assimp can process complex hierarchical scene graphs into clean vertex and index arrays.
 *   **Texture Management:**
     *   **[stb_image](https://github.com/nothings/stb):** Enhance usage of `stb_image` for loading multi-channel image layouts (PNG, JPG) and high-dynamic-range environment maps (HDR) for Image-Based Lighting (IBL) calculations. Preserve glTF color-space policy: base color and emissive are sRGB, while metallic-roughness, occlusion, and normal textures are linear data.
@@ -79,4 +89,4 @@ Vulkan drivers do not perform hand-holding. To safely validate render loops, uti
 2.  **Integrate VMA:** Keep the current preview allocation as a bridge, then introduce a VMA-backed Vulkan resource layer before adding scene SSBOs or accumulation images.
 3.  **Transition Scene Data:** Convert `Data::triIsect`, triangle shading data, `PBRMaterial`, and `globalCompactBVH` into GPU upload structs and Vulkan storage buffers.
 4.  **Implement Compute Shader Path:** Port the primary-ray closest-hit path first (`rayAABB`, `RayIntersectsTriangle`, `traverseFlatBVH`), then add material evaluation, bounces, and progressive accumulation.
-5.  **Add glTF Import:** After the GPU buffer contract is stable, flatten glTF meshes/materials into N-Ray's native traversal, shading, material, texture, and BVH upload data.
+5.  **Add glTF Import:** After the GPU buffer contract is stable, flatten glTF meshes/materials into N-Ray's native traversal, shading, material, texture, and BVH upload data. Use the vendored [`tutorials/saschawillems/gltf/`](../tutorials/saschawillems/gltf/) loaders as the canonical conversion reference (import-frontend only — flatten into native upload structs, do not bind their graphics vertex buffers to compute).

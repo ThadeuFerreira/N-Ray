@@ -21,6 +21,8 @@ struct RuntimeResources {
 	std::vector<RenderPixel> asyncFrame;
 	std::vector<glm::vec3> asyncAccum;
 	std::vector<RenderPixel> vulkanFrame;
+	bool vulkanFrameValid = false;
+	bool vulkanFrameDispatched = false;
 	int asyncRaysPerPixel = 1;
 };
 

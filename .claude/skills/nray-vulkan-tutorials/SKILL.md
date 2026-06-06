@@ -1,6 +1,6 @@
 ---
 name: nray-vulkan-tutorials
-description: Use when working on Vulkan issues in the N-Ray repository, especially compute shader experiments, Vulkan hello-world/window bring-up, VulkanCore wrapper usage, synchronization barriers, descriptor sets, shader compilation, or porting CPU path tracing concepts toward Vulkan. Always check the local ogldev tutorial tree under /home/thadeu/projects/N-Ray/tutorials/ogldev/Vulkan before designing Vulkan code from scratch.
+description: Use when working on Vulkan issues in the N-Ray repository, especially compute shader experiments, Vulkan hello-world/window bring-up, VulkanCore wrapper usage, synchronization barriers, descriptor sets, shader compilation, glTF asset import/conversion reference examples, or porting CPU path tracing concepts toward Vulkan. Always check the local ogldev tutorial tree under /home/thadeu/projects/N-Ray/tutorials/ogldev/Vulkan, and the vendored glTF loaders under /home/thadeu/projects/N-Ray/tutorials/saschawillems/gltf, before designing Vulkan or glTF code from scratch.
 ---
 
 # N-Ray Vulkan Tutorials
@@ -21,6 +21,7 @@ High-value references:
 - `tutorials/ogldev/Vulkan/VulkanCore/` - local Vulkan helper wrappers for instance/device/swapchain, queues, command buffers, shader compilation, descriptor pools, textures, graphics pipelines, compute pipelines, and ImGui integration.
 - `tutorials/ogldev/Vulkan/Tutorial13` through `Tutorial27` - graphics pipeline, shader, texture, model, and swapchain progression before compute.
 - `tutorials/ogldev/Vulkan/Tutorial29` and later - more advanced rendering/data-flow examples after compute.
+- `tutorials/saschawillems/gltf/` - canonical local glTF-loading references (vendored `SaschaWillems/Vulkan` `gltfloading` + `gltfscenerendering`): tinygltf accessor decode, node/TRS hierarchy traversal, uint8/16/32 index handling, `TANGENT`/TBN, and per-material handling. Reference-only/not built; see its `README.md` for the technique→`gltf_scene.cpp` map.
 - `docs/vulkan-migration-guide.md` - N-Ray-specific Vulkan migration direction and dependency choices.
 - `docs/vulkan-compute-path-tracing-plan.md` - concrete compute-shader path tracing buffer contract, BVH upload strategy, and staged GPU migration plan.
 - `assets/` - local glTF validation corpus for future importer, PBR material, texture color-space, tangent, and Vulkan upload work. Prefer `assets/*/scene.gltf` or `.glb` before external model downloads.
@@ -45,6 +46,12 @@ Do not use `PathTracingRenderer/models/` or `PathTracingRenderer/textures/` as
 the glTF validation source; those are the current OBJ/HDRI runtime assets for
 the CPU scene. If an `assets/` subfolder lacks a glTF/GLB scene file, treat it as
 source material only until an importable scene entry point is added.
+
+When writing or extending the glTF importer
+(`PathTracingRenderer/src/gltf_scene.cpp`), grep the vendored loaders under
+`tutorials/saschawillems/gltf/` for a proven conversion pattern before designing
+from scratch, and follow the channel/color-space/tangent rules in
+`docs/gltf-vulkan-pbr-import.md`.
 
 ## Compute Shader Smoke Test
 

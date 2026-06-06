@@ -1,6 +1,11 @@
 #pragma once
 #include <raylib.h>
+#include <algorithm>
+#include <cmath>
 #include <iostream>
+#include <glm/glm.hpp>
+#define GLM_ENABLE_EXPERIMENTAL
+#include <glm/gtx/rotate_vector.hpp>
 
 struct PTCam {
 
@@ -25,6 +30,7 @@ struct PTCam {
 
 	glm::vec3 camNormal = { 0.0f, 1.0f, 0.0f };
 	glm::vec3 worldUp = { 0.0f, 0.0f, 1.0f };
+	glm::vec3 orbitCenter = { 0.0f, 0.0f, 0.0f };
 	glm::vec3 right = glm::normalize(glm::cross(camNormal, worldUp));
 	glm::vec3 up = glm::normalize(glm::cross(right, camNormal));
 	float halfFovRadians = glm::radians(fov) * 0.5f;
@@ -64,6 +70,15 @@ struct PTCam {
 	}
 
 	float mouseSensitivity = 0.01f;
+	float zoomSensitivity = 0.12f;
+
+	glm::vec3 safeNormalize(glm::vec3 value, glm::vec3 fallback) {
+		float lenSq = glm::dot(value, value);
+		if (!std::isfinite(lenSq) || lenSq <= 0.00000001f) {
+			return fallback;
+		}
+		return glm::normalize(value);
+	}
 
 	void cameraLogic(Params& params, float& ratio) {
 		float currentSpeed = camSpeed * params.dt;
@@ -77,9 +92,33 @@ struct PTCam {
 			if (keyDownSample(KEY_LEFT_SHIFT, params)) camPos.z += currentSpeed;
 		}
 
+		if (!params.isMouseHoveringUI) {
+			float wheel = GetMouseWheelMove();
+			if (wheel != 0.0f) {
+				glm::vec3 offset = camPos - orbitCenter;
+				float distance = glm::length(offset);
+				if (!std::isfinite(distance) || distance <= 0.0001f) {
+					distance = 1.0f;
+					offset = glm::vec3(0.0f, -distance, 0.0f);
+				}
+
+				float zoomFactor = std::pow(1.0f - zoomSensitivity, wheel);
+				float nextDistance = std::clamp(distance * zoomFactor, 0.01f, 10000.0f);
+				camPos = orbitCenter + safeNormalize(offset, glm::vec3(0.0f, -1.0f, 0.0f)) * nextDistance;
+				targetNormal = safeNormalize(orbitCenter - camPos, targetNormal);
+
+				params.shouldSample = false;
+				params.enableSampling = false;
+				params.renderInvalidated = true;
+			}
+		}
+
 		glm::vec2 mDelta = { GetMouseDelta().x, GetMouseDelta().y };
 		if (!params.isMouseHoveringUI && (mDelta.x != 0.0f || mDelta.y != 0.0f)) {
-			if (mouseDownSample(1, params)) {
+			if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+				params.shouldSample = false;
+				params.enableSampling = false;
+				params.renderInvalidated = true;
 
 				bool teleported = false;
 				if (GetMousePosition().x < 0.0f) {
@@ -101,23 +140,34 @@ struct PTCam {
 				}
 
 				if (!teleported) {
-					glm::vec3 newTarget = camPos + targetNormal * 10.0f;
-
-					float ratio = float(params.screenSize.x) / float(params.screenSize.y);
-
-					if (mDelta.x != 0.0f) {
-						newTarget += right * mDelta.x * mouseSensitivity;
+					glm::vec3 offset = camPos - orbitCenter;
+					float distance = glm::length(offset);
+					if (!std::isfinite(distance) || distance <= 0.0001f) {
+						distance = std::max(focusDist, 1.0f);
+						offset = glm::vec3(0.0f, -distance, 0.0f);
 					}
 
-					if (mDelta.y != 0.0f) {
-						newTarget -= up * mDelta.y * ratio * mouseSensitivity;
-					}
+					float yaw = -mDelta.x * mouseSensitivity;
+					float pitch = -mDelta.y * ratio * mouseSensitivity;
 
-					targetNormal = glm::normalize(newTarget - camPos);
+					glm::vec3 yawedOffset = glm::rotate(offset, yaw, worldUp);
+					glm::vec3 forwardAfterYaw = safeNormalize(-yawedOffset, camNormal);
+					glm::vec3 pitchAxis = safeNormalize(glm::cross(forwardAfterYaw, worldUp), right);
+					glm::vec3 pitchedOffset = glm::rotate(yawedOffset, pitch, pitchAxis);
+
+					float upDot = glm::dot(safeNormalize(pitchedOffset, yawedOffset), worldUp);
+					if (std::abs(upDot) < 0.98f) {
+						camPos = orbitCenter + pitchedOffset;
+					}
+					else {
+						camPos = orbitCenter + yawedOffset;
+					}
+					targetNormal = safeNormalize(orbitCenter - camPos, targetNormal);
 				}
 			}
 		}
 
+		targetNormal = safeNormalize(targetNormal, camNormal);
 		camTarget = camPos + targetNormal * 10.0f;
 
 		halfFovRadians = glm::radians(fov) * 0.5f;
@@ -125,10 +175,12 @@ struct PTCam {
 
 		glm::vec3 camD = camTarget - camPos;
 
-		camNormal = glm::normalize(camD);
+		camNormal = safeNormalize(camD, targetNormal);
+		targetNormal = camNormal;
+		targetDist = glm::length(camD);
 
-		right = glm::normalize(glm::cross(camNormal, worldUp));
-		up = glm::normalize(glm::cross(right, camNormal));
+		right = safeNormalize(glm::cross(camNormal, worldUp), right);
+		up = safeNormalize(glm::cross(right, camNormal), up);
 
 		focalLength = focalLengthMM / 1000.0f;
 		float sensorWidth = sensorSize / 1000.0f;
