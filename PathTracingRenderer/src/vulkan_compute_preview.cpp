@@ -8,6 +8,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <glm/glm.hpp>
 #include <sstream>
 #include <vector>
@@ -49,13 +50,21 @@ struct GpuTriShading {
 	glm::vec4 aN;
 	glm::vec4 bN;
 	glm::vec4 cN;
+	glm::vec4 aTangent;
+	glm::vec4 bTangent;
+	glm::vec4 cTangent;
+	glm::vec4 uv01;
+	glm::vec4 uv2;
 	glm::uvec4 ids;
 };
 
 struct GpuMaterial {
-	glm::vec4 baseColor;    // rgb albedo, a opacity
-	glm::vec4 params;       // roughness, metalness, emissionIntensity, transmission
-	glm::vec4 emissionIor;  // rgb emissionCol, a IOR
+	glm::vec4 baseColor;      // rgba baseColorFactor
+	glm::vec4 params;         // roughness, metalness, emissionIntensity, transmission
+	glm::vec4 emissionIor;    // rgb emissiveFactor, a IOR
+	glm::uvec4 textureIndices; // baseColor, metallicRoughness, normal, emissive
+	glm::uvec4 textureInfo;    // occlusion, alphaMode, unused, unused
+	glm::vec4 textureParams;   // alphaCutoff, normalScale, occlusionStrength, unused
 };
 
 struct GpuBvhNode {
@@ -74,8 +83,8 @@ struct GpuSettings {
 };
 
 static_assert(sizeof(GpuTriIntersect) == 64, "GpuTriIntersect must match std430 shader layout.");
-static_assert(sizeof(GpuTriShading) == 64, "GpuTriShading must match std430 shader layout.");
-static_assert(sizeof(GpuMaterial) == 48, "GpuMaterial must match std430 shader layout.");
+static_assert(sizeof(GpuTriShading) == 144, "GpuTriShading must match std430 shader layout.");
+static_assert(sizeof(GpuMaterial) == 96, "GpuMaterial must match std430 shader layout.");
 static_assert(sizeof(GpuBvhNode) == 48, "GpuBvhNode must match std430 shader layout.");
 static_assert(sizeof(GpuSettings) == 64, "GpuSettings must match std430 shader layout.");
 
@@ -140,14 +149,17 @@ static const ShaderEntry kShaders[] = {
 };
 static const int kShaderCount = static_cast<int>(sizeof(kShaders) / sizeof(kShaders[0]));
 
-// Total descriptor set bindings: 0=pixels, 1-4=scene SSBOs, 5=accum, 6=settings.
-static constexpr uint32_t kTotalBindings = 7;
+static constexpr uint32_t kMaxPreviewTextures = 256;
+// Total descriptor set bindings: 0=pixels, 1-4=scene SSBOs, 5=accum, 6=settings, 7=textures.
+static constexpr uint32_t kTotalBindings = 8;
+static constexpr uint32_t kStorageBindings = 7;
 // Scene SSBO bindings start at index 1 (binding 0 is the pixel buffer).
 static constexpr uint32_t kFirstSceneBinding = 1;
 // Named binding slots — update if the layout in vulkan_gltf_flat.comp changes.
 static constexpr uint32_t kBindingPixels   = 0;
 static constexpr uint32_t kBindingAccum    = 5;
 static constexpr uint32_t kBindingSettings = 6;
+static constexpr uint32_t kBindingTextures = 7;
 
 static const ModelEntry kModels[] = {
 	{ "Nissan S15 Silvia", "assets/2018_garage_mak_nissan_s15_silvia_-_reggie_mah/scene.gltf" },
@@ -170,6 +182,16 @@ struct VulkanComputePreview::Impl {
 		VkDeviceSize allocationSize = 0;
 		size_t size = 0;
 		bool memoryCoherent = false;
+	};
+
+	struct TextureResource {
+		VkImage image = VK_NULL_HANDLE;
+		VkDeviceMemory memory = VK_NULL_HANDLE;
+		VkImageView view = VK_NULL_HANDLE;
+		VkSampler sampler = VK_NULL_HANDLE;
+		VkDescriptorImageInfo descriptor{};
+		uint32_t width = 1;
+		uint32_t height = 1;
 	};
 
 	VkInstance instance = VK_NULL_HANDLE;
@@ -223,9 +245,13 @@ struct VulkanComputePreview::Impl {
 
 	StorageBuffer dummyBuffer;
 	std::array<StorageBuffer, SCENE_BUFFER_COUNT> sceneBuffers;
+	std::vector<TextureResource> textureResources;
+	std::vector<VkDescriptorImageInfo> textureDescriptorInfos;
+	uint32_t textureDescriptorCount = 1;
+	bool intelGpu = false;
 	GltfPreviewScene modelScene;
 	bool modelBuffersReady = false;
-	// triCount, bvhNodeCount, materialCount, modelReady — cached once at load so
+	// triCount, bvhNodeCount, materialCount, textureCount — cached once at load so
 	// render() doesn't recompute the (constant) sizes every frame.
 	glm::uvec4 sceneCounts = glm::uvec4(0u);
 
@@ -245,6 +271,7 @@ struct VulkanComputePreview::Impl {
 	float timestampPeriod = 0.0f;
 	bool timestampSupported = false;
 	bool memBudgetSupported = false;
+	bool descriptorIndexingSupported = false;
 	uint64_t localHeapBytes = 0;
 	uint32_t localHeapIndex = UINT32_MAX;
 	uint64_t localHeapUsed = 0;
@@ -285,6 +312,7 @@ struct VulkanComputePreview::Impl {
 		if (!createInstance() ||
 			!selectPhysicalDevice() ||
 			!createDevice() ||
+			!createCommandResources() ||
 			!createPixelBuffer() ||
 			!createDummySceneBuffer() ||
 			!loadModelSceneResources() ||
@@ -292,8 +320,7 @@ struct VulkanComputePreview::Impl {
 			!createSettingsBuffer() ||
 			!createDescriptorSetLayout() ||
 			!createDescriptorPoolAndSet() ||
-			!createPipeline() ||
-			!createCommandResources()) {
+			!createPipeline()) {
 			if (instanceCleanupUnsafe) {
 				abandonUnsafePartialInstance();
 			}
@@ -484,11 +511,21 @@ struct VulkanComputePreview::Impl {
 		VkMemoryBarrier memoryBarrier{};
 		memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
 		memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		memoryBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		// On coherent memory (always true on Intel UMA) the next frame's sample barrier
+		// handles COMPUTE→COMPUTE ordering; only HOST visibility is needed here.
+		// On non-coherent memory keep the conservative mask.
+		VkPipelineStageFlags finalDstStage;
+		if (pixelMemoryCoherent) {
+			memoryBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+			finalDstStage = VK_PIPELINE_STAGE_HOST_BIT;
+		} else {
+			memoryBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+			finalDstStage = VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+		}
 		vkCmdPipelineBarrier(
 			commandBuffer,
 			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			finalDstStage,
 			0,
 			1,
 			&memoryBarrier,
@@ -608,6 +645,7 @@ struct VulkanComputePreview::Impl {
 		for (StorageBuffer& buffer : sceneBuffers) {
 			destroyStorageBuffer(buffer);
 		}
+		destroyTextureResources();
 		destroyPixelBuffer();
 		destroyAccumBuffer();
 		destroySettingsBuffer();
@@ -635,12 +673,14 @@ struct VulkanComputePreview::Impl {
 		modelBuffersReady = false;
 		modelScene = {};
 		sceneCounts = glm::uvec4(0u);
+		textureDescriptorCount = 1;
 		initialized = false;
 		lastGpuMs = 0.0;
 		localHeapUsed = 0;
 		frameCount = 0;
 		timestampSupported = false;
 		memBudgetSupported = false;
+		descriptorIndexingSupported = false;
 	}
 
 	void abandonUnsafePartialInstance() {
@@ -914,6 +954,7 @@ struct VulkanComputePreview::Impl {
 		VkPhysicalDeviceProperties selectedProps{};
 		vkGetPhysicalDeviceProperties(physicalDevice, &selectedProps);
 		timestampPeriod = selectedProps.limits.timestampPeriod;
+		intelGpu = (selectedProps.vendorID == 0x8086);
 
 		{
 			uint32_t count = 0;
@@ -978,6 +1019,7 @@ struct VulkanComputePreview::Impl {
 		queueCreateInfo.pQueuePriorities = &queuePriority;
 
 		memBudgetSupported = false;
+		descriptorIndexingSupported = false;
 		{
 			uint32_t extCount = 0;
 			vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, nullptr);
@@ -986,21 +1028,54 @@ struct VulkanComputePreview::Impl {
 			for (const auto& ext : exts) {
 				if (strcmp(ext.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0) {
 					memBudgetSupported = true;
-					break;
+				}
+				if (strcmp(ext.extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) == 0) {
+					descriptorIndexingSupported = true;
 				}
 			}
 		}
 
-		const char* memBudgetExt = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+		if (!descriptorIndexingSupported) {
+			return fail("Vulkan preview disabled: VK_EXT_descriptor_indexing is required for glTF texture arrays");
+		}
+
+		VkPhysicalDeviceDescriptorIndexingFeaturesEXT descriptorIndexingFeatures{};
+		descriptorIndexingFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT;
+		VkPhysicalDeviceFeatures2 availableFeatures{};
+		availableFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+		availableFeatures.pNext = &descriptorIndexingFeatures;
+		vkGetPhysicalDeviceFeatures2(physicalDevice, &availableFeatures);
+		if (descriptorIndexingFeatures.shaderSampledImageArrayNonUniformIndexing != VK_TRUE) {
+			return fail("Vulkan preview disabled: non-uniform sampled-image indexing is required for glTF textures");
+		}
+
+		VkPhysicalDeviceProperties props{};
+		vkGetPhysicalDeviceProperties(physicalDevice, &props);
+		if (props.limits.maxPerStageDescriptorSampledImages < kMaxPreviewTextures ||
+			props.limits.maxDescriptorSetSampledImages < kMaxPreviewTextures) {
+			return fail("Vulkan preview disabled: device sampled-image descriptor limit is too low for the glTF texture array");
+		}
+
+		VkPhysicalDeviceDescriptorIndexingFeaturesEXT enabledDescriptorIndexing{};
+		enabledDescriptorIndexing.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT;
+		enabledDescriptorIndexing.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+		VkPhysicalDeviceFeatures2 enabledFeatures{};
+		enabledFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+		enabledFeatures.pNext = &enabledDescriptorIndexing;
+
+		std::vector<const char*> enabledExtensions;
+		enabledExtensions.push_back(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+		if (memBudgetSupported) {
+			enabledExtensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+		}
 
 		VkDeviceCreateInfo createInfo{};
 		createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+		createInfo.pNext = &enabledFeatures;
 		createInfo.queueCreateInfoCount = 1;
 		createInfo.pQueueCreateInfos = &queueCreateInfo;
-		if (memBudgetSupported) {
-			createInfo.enabledExtensionCount = 1;
-			createInfo.ppEnabledExtensionNames = &memBudgetExt;
-		}
+		createInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExtensions.size());
+		createInfo.ppEnabledExtensionNames = enabledExtensions.data();
 
 		VkResult result = vkCreateDevice(physicalDevice, &createInfo, nullptr, &device);
 		if (result != VK_SUCCESS) {
@@ -1114,6 +1189,426 @@ struct VulkanComputePreview::Impl {
 		return true;
 	}
 
+	VkSamplerAddressMode samplerAddressMode(int wrapMode) const {
+		switch (wrapMode) {
+		case 33071: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		case 33648: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+		case 10497:
+		default: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+		}
+	}
+
+	VkFilter samplerFilter(int filterMode) const {
+		return filterMode == 9728 ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+	}
+
+	VkSamplerMipmapMode samplerMipmapMode(int minFilterMode) const {
+		return (minFilterMode == 9986 || minFilterMode == 9987)
+			? VK_SAMPLER_MIPMAP_MODE_LINEAR
+			: VK_SAMPLER_MIPMAP_MODE_NEAREST;
+	}
+
+	GltfPreviewTexture solidTexture(uint8_t r, uint8_t g, uint8_t b, uint8_t a, const char* name) const {
+		GltfPreviewTexture texture;
+		texture.name = name;
+		texture.width = 1;
+		texture.height = 1;
+		texture.rgba = { r, g, b, a };
+		return texture;
+	}
+
+	void destroyTextureResource(TextureResource& texture) {
+		if (texture.sampler != VK_NULL_HANDLE) {
+			vkDestroySampler(device, texture.sampler, nullptr);
+			texture.sampler = VK_NULL_HANDLE;
+		}
+		if (texture.view != VK_NULL_HANDLE) {
+			vkDestroyImageView(device, texture.view, nullptr);
+			texture.view = VK_NULL_HANDLE;
+		}
+		if (texture.image != VK_NULL_HANDLE) {
+			vkDestroyImage(device, texture.image, nullptr);
+			texture.image = VK_NULL_HANDLE;
+		}
+		if (texture.memory != VK_NULL_HANDLE) {
+			vkFreeMemory(device, texture.memory, nullptr);
+			texture.memory = VK_NULL_HANDLE;
+		}
+		texture.descriptor = {};
+		texture.width = 1;
+		texture.height = 1;
+	}
+
+	void destroyTextureResources() {
+		for (TextureResource& texture : textureResources) {
+			destroyTextureResource(texture);
+		}
+		textureResources.clear();
+		textureDescriptorInfos.clear();
+		textureDescriptorCount = 1;
+	}
+
+	bool createBufferResource(
+		VkDeviceSize byteSize,
+		VkBufferUsageFlags usage,
+		VkMemoryPropertyFlags memoryFlags,
+		VkBuffer& buffer,
+		VkDeviceMemory& memory,
+		VkDeviceSize& allocationSize,
+		const char* tag
+	) {
+		VkBufferCreateInfo bufferInfo{};
+		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		bufferInfo.size = byteSize;
+		bufferInfo.usage = usage;
+		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+		VkResult result = vkCreateBuffer(device, &bufferInfo, nullptr, &buffer);
+		if (result != VK_SUCCESS) {
+			return failVk((std::string("vkCreateBuffer ") + tag).c_str(), result);
+		}
+
+		VkMemoryRequirements memoryReqs{};
+		vkGetBufferMemoryRequirements(device, buffer, &memoryReqs);
+
+		uint32_t memoryTypeIndex = 0;
+		if (!findMemoryType(memoryReqs.memoryTypeBits, memoryFlags, memoryTypeIndex)) {
+			return fail(std::string("No matching memory type for Vulkan ") + tag + " buffer");
+		}
+
+		VkMemoryAllocateInfo allocateInfo{};
+		allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocateInfo.allocationSize = memoryReqs.size;
+		allocateInfo.memoryTypeIndex = memoryTypeIndex;
+
+		result = vkAllocateMemory(device, &allocateInfo, nullptr, &memory);
+		if (result != VK_SUCCESS) {
+			return failVk((std::string("vkAllocateMemory ") + tag).c_str(), result);
+		}
+		allocationSize = memoryReqs.size;
+
+		result = vkBindBufferMemory(device, buffer, memory, 0);
+		if (result != VK_SUCCESS) {
+			return failVk((std::string("vkBindBufferMemory ") + tag).c_str(), result);
+		}
+
+		return true;
+	}
+
+	void destroyTransientBuffer(VkBuffer& buffer, VkDeviceMemory& memory) {
+		if (buffer != VK_NULL_HANDLE) {
+			vkDestroyBuffer(device, buffer, nullptr);
+			buffer = VK_NULL_HANDLE;
+		}
+		if (memory != VK_NULL_HANDLE) {
+			vkFreeMemory(device, memory, nullptr);
+			memory = VK_NULL_HANDLE;
+		}
+	}
+
+	bool submitImmediate(const char* tag, const std::function<void(VkCommandBuffer)>& record) {
+		if (commandPool == VK_NULL_HANDLE) {
+			return fail(std::string("Vulkan command pool missing for ") + tag);
+		}
+
+		VkCommandBufferAllocateInfo allocateInfo{};
+		allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+		allocateInfo.commandPool = commandPool;
+		allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		allocateInfo.commandBufferCount = 1;
+
+		VkCommandBuffer uploadCommandBuffer = VK_NULL_HANDLE;
+		VkResult result = vkAllocateCommandBuffers(device, &allocateInfo, &uploadCommandBuffer);
+		if (result != VK_SUCCESS) {
+			return failVk((std::string("vkAllocateCommandBuffers ") + tag).c_str(), result);
+		}
+
+		VkCommandBufferBeginInfo beginInfo{};
+		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		result = vkBeginCommandBuffer(uploadCommandBuffer, &beginInfo);
+		if (result != VK_SUCCESS) {
+			vkFreeCommandBuffers(device, commandPool, 1, &uploadCommandBuffer);
+			return failVk((std::string("vkBeginCommandBuffer ") + tag).c_str(), result);
+		}
+
+		record(uploadCommandBuffer);
+
+		result = vkEndCommandBuffer(uploadCommandBuffer);
+		if (result != VK_SUCCESS) {
+			vkFreeCommandBuffers(device, commandPool, 1, &uploadCommandBuffer);
+			return failVk((std::string("vkEndCommandBuffer ") + tag).c_str(), result);
+		}
+
+		VkSubmitInfo submitInfo{};
+		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		submitInfo.commandBufferCount = 1;
+		submitInfo.pCommandBuffers = &uploadCommandBuffer;
+		result = vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+		if (result == VK_SUCCESS) {
+			result = vkQueueWaitIdle(queue);
+		}
+		vkFreeCommandBuffers(device, commandPool, 1, &uploadCommandBuffer);
+		if (result != VK_SUCCESS) {
+			return failVk((std::string("Vulkan immediate submit ") + tag).c_str(), result);
+		}
+		return true;
+	}
+
+	bool createTextureResource(const GltfPreviewTexture& source, TextureResource& texture) {
+		destroyTextureResource(texture);
+
+		uint32_t width = std::max(source.width, 1u);
+		uint32_t height = std::max(source.height, 1u);
+		size_t expectedBytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+		const std::vector<uint8_t>* uploadBytes = &source.rgba;
+		GltfPreviewTexture fallback;
+		if (uploadBytes->size() < expectedBytes) {
+			fallback = solidTexture(255, 255, 255, 255, "invalid texture fallback");
+			width = fallback.width;
+			height = fallback.height;
+			expectedBytes = fallback.rgba.size();
+			uploadBytes = &fallback.rgba;
+		}
+
+		VkBuffer stagingBuffer = VK_NULL_HANDLE;
+		VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+		VkDeviceSize stagingAllocationSize = 0;
+		if (!createBufferResource(
+			static_cast<VkDeviceSize>(expectedBytes),
+			VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			stagingBuffer,
+			stagingMemory,
+			stagingAllocationSize,
+			"texture staging")) {
+			destroyTransientBuffer(stagingBuffer, stagingMemory);
+			return false;
+		}
+
+		void* mapped = nullptr;
+		VkResult result = vkMapMemory(device, stagingMemory, 0, stagingAllocationSize, 0, &mapped);
+		if (result != VK_SUCCESS) {
+			destroyTransientBuffer(stagingBuffer, stagingMemory);
+			return failVk("vkMapMemory texture staging", result);
+		}
+		std::memcpy(mapped, uploadBytes->data(), expectedBytes);
+		vkUnmapMemory(device, stagingMemory);
+
+		VkImageCreateInfo imageInfo{};
+		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.imageType = VK_IMAGE_TYPE_2D;
+		imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+		imageInfo.extent = { width, height, 1 };
+		imageInfo.mipLevels = 1;
+		imageInfo.arrayLayers = 1;
+		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+		result = vkCreateImage(device, &imageInfo, nullptr, &texture.image);
+		if (result != VK_SUCCESS) {
+			destroyTransientBuffer(stagingBuffer, stagingMemory);
+			return failVk("vkCreateImage texture", result);
+		}
+
+		VkMemoryRequirements memoryReqs{};
+		vkGetImageMemoryRequirements(device, texture.image, &memoryReqs);
+		uint32_t memoryTypeIndex = 0;
+		if (!findMemoryType(memoryReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memoryTypeIndex)) {
+			destroyTransientBuffer(stagingBuffer, stagingMemory);
+			destroyTextureResource(texture);
+			return fail("No device-local memory type for Vulkan texture image");
+		}
+
+		VkMemoryAllocateInfo allocateInfo{};
+		allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocateInfo.allocationSize = memoryReqs.size;
+		allocateInfo.memoryTypeIndex = memoryTypeIndex;
+		result = vkAllocateMemory(device, &allocateInfo, nullptr, &texture.memory);
+		if (result != VK_SUCCESS) {
+			destroyTransientBuffer(stagingBuffer, stagingMemory);
+			destroyTextureResource(texture);
+			return failVk("vkAllocateMemory texture", result);
+		}
+
+		result = vkBindImageMemory(device, texture.image, texture.memory, 0);
+		if (result != VK_SUCCESS) {
+			destroyTransientBuffer(stagingBuffer, stagingMemory);
+			destroyTextureResource(texture);
+			return failVk("vkBindImageMemory texture", result);
+		}
+
+		bool submitted = submitImmediate("texture upload", [&](VkCommandBuffer cmd) {
+			VkImageSubresourceRange range{};
+			range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			range.baseMipLevel = 0;
+			range.levelCount = 1;
+			range.baseArrayLayer = 0;
+			range.layerCount = 1;
+
+			VkImageMemoryBarrier toTransfer{};
+			toTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			toTransfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			toTransfer.image = texture.image;
+			toTransfer.subresourceRange = range;
+			toTransfer.srcAccessMask = 0;
+			toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			vkCmdPipelineBarrier(
+				cmd,
+				VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+				VK_PIPELINE_STAGE_TRANSFER_BIT,
+				0,
+				0,
+				nullptr,
+				0,
+				nullptr,
+				1,
+				&toTransfer
+			);
+
+			VkBufferImageCopy copy{};
+			copy.bufferOffset = 0;
+			copy.bufferRowLength = 0;
+			copy.bufferImageHeight = 0;
+			copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			copy.imageSubresource.mipLevel = 0;
+			copy.imageSubresource.baseArrayLayer = 0;
+			copy.imageSubresource.layerCount = 1;
+			copy.imageOffset = { 0, 0, 0 };
+			copy.imageExtent = { width, height, 1 };
+			vkCmdCopyBufferToImage(cmd, stagingBuffer, texture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+			VkImageMemoryBarrier toShader{};
+			toShader.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			toShader.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			toShader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			toShader.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			toShader.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			toShader.image = texture.image;
+			toShader.subresourceRange = range;
+			toShader.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			toShader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+			vkCmdPipelineBarrier(
+				cmd,
+				VK_PIPELINE_STAGE_TRANSFER_BIT,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				0,
+				0,
+				nullptr,
+				0,
+				nullptr,
+				1,
+				&toShader
+			);
+		});
+
+		destroyTransientBuffer(stagingBuffer, stagingMemory);
+		if (!submitted) {
+			destroyTextureResource(texture);
+			return false;
+		}
+
+		VkImageViewCreateInfo viewInfo{};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = texture.image;
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		viewInfo.subresourceRange.baseMipLevel = 0;
+		viewInfo.subresourceRange.levelCount = 1;
+		viewInfo.subresourceRange.baseArrayLayer = 0;
+		viewInfo.subresourceRange.layerCount = 1;
+		result = vkCreateImageView(device, &viewInfo, nullptr, &texture.view);
+		if (result != VK_SUCCESS) {
+			destroyTextureResource(texture);
+			return failVk("vkCreateImageView texture", result);
+		}
+
+		VkSamplerCreateInfo samplerInfo{};
+		samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+		samplerInfo.magFilter = samplerFilter(source.magFilter);
+		samplerInfo.minFilter = samplerFilter(source.minFilter);
+		samplerInfo.mipmapMode = samplerMipmapMode(source.minFilter);
+		samplerInfo.addressModeU = samplerAddressMode(source.wrapS);
+		samplerInfo.addressModeV = samplerAddressMode(source.wrapT);
+		samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+		samplerInfo.mipLodBias = 0.0f;
+		samplerInfo.anisotropyEnable = VK_FALSE;
+		samplerInfo.maxAnisotropy = 1.0f;
+		samplerInfo.compareEnable = VK_FALSE;
+		samplerInfo.minLod = 0.0f;
+		samplerInfo.maxLod = 0.0f;
+		samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+		samplerInfo.unnormalizedCoordinates = VK_FALSE;
+		result = vkCreateSampler(device, &samplerInfo, nullptr, &texture.sampler);
+		if (result != VK_SUCCESS) {
+			destroyTextureResource(texture);
+			return failVk("vkCreateSampler texture", result);
+		}
+
+		texture.width = width;
+		texture.height = height;
+		texture.descriptor.sampler = texture.sampler;
+		texture.descriptor.imageView = texture.view;
+		texture.descriptor.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		return true;
+	}
+
+	bool rebuildTextureDescriptorInfos() {
+		if (textureResources.empty()) {
+			return fail("No Vulkan texture descriptors available");
+		}
+
+		textureDescriptorCount = static_cast<uint32_t>(std::min<size_t>(textureResources.size(), kMaxPreviewTextures));
+		textureDescriptorInfos.assign(kMaxPreviewTextures, textureResources.front().descriptor);
+		for (uint32_t i = 0; i < textureDescriptorCount; ++i) {
+			textureDescriptorInfos[i] = textureResources[i].descriptor;
+		}
+		return true;
+	}
+
+	bool createFallbackTextureResources() {
+		destroyTextureResources();
+		textureResources.emplace_back();
+		GltfPreviewTexture fallback = solidTexture(255, 255, 255, 255, "fallback white");
+		if (!createTextureResource(fallback, textureResources.back())) {
+			destroyTextureResources();
+			return false;
+		}
+		return rebuildTextureDescriptorInfos();
+	}
+
+	bool createTextureResources(const std::vector<GltfPreviewTexture>& textures) {
+		destroyTextureResources();
+		if (textures.empty()) {
+			return createFallbackTextureResources();
+		}
+
+		size_t uploadCount = std::min<size_t>(textures.size(), kMaxPreviewTextures);
+		textureResources.resize(uploadCount);
+		for (size_t i = 0; i < uploadCount; ++i) {
+			if (!createTextureResource(textures[i], textureResources[i])) {
+				destroyTextureResources();
+				return false;
+			}
+		}
+
+		return rebuildTextureDescriptorInfos();
+	}
+
+	uint32_t gpuTextureIndex(uint32_t textureIndex) const {
+		if (textureIndex == GLTF_PREVIEW_INVALID_TEXTURE || textureIndex >= textureDescriptorCount) {
+			return GLTF_PREVIEW_INVALID_TEXTURE;
+		}
+		return textureIndex;
+	}
+
 	bool createDummySceneBuffer() {
 		uint32_t zero[4] = {};
 		return createStorageBuffer(dummyBuffer, zero, sizeof(zero));
@@ -1126,15 +1621,26 @@ struct VulkanComputePreview::Impl {
 		for (StorageBuffer& buffer : sceneBuffers) {
 			destroyStorageBuffer(buffer);
 		}
+		destroyTextureResources();
 
 		int modelIndex = selectedModel >= 0 && selectedModel < kModelCount ? selectedModel : 0;
 		if (!loadGltfPreviewScene(kModels[modelIndex].path, modelScene)) {
 			if (!modelScene.status.empty()) {
 				modelScene.status = std::string(kModels[modelIndex].name) + ": " + modelScene.status;
 			}
+			if (!createFallbackTextureResources()) {
+				return false;
+			}
 			return true;
 		}
 		modelScene.status = std::string(kModels[modelIndex].name) + ": " + modelScene.status;
+		if (!createTextureResources(modelScene.textures)) {
+			modelScene.status = "glTF model texture upload failed: " + status;
+			if (!createFallbackTextureResources()) {
+				return false;
+			}
+			return true;
+		}
 
 		std::vector<GpuTriIntersect> gpuTriIsect;
 		gpuTriIsect.reserve(modelScene.triIsect.size());
@@ -1152,11 +1658,20 @@ struct VulkanComputePreview::Impl {
 
 		std::vector<GpuTriShading> gpuTriShading;
 		gpuTriShading.reserve(modelScene.tris.size());
-		for (const Tri& tri : modelScene.tris) {
+		for (size_t i = 0; i < modelScene.tris.size(); ++i) {
+			const Tri& tri = modelScene.tris[i];
+			const GltfPreviewTriSurface surface = i < modelScene.triSurfaces.size()
+				? modelScene.triSurfaces[i]
+				: GltfPreviewTriSurface{};
 			gpuTriShading.push_back({
 				glm::vec4(tri.aN, 0.0f),
 				glm::vec4(tri.bN, 0.0f),
 				glm::vec4(tri.cN, 0.0f),
+				surface.aTangent,
+				surface.bTangent,
+				surface.cTangent,
+				glm::vec4(surface.aUv, surface.bUv),
+				glm::vec4(surface.cUv, 0.0f, 0.0f),
 				glm::uvec4(tri.materialIdx, tri.modelIdx, 0u, 0u)
 			});
 		}
@@ -1165,12 +1680,29 @@ struct VulkanComputePreview::Impl {
 		gpuMaterials.reserve(modelScene.materials.size());
 		for (size_t i = 0; i < modelScene.materials.size(); ++i) {
 			const PBRMaterial& material = modelScene.materials[i];
-			float opacity = i < modelScene.materialOpacity.size() ? modelScene.materialOpacity[i] : 1.0f;
+			const GltfPreviewMaterialMeta* meta = i < modelScene.materialMeta.size() ? &modelScene.materialMeta[i] : nullptr;
 			float transmission = i < modelScene.materialTransmission.size() ? modelScene.materialTransmission[i] : 0.0f;
+			glm::vec4 baseColor = meta ? meta->baseColorFactor : glm::vec4(material.albedo, 1.0f);
+			glm::vec3 emission = meta ? meta->emissiveFactor : material.emissionCol;
+			float roughness = meta ? meta->roughness : material.roughness;
+			float metalness = meta ? meta->metalness : material.metalness;
+			float emissionIntensity = meta ? meta->emissiveStrength : material.emissionIntensity;
+			uint32_t baseColorTexture = meta ? gpuTextureIndex(meta->baseColorTexture) : GLTF_PREVIEW_INVALID_TEXTURE;
+			uint32_t metallicRoughnessTexture = meta ? gpuTextureIndex(meta->metallicRoughnessTexture) : GLTF_PREVIEW_INVALID_TEXTURE;
+			uint32_t normalTexture = meta ? gpuTextureIndex(meta->normalTexture) : GLTF_PREVIEW_INVALID_TEXTURE;
+			uint32_t emissiveTexture = meta ? gpuTextureIndex(meta->emissiveTexture) : GLTF_PREVIEW_INVALID_TEXTURE;
+			uint32_t occlusionTexture = meta ? gpuTextureIndex(meta->occlusionTexture) : GLTF_PREVIEW_INVALID_TEXTURE;
+			float alphaCutoff = meta ? meta->alphaCutoff : 0.5f;
+			float normalScale = meta ? meta->normalScale : 1.0f;
+			float occlusionStrength = meta ? meta->occlusionStrength : 1.0f;
+			uint32_t alphaMode = meta ? meta->alphaMode : GLTF_PREVIEW_ALPHA_OPAQUE;
 			gpuMaterials.push_back({
-				glm::vec4(material.albedo, opacity),
-				glm::vec4(material.roughness, material.metalness, material.emissionIntensity, transmission),
-				glm::vec4(material.emissionCol, material.IOR)
+				baseColor,
+				glm::vec4(roughness, metalness, emissionIntensity, transmission),
+				glm::vec4(emission, material.IOR),
+				glm::uvec4(baseColorTexture, metallicRoughnessTexture, normalTexture, emissiveTexture),
+				glm::uvec4(occlusionTexture, alphaMode, 0u, 0u),
+				glm::vec4(alphaCutoff, normalScale, occlusionStrength, 0.0f)
 			});
 		}
 
@@ -1200,7 +1732,7 @@ struct VulkanComputePreview::Impl {
 			static_cast<uint32_t>(modelScene.triIsect.size()),
 			static_cast<uint32_t>(modelScene.flatBvh.size()),
 			static_cast<uint32_t>(modelScene.materials.size()),
-			1u
+			textureDescriptorCount
 		);
 		modelBuffersReady = true;
 		return true;
@@ -1273,12 +1805,16 @@ struct VulkanComputePreview::Impl {
 
 	bool createDescriptorSetLayout() {
 		std::array<VkDescriptorSetLayoutBinding, kTotalBindings> bindings{};
-		for (uint32_t i = 0; i < bindings.size(); ++i) {
+		for (uint32_t i = 0; i < kStorageBindings; ++i) {
 			bindings[i].binding = i;
 			bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 			bindings[i].descriptorCount = 1;
 			bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 		}
+		bindings[kBindingTextures].binding = kBindingTextures;
+		bindings[kBindingTextures].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		bindings[kBindingTextures].descriptorCount = kMaxPreviewTextures;
+		bindings[kBindingTextures].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
 		VkDescriptorSetLayoutCreateInfo layoutInfo{};
 		layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -1298,15 +1834,17 @@ struct VulkanComputePreview::Impl {
 			return fail("Vulkan descriptor set layout missing");
 		}
 
-		VkDescriptorPoolSize poolSize{};
-		poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		poolSize.descriptorCount = kTotalBindings;
+		std::array<VkDescriptorPoolSize, 2> poolSizes{};
+		poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		poolSizes[0].descriptorCount = kStorageBindings;
+		poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		poolSizes[1].descriptorCount = kMaxPreviewTextures;
 
 		VkDescriptorPoolCreateInfo poolInfo{};
 		poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 		poolInfo.maxSets = 1;
-		poolInfo.poolSizeCount = 1;
-		poolInfo.pPoolSizes = &poolSize;
+		poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+		poolInfo.pPoolSizes = poolSizes.data();
 
 		VkResult result = vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool);
 		if (result != VK_SUCCESS) {
@@ -1324,9 +1862,22 @@ struct VulkanComputePreview::Impl {
 			return failVk("vkAllocateDescriptorSets", result);
 		}
 
-		std::array<VkDescriptorBufferInfo, kTotalBindings> bufferInfos{};
+		std::array<VkDescriptorBufferInfo, kStorageBindings> bufferInfos{};
 		std::array<VkWriteDescriptorSet, kTotalBindings> writes{};
 		for (uint32_t binding = 0; binding < writes.size(); ++binding) {
+			if (binding == kBindingTextures) {
+				if (textureDescriptorInfos.size() != kMaxPreviewTextures) {
+					return fail("Vulkan texture descriptor array is not ready");
+				}
+				writes[binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+				writes[binding].dstSet = descriptorSet;
+				writes[binding].dstBinding = binding;
+				writes[binding].descriptorCount = kMaxPreviewTextures;
+				writes[binding].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+				writes[binding].pImageInfo = textureDescriptorInfos.data();
+				continue;
+			}
+
 			if (binding == kBindingPixels) {
 				bufferInfos[binding].buffer = pixelBuffer;
 				bufferInfos[binding].range = static_cast<VkDeviceSize>(pixelBufferSize);
@@ -1387,11 +1938,25 @@ struct VulkanComputePreview::Impl {
 			return failVk("vkCreatePipelineLayout", result);
 		}
 
+		// BVH_MAX_STACK_DEPTH: 32 on Intel Iris Xe (narrow register file, SAH tree depth ≤ 25),
+		// 64 on all other devices (unchanged default matches the shader's constant_id = 0 default).
+		int bvhStackDepth = intelGpu ? 32 : 64;
+		VkSpecializationMapEntry specEntry{};
+		specEntry.constantID = 0;
+		specEntry.offset     = 0;
+		specEntry.size       = sizeof(int);
+		VkSpecializationInfo specInfo{};
+		specInfo.mapEntryCount = 1;
+		specInfo.pMapEntries   = &specEntry;
+		specInfo.dataSize      = sizeof(int);
+		specInfo.pData         = &bvhStackDepth;
+
 		VkPipelineShaderStageCreateInfo stageInfo{};
 		stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 		stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
 		stageInfo.module = shaderModule;
 		stageInfo.pName = "main";
+		stageInfo.pSpecializationInfo = &specInfo;
 
 		VkComputePipelineCreateInfo pipelineInfo{};
 		pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -1616,6 +2181,13 @@ GpuStats VulkanComputePreview::gpuStats() const {
 	GpuStats s{};
 	s.gpuDispatchMs = m_impl->lastGpuMs;
 	s.frameCount = m_impl->frameCount;
+	uint64_t raysPerSample =
+		static_cast<uint64_t>(std::max(m_impl->renderWidth, 0)) *
+		static_cast<uint64_t>(std::max(m_impl->renderHeight, 0));
+	s.primaryRaysTraced = raysPerSample * static_cast<uint64_t>(m_impl->currentSample);
+	if (m_impl->lastGpuMs > 0.0) {
+		s.primaryRaysPerSec = static_cast<double>(raysPerSample) / (m_impl->lastGpuMs / 1000.0);
+	}
 	s.localHeapBytes = m_impl->localHeapBytes;
 	s.localHeapUsed = m_impl->localHeapUsed;
 	s.pixelBufferBytes = m_impl->pixelBufferSize;

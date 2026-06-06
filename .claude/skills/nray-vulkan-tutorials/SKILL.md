@@ -1,6 +1,6 @@
 ---
 name: nray-vulkan-tutorials
-description: Use when working on Vulkan issues in the N-Ray repository, especially compute shader experiments, Vulkan hello-world/window bring-up, VulkanCore wrapper usage, synchronization barriers, descriptor sets, shader compilation, glTF asset import/conversion/skinning/animation reference examples, Vulkan PBR pipelines (material push constants, IBL pre-computation, irradiance/BRDF-LUT/prefiltered-cube descriptor layouts, textured PBR with tangent vertex attributes), or porting CPU path tracing concepts toward Vulkan. Always check the local ogldev tutorial tree under /home/thadeu/projects/N-Ray/tutorials/ogldev/Vulkan, the vendored glTF loaders under /home/thadeu/projects/N-Ray/tutorials/saschawillems/gltf, and the upstream Sascha Willems gltfskinning guide before designing Vulkan or glTF code from scratch.
+description: Use when working on Vulkan issues in the N-Ray repository, especially compute shader experiments, Vulkan hello-world/window bring-up, VulkanCore wrapper usage, synchronization barriers, descriptor sets, shader compilation, glTF asset import/conversion/skinning/animation reference examples, Vulkan PBR pipelines (material push constants, IBL pre-computation, irradiance/BRDF-LUT/prefiltered-cube descriptor layouts, textured PBR with tangent vertex attributes), hardware ray tracing (VK_KHR_ray_tracing_pipeline, BLAS/TLAS build, SBT layout, raygen/miss/closesthit/anyhit/intersection/callable shader groups, frame accumulation, glTF ray tracing with descriptor indexing, recursive secondary rays for shadows and reflections via multiple miss shaders/ray payloads/iterate-in-raygen bounce loops), or porting CPU path tracing concepts toward Vulkan compute or HW ray tracing. Always check the local ogldev tutorial tree under /home/thadeu/projects/N-Ray/tutorials/ogldev/Vulkan, the vendored glTF loaders under /home/thadeu/projects/N-Ray/tutorials/saschawillems/gltf, and the upstream Sascha Willems gltfskinning and ray tracing example guides before designing Vulkan or glTF code from scratch.
 ---
 
 # N-Ray Vulkan Tutorials
@@ -25,6 +25,12 @@ High-value references:
 - Upstream `SaschaWillems/Vulkan/examples/gltfskinning` - use this as the skinned-animation reference when adding real joint palettes: mutable TRS nodes, `JOINTS_0`/`WEIGHTS_0`, `Skin` inverse bind matrices, animation samplers/channels, per-frame joint-matrix SSBOs, `updateAnimation`, `updateJoints`, and shader-side weighted skin matrices. This sample is documented in `docs/gltf-vulkan-pbr-import.md`; it is not currently vendored in-tree.
 - `docs/vulkan-migration-guide.md` - N-Ray-specific Vulkan migration direction and dependency choices.
 - `docs/vulkan-compute-path-tracing-plan.md` - concrete compute-shader path tracing buffer contract, BVH upload strategy, and staged GPU migration plan.
+- Upstream `SaschaWillems/Vulkan/examples/raytracingbasic` — canonical HW RT bringup: extension + feature chain, function pointer loading, BLAS/TLAS build, storage image, SBT sizing, `vkCmdTraceRaysKHR`, and blit-to-swapchain. Use as the first reference before writing any `VK_KHR_ray_tracing_pipeline` code.
+- Upstream `SaschaWillems/Vulkan/examples/raytracinggltf` — glTF ray tracing with multi-primitive BLAS, `GeometryNode` SSBO for per-primitive material/texture lookup, `VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT_EXT` for unbounded texture arrays, any-hit shader for transparency, and frame-accumulation counter for progressive anti-aliasing.
+- Upstream `SaschaWillems/Vulkan/examples/raytracingcallable` — callable shaders: multi-geometry BLAS (one geometry per object), `gl_GeometryIndexEXT` dispatch, separate callable SBT with one handle per geometry, and `executeCallableEXT`.
+- Upstream `SaschaWillems/Vulkan/examples/raytracingintersection` — procedural geometry: `VK_GEOMETRY_TYPE_AABBS_KHR` BLAS, intersection shader (`.rint`) calling `reportIntersectionEXT`, `VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR`, and per-sphere SSBO indexed by `gl_PrimitiveID`.
+- Upstream `SaschaWillems/Vulkan/examples/raytracingshadows` — recursive secondary rays: a second miss shader (`shadow.rmiss`) for shadow-ray occlusion, the TLAS bound to `VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR` (not just raygen) so closest-hit can launch `traceRayEXT`, vertex/index SSBOs for hit-attribute reconstruction, and `maxPipelineRayRecursionDepth = 2`. The foundation for any reflection/secondary-bounce work.
+- Upstream `SaschaWillems/Vulkan/examples/raytracingreflections` — recursive reflections: the **iterate-in-raygen** bounce loop (closest-hit returns surface data via the payload; raygen reflects and re-traces in a loop) that keeps `maxPipelineRayRecursionDepth` low while still doing N reflection bounces. This is the direct analogue of N-Ray's `rayLogic` bounce loop — use it as the primary reflection reference.
 - `assets/` - local glTF validation corpus for future importer, PBR material, texture color-space, tangent, and Vulkan upload work. Prefer `assets/*/scene.gltf` or `.glb` before external model downloads.
 - `vendor/volk/` - Vulkan function loader only; it still includes Vulkan API headers such as `<vulkan/vulkan_core.h>` and does not replace `libvulkan-dev` or the LunarG SDK headers.
 - `vendor/VulkanMemoryAllocator/include/vk_mem_alloc.h` - VMA also includes `<vulkan/vulkan.h>`, so it requires Vulkan headers too.
@@ -126,6 +132,514 @@ Recommended first pass:
 - Reuse `CompactBVH` semantics in the shader: leaf when `triCount > 0`, first child at `current + 1`, second child by index, fixed local traversal stack.
 - Port `rayAABB`, `RayIntersectsTriangle`, and `traverseFlatBVH` before adding bounces or full PBR.
 - Treat the current `VulkanComputePreview` host-visible pixel-buffer readback as a bridge only. The target renderer should write an accumulation storage image/buffer and eventually avoid CPU readback.
+
+## Hardware Ray Tracing (VK_KHR_ray_tracing_pipeline)
+
+Reference source: upstream `SaschaWillems/Vulkan/examples/raytracingbasic`, `raytracinggltf`, `raytracingcallable`, `raytracingintersection`, `raytracingshadows`, and `raytracingreflections`. These are not vendored locally; use the patterns below and search the upstream repo before writing HW RT code from scratch.
+
+### Required extensions and Vulkan API version
+
+```cpp
+apiVersion = VK_API_VERSION_1_1;  // minimum
+enabledDeviceExtensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+enabledDeviceExtensions.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+// Required by acceleration structure:
+enabledDeviceExtensions.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+enabledDeviceExtensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+enabledDeviceExtensions.push_back(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+// Required by ray tracing pipeline:
+enabledDeviceExtensions.push_back(VK_KHR_SPIRV_1_4_EXTENSION_NAME);
+enabledDeviceExtensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
+```
+
+### Feature chain (getEnabledFeatures / deviceCreatepNextChain)
+
+Chain must be assembled tail-to-head — BufferDeviceAddress is the innermost:
+
+```cpp
+enabledBufferDeviceAddresFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+enabledBufferDeviceAddresFeatures.bufferDeviceAddress = VK_TRUE;
+
+enabledRayTracingPipelineFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
+enabledRayTracingPipelineFeatures.rayTracingPipeline = VK_TRUE;
+enabledRayTracingPipelineFeatures.pNext = &enabledBufferDeviceAddresFeatures;
+
+enabledAccelerationStructureFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+enabledAccelerationStructureFeatures.accelerationStructure = VK_TRUE;
+enabledAccelerationStructureFeatures.pNext = &enabledRayTracingPipelineFeatures;
+
+deviceCreatepNextChain = &enabledAccelerationStructureFeatures;
+enabledFeatures.shaderStorageImageWriteWithoutFormat = VK_TRUE;  // storage image format decided at runtime
+```
+
+For glTF + descriptor indexing also enable:
+
+```cpp
+physicalDeviceDescriptorIndexingFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT;
+physicalDeviceDescriptorIndexingFeatures.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+physicalDeviceDescriptorIndexingFeatures.runtimeDescriptorArray = VK_TRUE;
+physicalDeviceDescriptorIndexingFeatures.descriptorBindingVariableDescriptorCount = VK_TRUE;
+physicalDeviceDescriptorIndexingFeatures.pNext = &enabledAccelerationStructureFeatures;
+deviceCreatepNextChain = &physicalDeviceDescriptorIndexingFeatures;
+enabledFeatures.shaderInt64 = VK_TRUE;  // needed for uint64_t buffer device addresses in shaders
+```
+
+### Function pointer loading (in prepare())
+
+All RT entry points are KHR extensions; load them from the device:
+
+```cpp
+vkGetBufferDeviceAddressKHR                = reinterpret_cast<PFN_vkGetBufferDeviceAddressKHR>               (vkGetDeviceProcAddr(device, "vkGetBufferDeviceAddressKHR"));
+vkCmdBuildAccelerationStructuresKHR        = reinterpret_cast<PFN_vkCmdBuildAccelerationStructuresKHR>       (vkGetDeviceProcAddr(device, "vkCmdBuildAccelerationStructuresKHR"));
+vkBuildAccelerationStructuresKHR           = reinterpret_cast<PFN_vkBuildAccelerationStructuresKHR>          (vkGetDeviceProcAddr(device, "vkBuildAccelerationStructuresKHR"));
+vkCreateAccelerationStructureKHR           = reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>          (vkGetDeviceProcAddr(device, "vkCreateAccelerationStructureKHR"));
+vkDestroyAccelerationStructureKHR          = reinterpret_cast<PFN_vkDestroyAccelerationStructureKHR>         (vkGetDeviceProcAddr(device, "vkDestroyAccelerationStructureKHR"));
+vkGetAccelerationStructureBuildSizesKHR    = reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>   (vkGetDeviceProcAddr(device, "vkGetAccelerationStructureBuildSizesKHR"));
+vkGetAccelerationStructureDeviceAddressKHR = reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(vkGetDeviceProcAddr(device, "vkGetAccelerationStructureDeviceAddressKHR"));
+vkCmdTraceRaysKHR                          = reinterpret_cast<PFN_vkCmdTraceRaysKHR>                         (vkGetDeviceProcAddr(device, "vkCmdTraceRaysKHR"));
+vkGetRayTracingShaderGroupHandlesKHR       = reinterpret_cast<PFN_vkGetRayTracingShaderGroupHandlesKHR>      (vkGetDeviceProcAddr(device, "vkGetRayTracingShaderGroupHandlesKHR"));
+vkCreateRayTracingPipelinesKHR             = reinterpret_cast<PFN_vkCreateRayTracingPipelinesKHR>            (vkGetDeviceProcAddr(device, "vkCreateRayTracingPipelinesKHR"));
+```
+
+Also query pipeline properties (needed for SBT sizing):
+
+```cpp
+rayTracingPipelineProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+VkPhysicalDeviceProperties2 props2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+props2.pNext = &rayTracingPipelineProperties;
+vkGetPhysicalDeviceProperties2(physicalDevice, &props2);
+```
+
+### AccelerationStructure struct
+
+```cpp
+struct AccelerationStructure {
+    VkAccelerationStructureKHR handle;
+    uint64_t deviceAddress = 0;
+    VkDeviceMemory memory;
+    VkBuffer buffer;
+};
+```
+
+The `deviceAddress` (from `vkGetAccelerationStructureDeviceAddressKHR`) is what TLAS instances reference, not the `VkBuffer` handle.
+
+### Buffer usage flags for AS inputs
+
+Vertex/index/transform/instance buffers used as AS build inputs need:
+
+```cpp
+VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+```
+
+Add `VK_BUFFER_USAGE_STORAGE_BUFFER_BIT` when the same buffer is also read by shaders (e.g. vertex data for closest-hit attribute lookups).
+
+The AS storage buffer itself needs:
+
+```cpp
+VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+```
+
+All device-address allocations need `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT_KHR` in `VkMemoryAllocateFlagsInfo` chained via `pNext`.
+
+### BLAS build sequence (triangle geometry)
+
+```
+1. Upload vertex/index/transform buffers (HOST_VISIBLE | HOST_COHERENT for simplicity; stage to DEVICE_LOCAL for perf)
+2. Fill VkAccelerationStructureGeometryKHR:
+     geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR
+     geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT
+     geometry.triangles.vertexData.deviceAddress = getBufferDeviceAddress(vertexBuffer)
+     geometry.triangles.vertexStride = sizeof(Vertex)
+     geometry.triangles.maxVertex = vertexCount - 1
+     geometry.triangles.indexType = VK_INDEX_TYPE_UINT32
+     geometry.triangles.indexData.deviceAddress = getBufferDeviceAddress(indexBuffer)
+     geometry.triangles.transformData = transformBufferDeviceAddress  (identity or per-node)
+3. Fill VkAccelerationStructureBuildGeometryInfoKHR:
+     type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR
+     flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR
+     geometryCount = 1 (or N for multi-geometry BLAS)
+4. vkGetAccelerationStructureBuildSizesKHR with primitiveCount[] per geometry → VkAccelerationStructureBuildSizesInfoKHR
+5. createAccelerationStructureBuffer (AS storage + device-address memory)
+6. vkCreateAccelerationStructureKHR
+7. createScratchBuffer(buildSizesInfo.buildScratchSize) — temporary DEVICE_LOCAL, SHADER_DEVICE_ADDRESS
+8. Set buildInfo.mode = BUILD, dstAccelerationStructure = handle, scratchData.deviceAddress
+9. Fill VkAccelerationStructureBuildRangeInfoKHR: primitiveCount, primitiveOffset=0, firstVertex=0, transformOffset
+10. vkCmdBuildAccelerationStructuresKHR in a one-time command buffer → flushCommandBuffer
+11. vkGetAccelerationStructureDeviceAddressKHR → store in bottomLevelAS.deviceAddress
+12. deleteScratchBuffer
+```
+
+For multi-geometry BLAS (one geometry per glTF primitive or per object), pass arrays of `VkAccelerationStructureGeometryKHR` and matching `primitiveCount[]`. Each geometry gets its own `VkAccelerationStructureBuildRangeInfoKHR` with the correct `transformOffset` (stride × geometry index when using a shared transform buffer).
+
+### TLAS build sequence
+
+```
+1. Fill VkAccelerationStructureInstanceKHR:
+     transform = 3×4 row-major identity (or flip Y for glTF: [1][1] = -1.0f)
+     mask = 0xFF
+     instanceShaderBindingTableRecordOffset = 0
+     flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR
+     accelerationStructureReference = bottomLevelAS.deviceAddress
+2. Upload instances buffer (HOST_VISIBLE | HOST_COHERENT, SHADER_DEVICE_ADDRESS | AS_BUILD_INPUT_READ_ONLY)
+3. Fill VkAccelerationStructureGeometryKHR:
+     geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR
+     geometry.instances.arrayOfPointers = VK_FALSE
+     geometry.instances.data.deviceAddress = getBufferDeviceAddress(instancesBuffer)
+4. Same size query + create + build pattern as BLAS (type = TOP_LEVEL, primitiveCount = instance count)
+5. instancesBuffer.destroy() after flushCommandBuffer (TLAS keeps its own copy)
+```
+
+### Storage image for raygen output
+
+```cpp
+image.format = swapChain.colorFormat;  // match exactly — no conversion needed in the blit
+image.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+// After creation: transition UNDEFINED → GENERAL via one-time command buffer
+vks::tools::setImageLayout(cmd, storageImage.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+    { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 });
+```
+
+On window resize: destroy image/view/memory, recreate, update the storage image descriptor in all frame descriptor sets.
+
+### Shader Binding Table (SBT) layout and sizing
+
+SBT standard layout:
+
+```
+| raygen  |
+| miss    |  (can have multiple — e.g. primary + shadow)
+| hit     |  (closesthit [+ anyhit [+ intersection]])
+| callable |  (optional; one slot per callable shader)
+```
+
+Sizing:
+
+```cpp
+const uint32_t handleSize        = rayTracingPipelineProperties.shaderGroupHandleSize;
+const uint32_t handleSizeAligned = alignedSize(handleSize, rayTracingPipelineProperties.shaderGroupHandleAlignment);
+// SBT buffer usage:
+VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+// Memory: HOST_VISIBLE | HOST_COHERENT (persistent map)
+// VkStridedDeviceAddressRegionKHR:
+entry.deviceAddress = getBufferDeviceAddress(sbtBuffer);
+entry.stride        = handleSizeAligned;
+entry.size          = handleSizeAligned;  // (or handleSizeAligned * N for N shaders in this group)
+```
+
+After `vkGetRayTracingShaderGroupHandlesKHR` fills `shaderHandleStorage[]`, copy with stride offsets:
+
+```cpp
+memcpy(raygen.mapped,   storage.data(),                          handleSize);
+memcpy(miss.mapped,     storage.data() + handleSizeAligned,      handleSize);  // * missCount for multiple
+memcpy(hit.mapped,      storage.data() + handleSizeAligned * 2,  handleSize);
+memcpy(callable.mapped, storage.data() + handleSizeAligned * 3,  handleSize * objectCount);
+```
+
+### Shader group types
+
+```cpp
+// Ray generation / miss / callable — all use GENERAL:
+shaderGroup.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+shaderGroup.generalShader = <stage index>;
+
+// Triangle closest-hit (with optional any-hit):
+shaderGroup.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+shaderGroup.closestHitShader = <chit stage>;
+shaderGroup.anyHitShader     = <ahit stage>;  // or VK_SHADER_UNUSED_KHR
+
+// Procedural closest-hit + intersection:
+shaderGroup.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR;
+shaderGroup.closestHitShader  = <chit stage>;
+shaderGroup.intersectionShader = <rint stage>;
+```
+
+Always zero-initialize `VkRayTracingShaderGroupCreateInfoKHR` and set unused slots to `VK_SHADER_UNUSED_KHR`.
+
+### Pipeline creation
+
+```cpp
+VkRayTracingPipelineCreateInfoKHR ci{};
+ci.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
+ci.stageCount = static_cast<uint32_t>(shaderStages.size());
+ci.pStages    = shaderStages.data();
+ci.groupCount = static_cast<uint32_t>(shaderGroups.size());
+ci.pGroups    = shaderGroups.data();
+ci.maxPipelineRayRecursionDepth = std::min(2u, rayTracingPipelineProperties.maxRayRecursionDepth);
+ci.layout     = pipelineLayout;
+vkCreateRayTracingPipelinesKHR(device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline);
+```
+
+### Descriptor layout (canonical bindings)
+
+Basic:
+```
+Binding 0: VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR  — top-level AS (raygen [+ chit for shadow rays])
+Binding 1: VK_DESCRIPTOR_TYPE_STORAGE_IMAGE               — raygen output (raygen only)
+Binding 2: VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER              — {viewInverse, projInverse [, frame]}
+```
+
+Extended for glTF:
+```
+Binding 3: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER      — unused in basic; texture array in gltf sample
+Binding 4: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER              — GeometryNode SSBO (see below)
+Binding 5: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER[]    — variable-count texture array (descriptor indexing)
+```
+
+Official `raytracingshadows` pattern:
+```
+Binding 0: VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR  - TLAS, visible to raygen and closest-hit
+Binding 1: VK_DESCRIPTOR_TYPE_STORAGE_IMAGE               - raygen output
+Binding 2: VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER              - {viewInverse, projInverse, lightPos, vertexSize}
+Binding 3: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER              - glTF vertex buffer, visible to closest-hit
+Binding 4: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER              - glTF index buffer, visible to closest-hit
+```
+
+That sample loads a complex glTF scene through `vkglTF::Model`, sets the model
+buffer usage flags to:
+
+```cpp
+VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+```
+
+It then builds one triangle BLAS from the scene vertex/index buffer device
+addresses and places it in one TLAS instance with
+`VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR`.
+
+Writing the AS descriptor requires `VkWriteDescriptorSetAccelerationStructureKHR` chained via `pNext` on the `VkWriteDescriptorSet`:
+
+```cpp
+VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
+asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+asInfo.accelerationStructureCount = 1;
+asInfo.pAccelerationStructures    = &topLevelAS.handle;
+
+VkWriteDescriptorSet write{};
+write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+write.pNext           = &asInfo;
+write.dstBinding      = 0;
+write.descriptorCount = 1;
+write.descriptorType  = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+```
+
+### Command buffer dispatch and blit to swapchain
+
+```cpp
+vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline);
+vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipelineLayout, 0, 1, &descriptorSets[i], 0, 0);
+vkCmdTraceRaysKHR(cmd, &raygen_sbt, &miss_sbt, &hit_sbt, &callable_sbt_or_empty, width, height, 1);
+
+// Blit storage image to swapchain (no render pass needed):
+setImageLayout(cmd, swapChain.images[idx], UNDEFINED, TRANSFER_DST_OPTIMAL, range);
+setImageLayout(cmd, storageImage.image,    GENERAL,   TRANSFER_SRC_OPTIMAL, range);
+vkCmdCopyImage(cmd, storageImage.image, TRANSFER_SRC_OPTIMAL, swapChain.images[idx], TRANSFER_DST_OPTIMAL, 1, &region);
+setImageLayout(cmd, swapChain.images[idx], TRANSFER_DST_OPTIMAL, PRESENT_SRC_KHR,  range);
+setImageLayout(cmd, storageImage.image,    TRANSFER_SRC_OPTIMAL, GENERAL,           range);
+```
+
+Pass `&emptySbtEntry` (zero-init `VkStridedDeviceAddressRegionKHR`) for the callable slot when not using callable shaders.
+
+### Frame accumulation pattern
+
+From the `raytracinggltf` example — enables progressive anti-aliasing and stochastic transparency:
+
+```cpp
+struct UniformData {
+    glm::mat4 viewInverse;
+    glm::mat4 projInverse;
+    uint32_t frame{ 0 };
+};
+
+// each render():
+if (camera.updated) uniformData.frame = -1;  // reset on camera move
+uniformData.frame++;
+memcpy(uniformBuffers[currentBuffer].mapped, &uniformData, sizeof(uniformData));
+```
+
+The raygen shader uses `frame` as a noise seed to jitter ray directions per sample, accumulating into the storage image across frames. Reset to 0 (via wrapping from -1) on camera or scene change.
+
+**N-Ray mapping:** `params.renderInvalidated` / `params.currentSample` maps directly — pass `currentSample` as the frame counter in the UBO.
+
+### GeometryNode SSBO (glTF multi-primitive)
+
+One entry per glTF primitive, indexed by `gl_GeometryIndexEXT` in the closest-hit shader:
+
+```cpp
+struct GeometryNode {
+    uint64_t vertexBufferDeviceAddress;  // base of the shared vertex buffer
+    uint64_t indexBufferDeviceAddress;   // offset-adjusted pointer to this primitive's first index
+    int32_t  textureIndexBaseColor;
+    int32_t  textureIndexOcclusion;      // -1 if absent
+};
+```
+
+Build the BLAS with one `VkAccelerationStructureGeometryKHR` per primitive so `gl_GeometryIndexEXT` in the shader equals the `geometryNodes[]` index. In the closest-hit shader:
+
+```glsl
+GeometryNode node = geometryNodes[gl_GeometryIndexEXT];
+// reconstruct hit attributes:
+uint idx0 = indices[gl_PrimitiveID * 3 + 0] + node.vertexBufferDeviceAddress ...
+```
+
+**N-Ray mapping:** `Data::tris[hitIdx].materialIdx` + `Data::materials[]` is the CPU equivalent. The GPU version replaces the fat `Tri` with a compact `GeometryNode` SSBO + the model's vertex/index buffers.
+
+### Descriptor indexing for variable-count texture arrays
+
+When a glTF model has an unknown number of textures at pipeline-creation time:
+
+```cpp
+// In descriptor set layout: last binding uses variable count flag
+std::vector<VkDescriptorBindingFlagsEXT> bindingFlags = { 0, 0, 0, 0, 0,
+    VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT_EXT };
+VkDescriptorSetLayoutBindingFlagsCreateInfoEXT flagsCI{};
+flagsCI.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_EXT;
+flagsCI.bindingCount = 6;
+flagsCI.pBindingFlags = bindingFlags.data();
+descriptorSetLayoutCI.pNext = &flagsCI;
+
+// At allocation: tell the pool the actual count
+uint32_t varDescCount[] = { imageCount };
+VkDescriptorSetVariableDescriptorCountAllocateInfoEXT varAllocInfo{};
+varAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO_EXT;
+varAllocInfo.descriptorSetCount = 1;
+varAllocInfo.pDescriptorCounts  = varDescCount;
+allocInfo.pNext = &varAllocInfo;
+```
+
+Shader side requires `#extension GL_EXT_nonuniform_qualifier : enable` and `nonuniformEXT()` when indexing with a non-uniform value like `gl_GeometryIndexEXT`.
+
+### Callable shaders
+
+Add per-geometry callable shader groups after raygen/miss/hit in the SBT:
+
+```cpp
+// For objectCount callables:
+for (uint32_t i = 0; i < objectCount; i++) {
+    shaderStages.push_back(loadShader("callable" + to_string(i+1) + ".rcall.spv", VK_SHADER_STAGE_CALLABLE_BIT_KHR));
+    shaderGroup.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    shaderGroup.generalShader = shaderStages.size() - 1;
+    shaderGroups.push_back(shaderGroup);
+}
+// Callable SBT holds objectCount handles:
+createShaderBindingTable(callable, objectCount);
+memcpy(callable.mapped, storage.data() + handleSizeAligned * 3, handleSize * objectCount);
+```
+
+In the closest-hit shader: `executeCallableEXT(gl_GeometryIndexEXT, payloadLocation)` — dispatches to the callable at SBT slot `gl_GeometryIndexEXT`. The callable SBT entry (4th argument to `vkCmdTraceRaysKHR`) must be non-empty.
+
+### Intersection shaders (procedural geometry)
+
+Replace triangle BLAS geometry with AABB geometry:
+
+```cpp
+// BLAS geometry:
+accelerationStructureGeometry.geometryType = VK_GEOMETRY_TYPE_AABBS_KHR;
+accelerationStructureGeometry.geometry.aabbs.sType  = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_AABBS_DATA_KHR;
+accelerationStructureGeometry.geometry.aabbs.data.deviceAddress = getBufferDeviceAddress(aabbsBuffer);
+accelerationStructureGeometry.geometry.aabbs.stride = sizeof(VkAabbPositionsKHR);  // 6 floats
+
+// Hit group type is PROCEDURAL (not TRIANGLES):
+shaderGroup.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR;
+shaderGroup.closestHitShader   = <chit stage>;
+shaderGroup.intersectionShader = <rint stage>;
+```
+
+The intersection shader (`.rint`) runs once per AABB hit candidate. It tests the analytical shape (e.g. sphere) and calls `reportIntersectionEXT(t, hitKind)` if the ray actually hits it. The closest-hit shader is only invoked after a successful `reportIntersectionEXT`. Sphere data is passed as a separate SSBO indexed by `gl_PrimitiveID`.
+
+### Recursive secondary rays — shadows and reflections
+
+References: upstream `SaschaWillems/Vulkan/examples/raytracingshadows` and `raytracingreflections`. Both extend `raytracingbasic` by launching a **second ray after the first hit**. Shadows trace toward the light; reflections trace along the reflected direction. The two examples demonstrate the two ways to structure secondary bounces, and the choice matters for N-Ray.
+
+#### Two structuring patterns (pick deliberately)
+
+| Pattern | Where the secondary ray is launched | Recursion depth needed | Maps to |
+|---|---|---|---|
+| **Recursion from closest-hit** (shadows) | `traceRayEXT` inside `.rchit` | grows with bounce count — `maxPipelineRayRecursionDepth ≥ bounces+1` | a single occlusion/shadow probe per hit |
+| **Iterate in raygen** (reflections) | closest-hit only *returns* surface data via payload; raygen reflects and re-traces in a `for` loop | stays at **1** regardless of bounce count | N-Ray's `rayLogic` bounce loop — **prefer this** |
+
+Hardware recursion is capped (`maxPipelineRayRecursionDepth`, often 1–2 on real GPUs and always `≥ rayTracingPipelineProperties.maxRayRecursionDepth`). Deep path-tracer bounce counts will exceed it. The reflections example sidesteps this: the closest-hit shader writes `{color, distance, normal, reflector}` into the payload and returns; the raygen shader inspects the payload, computes the reflected origin/direction, attenuates throughput, and calls `traceRayEXT` again in a bounded loop. This is exactly how N-Ray's `rayLogic` already works on the CPU, so the iterate-in-raygen form is the natural port — keep `maxPipelineRayRecursionDepth = 1` and drive bounces from the loop. Reserve closest-hit recursion for a single short shadow probe (depth 2) if you add direct lighting.
+
+#### Payload design
+
+Closest-hit communicates with the launching shader only through the ray payload (`rayPayloadEXT` / `rayPayloadInEXT` at a matching `location`). A reflection/path-tracer payload carries enough to continue the loop in raygen:
+
+```glsl
+struct RayPayload {
+    vec3  color;       // surface contribution at this hit
+    float distance;    // gl_RayTmaxEXT — used to compute the hit point
+    vec3  normal;      // world-space shading normal for the reflected direction
+    float reflector;   // 0 = stop, >0 = spawn a reflection ray (or a material/throughput field)
+};
+layout(location = 0) rayPayloadEXT RayPayload payload;   // raygen
+// closest-hit: layout(location = 0) rayPayloadInEXT RayPayload payload;
+```
+
+Shadow rays use a **separate, tiny payload at a different location** (e.g. `layout(location = 2) rayPayloadEXT bool shadowed;`) so the occlusion result does not clobber the primary payload. The shadow miss shader sets `shadowed = false`; default it to `true` before the trace and use `gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT` so any hit between surface and light proves occlusion without invoking a hit shader.
+
+#### Multiple miss shaders and SBT layout
+
+Shadow rays need a *second* miss shader. The miss group then holds two handles and `vkCmdTraceRaysKHR`'s miss `sbtRecordOffset`/index selects which one. From the shadows sample:
+
+```cpp
+createShaderBindingTable(shaderBindingTables.raygen, 1);
+createShaderBindingTable(shaderBindingTables.miss,   2);   // primary miss + shadow miss
+createShaderBindingTable(shaderBindingTables.hit,    1);
+
+const uint32_t handleSizeAligned = alignedSize(handleSize, shaderGroupHandleAlignment);
+memcpy(raygen.mapped, storage.data(),                         handleSize);
+memcpy(miss.mapped,   storage.data() + handleSizeAligned,     handleSize * 2);  // two contiguous handles
+memcpy(hit.mapped,    storage.data() + handleSizeAligned * 3, handleSize);      // raygen=0, miss=1, shadowmiss=2, hit=3
+```
+
+Both miss shaders are pushed as `VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR` groups, back to back, before the hit group. In GLSL, the shadow trace selects the second miss shader via its miss index argument to `traceRayEXT` (`missIndex = 1`).
+
+#### Descriptor differences from raytracingbasic
+
+The secondary ray needs scene attributes and an AS reachable from the hit shader:
+
+```cpp
+// Binding 0: TLAS must now be visible to CLOSEST_HIT too (it launches traceRayEXT):
+descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+    VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, 0);
+// Binding 2: UBO with light position visible to RAYGEN | CLOSEST_HIT | MISS:
+descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+    VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR, 2);
+// Bindings 3,4: vertex + index buffers as STORAGE_BUFFER for CLOSEST_HIT attribute reconstruction:
+descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, 3);
+descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, 4);
+```
+
+The vertex/index buffers must be created with `VK_BUFFER_USAGE_STORAGE_BUFFER_BIT` *in addition to* the AS-build-input flags (the shadows sample sets all three usage bits on the glTF loader's buffers — see "Buffer usage flags for AS inputs"). Size the descriptor pool for the extra storage buffers (`STORAGE_BUFFER` count = `maxConcurrentFrames * 2`). The closest-hit shader reconstructs the interpolated normal from the three vertices of `gl_PrimitiveID` (using barycentrics from `hitAttributeEXT`) and `uniformData.vertexSize` for manual struct unpacking.
+
+#### Recursion depth and per-bounce origin offset
+
+```cpp
+ci.maxPipelineRayRecursionDepth = std::min(2u, rayTracingPipelineProperties.maxRayRecursionDepth);
+```
+
+Set this to the actual recursion you use (2 for primary + shadow), not the bounce count when iterating in raygen. Always re-launch secondary rays with the origin nudged off the surface (`hitPoint + normal * tmin`, `tmin ≈ 0.001`) to avoid self-intersection acne — the GPU analogue of the CPU path tracer's epsilon offset after each bounce.
+
+**N-Ray mapping:** the `rayLogic` bounce loop becomes the raygen loop; per-bounce material branching (diffuse/specular/refraction) decides the next direction and throughput written back through the payload; `reflector`/material id in the payload replaces the CPU material lookup. Russian roulette termination ports verbatim as the loop's early-exit. Add a single shadow trace (second miss shader, depth-2 recursion) only if/when you add next-event-estimation direct lighting.
+
+### N-Ray mapping for hardware ray tracing
+
+| N-Ray CPU concept | Vulkan HW RT equivalent |
+|---|---|
+| `globalCompactBVH` (flattened SAH BVH) | Replaced entirely by hardware BLAS/TLAS — driver manages the tree |
+| `Data::tris` fat triangle array | Vertex/index buffers for BLAS inputs + `GeometryNode` SSBO for shading attribute lookups |
+| `Data::triIsect` compact traversal mirror | Eliminated — hardware traversal does not read this |
+| `Data::materials` | Material SSBO indexed via `GeometryNode.textureIndexBaseColor` or a material index per geometry |
+| `traverseFlatBVH` + `rayAABB` + `RayIntersectsTriangle` | Handled by hardware; raygen calls `traceRayEXT()`, driver does the traversal |
+| `rayLogic` bounce loop | **Iterate-in-raygen** loop (`raytracingreflections` pattern): closest-hit returns surface data via the payload, raygen reflects/re-traces — keeps `maxPipelineRayRecursionDepth = 1`. Avoid deep closest-hit recursion |
+| `specularLighting` reflected direction | Reflected ray spawned in the raygen loop from the payload `normal`, origin offset by `normal * tmin` |
+| Shadow/occlusion probe (future NEE direct lighting) | Second miss shader + `traceRayEXT` from closest-hit with `TerminateOnFirstHit | SkipClosestHit` (`raytracingshadows` pattern), recursion depth 2, separate shadow payload location |
+| `accumBuffer` (float HDR accumulation) | Storage image accumulation via `frame` counter in UBO |
+| `params.renderInvalidated` (restart worker) | `uniformData.frame = -1` to reset accumulation |
+| `params.russianRoulette` | Same unbiased termination logic, fully portable to GLSL |
+| `ObjImporter` (one model → one BLAS geometry) | One BLAS geometry per glTF primitive; multi-model scenes use a multi-geometry BLAS or multiple BLAS with TLAS instances |
+
+The initial HW RT port does not need to replicate the full PBR stack immediately — a raygen + miss (sky color) + closesthit (normal visualization or flat albedo) produces a working image first. Port `rayAABB` / triangle intersection logic only if debugging the hardware AS build; for production use, trust the hardware.
 
 ## ImGui Mouse Coordinate Debugging
 

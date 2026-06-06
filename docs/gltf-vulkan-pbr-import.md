@@ -18,6 +18,10 @@ References:
   [Reference Implementations](#reference-implementations) below).
 - Upstream animated-skinning reference:
   [`SaschaWillems/Vulkan` `examples/gltfskinning`](https://github.com/SaschaWillems/Vulkan/tree/master/examples/gltfskinning).
+- Upstream hardware-ray-tracing shadow reference:
+  [`SaschaWillems/Vulkan` `examples/raytracingshadows`](https://github.com/SaschaWillems/Vulkan/tree/master/examples/raytracingshadows)
+  for glTF vertex/index buffers used as both acceleration-structure inputs and
+  closest-hit SSBOs, plus the two-miss-shader shadow-ray SBT pattern.
 
 ## Role In N-Ray
 
@@ -221,6 +225,13 @@ If a hardware ray tracing backend is added later, Vulkan/GLSL built-ins such as
 `InstanceID` and `PrimitiveID` become relevant. In the current compute-first
 plan, the shader owns traversal, so the hit record should carry the primitive,
 material, and instance indices explicitly.
+
+For that future hardware path, the official Sascha Willems `raytracingshadows`
+sample is the relevant shadow reference: closest-hit reconstructs the hit
+geometry from descriptor-bound glTF vertex and index buffers, traces a secondary
+shadow ray against the same TLAS, and uses a second miss shader to identify
+unoccluded light samples. That is a hardware RT backend pattern, not a change to
+the current compute-preview buffer contract.
 
 Use explicit `vec4`/`uvec4`-style layouts for GPU structs. Do not copy C++ glTF
 loader structs directly into SSBOs. `std430` alignment, `glm::vec3` padding,

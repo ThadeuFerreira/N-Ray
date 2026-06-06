@@ -1,6 +1,10 @@
 #version 450
+#extension GL_EXT_nonuniform_qualifier : require
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Specialization constant 0: overridden at pipeline creation (32 on Intel Iris Xe, 64 otherwise).
+layout(constant_id = 0) const int BVH_MAX_STACK_DEPTH = 64;
 
 layout(std430, binding = 0) buffer PixelBuffer {
 	uint pixels[];
@@ -17,6 +21,11 @@ struct GpuTriShading {
 	vec4 aN;
 	vec4 bN;
 	vec4 cN;
+	vec4 aTangent;
+	vec4 bTangent;
+	vec4 cTangent;
+	vec4 uv01;
+	vec4 uv2;
 	uvec4 ids;
 };
 
@@ -24,6 +33,9 @@ struct GpuMaterial {
 	vec4 baseColor;
 	vec4 params;
 	vec4 emissionIor;
+	uvec4 textureIndices;
+	uvec4 textureInfo;
+	vec4 textureParams;
 };
 
 struct GpuBvhNode {
@@ -63,6 +75,8 @@ layout(std430, binding = 6) readonly buffer SettingsBuffer {
 	GpuSettings cfg;
 };
 
+layout(binding = 7) uniform sampler2D sceneTextures[256];
+
 layout(push_constant) uniform PushConstants {
 	int width;
 	int height;
@@ -81,6 +95,10 @@ const float EPSILON = 0.0000001;
 const float MIN_DET_EPSILON = 0.000000000001;
 const float MIN_RAY_BIAS = 0.000001;
 const float INF_T = 3.402823466e+38;
+const uint INVALID_TEXTURE = 0xffffffffu;
+const uint GLTF_ALPHA_OPAQUE = 0u;
+const uint GLTF_ALPHA_MASK = 1u;
+const uint GLTF_ALPHA_BLEND = 2u;
 
 bool invalidVec3(vec3 value) {
 	return any(isnan(value)) || any(isinf(value));
@@ -207,6 +225,71 @@ vec3 contrastSCurve(vec3 color, float c) {
 	), 0.0, 1.0);
 }
 
+vec3 srgbToLinear(vec3 color) {
+	vec3 low = color / 12.92;
+	vec3 high = pow(max((color + 0.055) / 1.055, vec3(0.0)), vec3(2.4));
+	return mix(low, high, step(vec3(0.04045), color));
+}
+
+bool validTexture(uint textureIndex) {
+	return textureIndex != INVALID_TEXTURE && textureIndex < pc.sceneCounts.w;
+}
+
+vec4 sampleSceneTexture(uint textureIndex, vec2 uv, vec4 fallback) {
+	if (!validTexture(textureIndex)) {
+		return fallback;
+	}
+	return texture(sceneTextures[nonuniformEXT(textureIndex)], uv);
+}
+
+vec2 interpolateUv(GpuTriShading shading, float hitU, float hitV) {
+	float hitW = 1.0 - hitU - hitV;
+	vec2 aUv = shading.uv01.xy;
+	vec2 bUv = shading.uv01.zw;
+	vec2 cUv = shading.uv2.xy;
+	return aUv * hitW + bUv * hitU + cUv * hitV;
+}
+
+vec4 interpolateTangent(GpuTriShading shading, float hitU, float hitV) {
+	float hitW = 1.0 - hitU - hitV;
+	vec4 tangent =
+		shading.aTangent * hitW +
+		shading.bTangent * hitU +
+		shading.cTangent * hitV;
+	tangent.w = tangent.w < 0.0 ? -1.0 : 1.0;
+	return tangent;
+}
+
+float materialAlpha(GpuMaterial material, vec2 uv) {
+	float alpha = material.baseColor.a;
+	if (validTexture(material.textureIndices.x)) {
+		alpha *= sampleSceneTexture(material.textureIndices.x, uv, vec4(1.0)).a;
+	}
+	return alpha;
+}
+
+bool alphaHitAccepted(uint triIdx, float hitU, float hitV) {
+	GpuTriShading shading = triShading[triIdx];
+	uint materialIndex = shading.ids.x;
+	if (materialIndex >= pc.sceneCounts.z) {
+		return true;
+	}
+
+	GpuMaterial material = materials[materialIndex];
+	uint alphaMode = material.textureInfo.y;
+	if (alphaMode == GLTF_ALPHA_OPAQUE) {
+		return true;
+	}
+
+	vec2 uv = interpolateUv(shading, hitU, hitV);
+	float alpha = materialAlpha(material, uv);
+	if (alphaMode == GLTF_ALPHA_MASK) {
+		return alpha >= material.textureParams.x;
+	}
+
+	return alpha > 0.001;
+}
+
 bool rayAabb(vec3 origin, vec3 invDir, vec3 boxMin, vec3 boxMax, float maxT) {
 	vec3 t0 = (boxMin - origin) * invDir;
 	vec3 t1 = (boxMax - origin) * invDir;
@@ -310,7 +393,7 @@ bool traverseBvh(
 		return false;
 	}
 
-	uint stack[64];
+	uint stack[BVH_MAX_STACK_DEPTH];
 	int stackPtr = 0;
 	uint current = 0u;
 	bool hit = false;
@@ -337,6 +420,9 @@ bool traverseBvh(
 					float v;
 					GpuTriIntersect tri = triIsect[triBufferIndex];
 					if (rayIntersectsTriangle(origin, dir, tri, t, u, v) && t < closestT) {
+						if (tri.ids.x >= triCount || !alphaHitAccepted(tri.ids.x, u, v)) {
+							continue;
+						}
 						closestT = t;
 						hitTriIdx = tri.ids.x;
 						hitU = u;
@@ -353,7 +439,7 @@ bool traverseBvh(
 			else {
 				uint firstChild = current + 1u;
 				uint secondChild = node.meta.x;
-				if (stackPtr >= 64) {
+				if (stackPtr >= BVH_MAX_STACK_DEPTH) {
 					stackOverflow = true;
 					break;
 				}
@@ -437,6 +523,7 @@ void main() {
 		if (dot(normal, -dir) < 0.0) {
 			normal = -normal;
 		}
+		vec2 hitUv = interpolateUv(shading, hitU, hitV);
 
 		uint materialIndex = shading.ids.x;
 		vec3 albedo = vec3(0.8);
@@ -447,12 +534,46 @@ void main() {
 		float ior = 1.5;
 		if (materialIndex < pc.sceneCounts.z) {
 			GpuMaterial material = materials[materialIndex];
-			albedo = max(material.baseColor.rgb, vec3(0.0));
+			vec4 baseColor = material.baseColor;
+			if (validTexture(material.textureIndices.x)) {
+				vec4 baseSample = sampleSceneTexture(material.textureIndices.x, hitUv, vec4(1.0));
+				baseColor *= vec4(srgbToLinear(baseSample.rgb), baseSample.a);
+			}
+			albedo = max(baseColor.rgb, vec3(0.0));
 			roughness = clamp(material.params.x, 0.02, 1.0);
 			metalness = clamp(material.params.y, 0.0, 1.0);
+			if (validTexture(material.textureIndices.y)) {
+				vec4 mrSample = sampleSceneTexture(material.textureIndices.y, hitUv, vec4(1.0));
+				roughness = clamp(roughness * mrSample.g, 0.02, 1.0);
+				metalness = clamp(metalness * mrSample.b, 0.0, 1.0);
+			}
 			emissionIntensity = max(material.params.z, 0.0);
 			emissionColor = max(material.emissionIor.rgb, vec3(0.0));
+			if (validTexture(material.textureIndices.w)) {
+				vec3 emissiveSample = srgbToLinear(sampleSceneTexture(material.textureIndices.w, hitUv, vec4(1.0)).rgb);
+				emissionColor *= emissiveSample;
+			}
 			ior = max(material.emissionIor.a, 1.001);
+
+			if (validTexture(material.textureIndices.z)) {
+				vec3 tangentSample = sampleSceneTexture(material.textureIndices.z, hitUv, vec4(0.5, 0.5, 1.0, 1.0)).rgb * 2.0 - 1.0;
+				tangentSample.xy *= material.textureParams.y;
+				tangentSample = safeNormalize(tangentSample, vec3(0.0, 0.0, 1.0));
+
+				vec4 tangent4 = interpolateTangent(shading, hitU, hitV);
+				vec3 tangent = tangent4.xyz - normal * dot(normal, tangent4.xyz);
+				tangent = safeNormalize(tangent, abs(normal.z) < 0.999 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0));
+				vec3 bitangent = safeNormalize(cross(normal, tangent) * tangent4.w, cross(normal, tangent));
+				normal = safeNormalize(
+					tangent * tangentSample.x +
+					bitangent * tangentSample.y +
+					normal * tangentSample.z,
+					normal
+				);
+				if (dot(normal, -dir) < 0.0) {
+					normal = -normal;
+				}
+			}
 		}
 
 		if (emissionIntensity > 0.0 && maxComponent(emissionColor) > 0.0) {

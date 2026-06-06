@@ -198,11 +198,26 @@ bool updateVulkanComputePreview(RuntimeResources& runtime) {
 	else {
 		runtime.vulkanFrameDispatched = false;
 	}
+
+	GpuStats gpuStats = runtime.vulkanPreview.gpuStats();
 	resetRenderStats(params);
 	params.currentSample = static_cast<int>(runtime.vulkanPreview.samplesAccumulated());
 	params.renderStatsSample = params.currentSample;
 	params.renderStatsActive = modelPreview && !runtime.vulkanPreview.converged();
 	params.renderStatsComplete = runtime.vulkanPreview.converged();
+	if (modelPreview) {
+		params.renderStatsTotalRays = gpuStats.primaryRaysTraced;
+		params.renderStatsRaysPerSec = gpuStats.primaryRaysPerSec;
+		params.renderStatsMsPerSample = gpuStats.gpuDispatchMs;
+		params.renderStatsPublishedFrames = gpuStats.frameCount;
+		if (gpuStats.primaryRaysTraced > 0 && gpuStats.primaryRaysPerSec > 0.0) {
+			params.renderStatsElapsedSec =
+				static_cast<double>(gpuStats.primaryRaysTraced) / gpuStats.primaryRaysPerSec;
+		}
+		if (gpuStats.gpuDispatchMs > 0.0) {
+			params.renderStatsSamplesPerSec = 1000.0 / gpuStats.gpuDispatchMs;
+		}
+	}
 	drawRenderTexture(runtime.render, screen);
 	return true;
 }
@@ -305,6 +320,13 @@ void drawVulkanPreviewPanel(RuntimeResources& runtime, bool vulkanFrameDrawn) {
 		ImGui::Text("Frames:      %u", gs.frameCount);
 		if (VulkanComputePreview::isModelPreviewIndex(runtime.vulkanPreview.shaderIndex())) {
 			ImGui::Text("Sample:      %u / %u", gs.samplesAccumulated, gs.maxSamples);
+			ImGui::Text("Primary rays: %.2f M", static_cast<double>(gs.primaryRaysTraced) / 1000000.0);
+			if (gs.primaryRaysPerSec > 0.0) {
+				ImGui::Text("Primary rays/sec: %.2f M", gs.primaryRaysPerSec / 1000000.0);
+			}
+			else {
+				ImGui::TextDisabled("Primary rays/sec: unavailable");
+			}
 		}
 
 		if (gs.timestampAvailable) {

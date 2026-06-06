@@ -268,9 +268,12 @@ PBRMaterial convertMaterial(
 	}
 
 	meta.baseColorTexture = textureIndexOrInvalid(pbr.baseColorTexture.index, model.textures.size());
+	meta.metallicRoughnessTexture = textureIndexOrInvalid(pbr.metallicRoughnessTexture.index, model.textures.size());
 	meta.normalTexture = textureIndexOrInvalid(material.normalTexture.index, model.textures.size());
+	meta.occlusionTexture = textureIndexOrInvalid(material.occlusionTexture.index, model.textures.size());
 	meta.emissiveTexture = textureIndexOrInvalid(material.emissiveTexture.index, model.textures.size());
 	meta.normalScale = static_cast<float>(material.normalTexture.scale);
+	meta.occlusionStrength = static_cast<float>(material.occlusionTexture.strength);
 	meta.roughness = static_cast<float>(pbr.roughnessFactor);
 	meta.metalness = static_cast<float>(pbr.metallicFactor);
 	meta.alphaMode = alphaModeValue(material);
@@ -811,6 +814,12 @@ glm::vec3 fallbackTangentFromUv(
 	return (edge1 * deltaUv2.y - edge2 * deltaUv1.y) / denom;
 }
 
+glm::vec3 orthogonalTangent(const glm::vec3& normal) {
+	glm::vec3 n = safeNormal(normal, glm::vec3(0.0f, 0.0f, 1.0f));
+	glm::vec3 up = std::abs(n.z) < 0.999f ? glm::vec3(0.0f, 0.0f, 1.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+	return safeNormal(glm::cross(up, n), glm::vec3(1.0f, 0.0f, 0.0f));
+}
+
 void includeBounds(GltfPreviewScene& scene, const Tri& tri, bool& haveBounds) {
 	if (!haveBounds) {
 		scene.boundsMin = tri.min;
@@ -882,7 +891,9 @@ bool applyBindPoseSkinning(
 	const std::vector<glm::mat4>& skinMatrices,
 	std::vector<glm::vec3>& positions,
 	std::vector<glm::vec3>& normals,
+	std::vector<glm::vec4>& tangents,
 	bool hasNormals,
+	bool hasTangents,
 	std::string& error
 ) {
 	auto jointsIt = primitive.attributes.find("JOINTS_0");
@@ -909,6 +920,10 @@ bool applyBindPoseSkinning(
 		positions[i] = glm::vec3(skin * glm::vec4(positions[i], 1.0f));
 		if (hasNormals && i < normals.size()) {
 			normals[i] = safeNormal(glm::mat3(skin) * normals[i], normals[i]);
+		}
+		if (hasTangents && i < tangents.size()) {
+			glm::vec3 tangent = safeNormal(glm::mat3(skin) * glm::vec3(tangents[i]), glm::vec3(tangents[i]));
+			tangents[i] = glm::vec4(tangent, tangents[i].w);
 		}
 	}
 
@@ -950,6 +965,22 @@ bool appendPrimitive(
 		return false;
 	}
 
+	std::vector<glm::vec2> texcoords;
+	auto texcoordIt = primitive.attributes.find("TEXCOORD_0");
+	bool hasTexcoords = texcoordIt != primitive.attributes.end() &&
+		readVec2Accessor(model, texcoordIt->second, texcoords, error);
+	if (texcoordIt != primitive.attributes.end() && !hasTexcoords) {
+		return false;
+	}
+
+	std::vector<glm::vec4> tangents;
+	auto tangentIt = primitive.attributes.find("TANGENT");
+	bool hasTangents = tangentIt != primitive.attributes.end() &&
+		readVec4Accessor(model, tangentIt->second, tangents, error);
+	if (tangentIt != primitive.attributes.end() && !hasTangents) {
+		return false;
+	}
+
 	std::vector<uint32_t> indices;
 	if (primitive.indices >= 0) {
 		if (!readIndexAccessor(model, primitive.indices, indices, error)) {
@@ -970,7 +1001,7 @@ bool appendPrimitive(
 
 	glm::mat4 effectiveWorld = world;
 	if (skinMatrices) {
-		if (!applyBindPoseSkinning(model, primitive, *skinMatrices, positions, normals, hasNormals, error)) {
+		if (!applyBindPoseSkinning(model, primitive, *skinMatrices, positions, normals, tangents, hasNormals, hasTangents, error)) {
 			return false;
 		}
 		effectiveWorld = glm::mat4(1.0f);
@@ -1018,7 +1049,41 @@ bool appendPrimitive(
 			if (windingFlipped) std::swap(bN, cN);
 		}
 
+		GltfPreviewTriSurface surface{};
+		if (hasTexcoords && ia < texcoords.size() && ib < texcoords.size() && ic < texcoords.size()) {
+			surface.aUv = texcoords[ia];
+			surface.bUv = texcoords[ib];
+			surface.cUv = texcoords[ic];
+		}
+
+		if (hasTangents && ia < tangents.size() && ib < tangents.size() && ic < tangents.size()) {
+			float handednessScale = windingFlipped ? -1.0f : 1.0f;
+			glm::vec4 aT = tangents[ia];
+			glm::vec4 bT = tangents[ib];
+			glm::vec4 cT = tangents[ic];
+			surface.aTangent = makeTangent(normalMatrix * glm::vec3(aT), aN, aT.w * handednessScale, orthogonalTangent(aN));
+			surface.bTangent = makeTangent(normalMatrix * glm::vec3(bT), bN, bT.w * handednessScale, orthogonalTangent(bN));
+			surface.cTangent = makeTangent(normalMatrix * glm::vec3(cT), cN, cT.w * handednessScale, orthogonalTangent(cN));
+		}
+		else {
+			glm::vec3 fallbackTangent = fallbackTangentFromUv(
+				a,
+				b,
+				c,
+				surface.aUv,
+				surface.bUv,
+				surface.cUv,
+				orthogonalTangent(faceNormal)
+			);
+			surface.aTangent = makeTangent(fallbackTangent, aN, 1.0f, orthogonalTangent(aN));
+			surface.bTangent = makeTangent(fallbackTangent, bN, 1.0f, orthogonalTangent(bN));
+			surface.cTangent = makeTangent(fallbackTangent, cN, 1.0f, orthogonalTangent(cN));
+		}
+
+		uint32_t originalTriIndex = static_cast<uint32_t>(scene.tris.size());
 		scene.tris.emplace_back(a, b, c, aN, bN, cN, materialIndex, primitiveIndex, doubleSided);
+		scene.tris.back().idx = originalTriIndex;
+		scene.triSurfaces.push_back(surface);
 		includeBounds(scene, scene.tris.back(), haveBounds);
 		++appendedTriangles;
 	}
@@ -1185,6 +1250,18 @@ void buildSceneAcceleration(GltfPreviewScene& scene) {
 	PathTracer tracer;
 	tracer.flattenBVH(0, buildBvh, scene.flatBvh);
 
+	// flattenBVH reorders scene.tris; tri.idx still holds the pre-flatten index, so
+	// reorder the parallel surfaces into a fresh buffer to match. Out-of-range indices
+	// (e.g. a missing/short triSurfaces array) keep the default-constructed surface.
+	std::vector<GltfPreviewTriSurface> reorderedSurfaces(scene.tris.size());
+	for (size_t i = 0; i < scene.tris.size(); ++i) {
+		uint32_t originalTriIndex = scene.tris[i].idx;
+		if (originalTriIndex < scene.triSurfaces.size()) {
+			reorderedSurfaces[i] = scene.triSurfaces[originalTriIndex];
+		}
+	}
+	scene.triSurfaces = std::move(reorderedSurfaces);
+
 	scene.triIsect.resize(scene.tris.size());
 	for (size_t i = 0; i < scene.tris.size(); ++i) {
 		Tri& tri = scene.tris[i];
@@ -1245,6 +1322,10 @@ bool loadGltfPreviewScene(const std::string& requestedPath, GltfPreviewScene& sc
 	scene.materialMeta.reserve(model.materials.size() + 1);
 	scene.materialOpacity.reserve(model.materials.size() + 1);
 	scene.materialTransmission.reserve(model.materials.size() + 1);
+	scene.textures.reserve(model.textures.size());
+	for (int textureIndex = 0; textureIndex < static_cast<int>(model.textures.size()); ++textureIndex) {
+		scene.textures.push_back(convertTexture(model, textureIndex));
+	}
 	for (const tinygltf::Material& material : model.materials) {
 		GltfPreviewMaterialMeta meta;
 		float opacity = 1.0f;

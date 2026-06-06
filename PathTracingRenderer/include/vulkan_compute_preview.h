@@ -40,7 +40,9 @@ struct VulkanPreviewSettings {
 
 struct GpuStats {
 	double gpuDispatchMs = 0.0;
+	double primaryRaysPerSec = 0.0;
 	uint32_t frameCount = 0;
+	uint64_t primaryRaysTraced = 0;
 	uint64_t localHeapBytes = 0;
 	uint64_t localHeapUsed = 0;
 	uint64_t pixelBufferBytes = 0;

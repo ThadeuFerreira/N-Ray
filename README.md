@@ -87,6 +87,12 @@ geometry stays visible while the compute path is being stabilized. See
 [`docs/gltf-vulkan-pbr-import.md`](docs/gltf-vulkan-pbr-import.md#pbr-is-the-material-model-not-the-transport-algorithm)
 for the detailed comparison.
 
+Future `VK_KHR_ray_tracing_pipeline` work is tracked separately from the current
+compute preview. Use the repo-local Vulkan skill and Sascha Willems
+`raytracingbasic`, `raytracinggltf`, `raytracingtextures`, and
+`raytracingshadows` examples for BLAS/TLAS bring-up, glTF geometry/material
+descriptors, any-hit transparency, and two-miss shadow-ray pipelines.
+
 ## Build With Premake
 
 `premake5.lua` is the source of truth for project files, include paths, source globs, links, and compiler flags. It generates project files under `build/` so it does not overwrite the hand-written root `Makefile`.

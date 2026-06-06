@@ -47,9 +47,12 @@ struct GltfPreviewMaterialMeta {
 	float metalness = 1.0f;
 	float alphaCutoff = 0.5f;
 	float normalScale = 1.0f;
+	float occlusionStrength = 1.0f;
 	float transmission = 0.0f;
 	uint32_t baseColorTexture = GLTF_PREVIEW_INVALID_TEXTURE;
+	uint32_t metallicRoughnessTexture = GLTF_PREVIEW_INVALID_TEXTURE;
 	uint32_t normalTexture = GLTF_PREVIEW_INVALID_TEXTURE;
+	uint32_t occlusionTexture = GLTF_PREVIEW_INVALID_TEXTURE;
 	uint32_t emissiveTexture = GLTF_PREVIEW_INVALID_TEXTURE;
 	uint32_t alphaMode = GLTF_PREVIEW_ALPHA_OPAQUE;
 };

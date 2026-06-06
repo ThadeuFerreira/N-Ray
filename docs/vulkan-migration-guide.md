@@ -15,6 +15,17 @@ The current architecture relies on `omp.h` (OpenMP) for CPU parallelism and cust
 
 The current migration direction is Vulkan **compute shaders** (`VK_PIPELINE_BIND_POINT_COMPUTE`) rather than `VK_KHR_ray_tracing_pipeline`. Compute shaders do not consume automatic vertex inputs or hardware triangle state; the CPU must flatten scene geometry, materials, and BVH nodes into descriptor-bound storage buffers.
 
+Future hardware ray tracing work should use the official Sascha Willems
+`raytracingshadows` example as the direct-light shadow reference, alongside
+`raytracingbasic` for bring-up and `raytracinggltf` for glTF geometry/material
+descriptors. The shadow sample's useful contract is: glTF vertex/index buffers
+created with acceleration-structure input, shader-device-address, and
+storage-buffer usage; one triangle BLAS referenced by one TLAS instance;
+descriptors for TLAS, storage image, uniform data, vertex SSBO, and index SSBO;
+raygen plus primary miss plus shadow miss plus closest-hit shader groups; a miss
+SBT with two records; and recursion depth clamped to two so closest-hit can trace
+shadow rays.
+
 PBR material work is not the same thing as ray tracing work. PBR is the
 micro-scale BRDF evaluated at one shaded point, and it can be used by a normal
 Vulkan graphics/raster pipeline just as well as by a path tracer. The Vulkan
