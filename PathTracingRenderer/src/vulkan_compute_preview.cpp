@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <glm/glm.hpp>
 #include <sstream>
@@ -106,6 +107,16 @@ uint32_t ceilDiv(uint32_t value, uint32_t divisor) {
 	return (value + divisor - 1) / divisor;
 }
 
+float computeModelRayBias(const GltfPreviewScene& scene) {
+	glm::vec3 extent = scene.boundsMax - scene.boundsMin;
+	float diagonal = glm::length(extent);
+	if (!std::isfinite(diagonal) || diagonal <= 0.0f) {
+		return 0.0001f;
+	}
+
+	return std::clamp(diagonal * 0.00001f, 0.000001f, 0.01f);
+}
+
 struct ShaderEntry {
 	const char* name;
 	const unsigned char* spv;
@@ -128,15 +139,19 @@ static const ShaderEntry kShaders[] = {
 	{ "Nissan S15 glTF Model",      nray_vulkan_gltf_flat_comp_spv,         nray_vulkan_gltf_flat_comp_spv_len,         true  },
 };
 static const int kShaderCount = static_cast<int>(sizeof(kShaders) / sizeof(kShaders[0]));
-static const int kModelShaderIndex = kShaderCount - 1;
 
 // Total descriptor set bindings: 0=pixels, 1-4=scene SSBOs, 5=accum, 6=settings.
 static constexpr uint32_t kTotalBindings = 7;
 // Scene SSBO bindings start at index 1 (binding 0 is the pixel buffer).
 static constexpr uint32_t kFirstSceneBinding = 1;
+// Named binding slots — update if the layout in vulkan_gltf_flat.comp changes.
+static constexpr uint32_t kBindingPixels   = 0;
+static constexpr uint32_t kBindingAccum    = 5;
+static constexpr uint32_t kBindingSettings = 6;
 
 static const ModelEntry kModels[] = {
 	{ "Nissan S15 Silvia", "assets/2018_garage_mak_nissan_s15_silvia_-_reggie_mah/scene.gltf" },
+	{ "LB Silhouette Murcielago GT Evo", "assets/2024_lbsilhouette_works_murcielago_gt_evo/scene.gltf" },
 	{ "Torvosaurus Tanneri", "assets/accurate_torvosaurus_tanneri/scene.gltf" },
 	{ "Beretta ARX160", "assets/beretta_arx160/scene.gltf" },
 	{ "Beretta M9", "assets/beretta_m9_gameready/scene.gltf" },
@@ -336,10 +351,10 @@ struct VulkanComputePreview::Impl {
 			return false;
 		}
 
+		const ShaderEntry& selectedEntry = kShaders[selectedShader >= 0 && selectedShader < kShaderCount ? selectedShader : 0];
 		maxSamplesCached = static_cast<uint32_t>(std::max(1, settings.maxSamples));
 		if (settings.resetAccumulation) {
-			currentSample = 0;
-			accumNeedsClear = true;
+			resetAccumState();
 		}
 
 		// Upload the per-dispatch render/sky settings (binding 6).
@@ -435,6 +450,10 @@ struct VulkanComputePreview::Impl {
 			);
 		}
 
+		float modelRayBias = selectedEntry.requiresModel && modelBuffersReady
+			? computeModelRayBias(modelScene)
+			: 0.0001f;
+
 		PushConstants pushConstants{
 			renderWidth,
 			renderHeight,
@@ -444,7 +463,7 @@ struct VulkanComputePreview::Impl {
 			glm::vec4(camera.forward, 0.0f),
 			glm::vec4(camera.right, 0.0f),
 			glm::vec4(camera.up, 0.0f),
-			glm::vec4(camera.verticalScale, camera.aspect, 0.0f, 0.0f),
+			glm::vec4(camera.verticalScale, camera.aspect, modelRayBias, 0.0f),
 			sceneCounts
 		};
 
@@ -611,9 +630,8 @@ struct VulkanComputePreview::Impl {
 		pixelAllocationSize = 0;
 		pixelBufferSize = 0;
 		pixelMemoryCoherent = false;
-		currentSample = 0;
+		resetAccumState();
 		maxSamplesCached = 1;
-		accumNeedsClear = true;
 		modelBuffersReady = false;
 		modelScene = {};
 		sceneCounts = glm::uvec4(0u);
@@ -727,6 +745,11 @@ struct VulkanComputePreview::Impl {
 		allocationSize = 0;
 	}
 
+	void resetAccumState() {
+		currentSample = 0;
+		accumNeedsClear = true;
+	}
+
 	// Flush a host write to non-coherent mapped memory so the device sees it.
 	bool flushMappedRange(VkDeviceMemory memory, bool coherent, const char* op) {
 		if (coherent) {
@@ -785,8 +808,7 @@ struct VulkanComputePreview::Impl {
 			return failVk("vkBindBufferMemory accum", result);
 		}
 
-		currentSample = 0;
-		accumNeedsClear = true;
+		resetAccumState();
 		return true;
 	}
 
@@ -1083,21 +1105,12 @@ struct VulkanComputePreview::Impl {
 			std::memset(mapped, 0, byteSize);
 		}
 
-		if (!resource.memoryCoherent) {
-			VkMappedMemoryRange range{};
-			range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-			range.memory = resource.memory;
-			range.offset = 0;
-			range.size = VK_WHOLE_SIZE;
-			result = vkFlushMappedMemoryRanges(device, 1, &range);
-			if (result != VK_SUCCESS) {
-				vkUnmapMemory(device, resource.memory);
-				destroyStorageBuffer(resource);
-				return failVk("vkFlushMappedMemoryRanges scene", result);
-			}
-		}
-
+		bool flushed = flushMappedRange(resource.memory, resource.memoryCoherent, "vkFlushMappedMemoryRanges scene");
 		vkUnmapMemory(device, resource.memory);
+		if (!flushed) {
+			destroyStorageBuffer(resource);
+			return false;
+		}
 		return true;
 	}
 
@@ -1126,11 +1139,14 @@ struct VulkanComputePreview::Impl {
 		std::vector<GpuTriIntersect> gpuTriIsect;
 		gpuTriIsect.reserve(modelScene.triIsect.size());
 		for (const TriIntersect& tri : modelScene.triIsect) {
+			// The compute glTF preview favors validation visibility over strict
+			// material backface culling; future raster/PBR paths can honor glTF
+			// doubleSided exactly.
 			gpuTriIsect.push_back({
 				glm::vec4(tri.a, 0.0f),
 				glm::vec4(tri.eA, 0.0f),
 				glm::vec4(tri.eB, 0.0f),
-				glm::uvec4(tri.idx, tri.doubleSided, 0u, 0u)
+				glm::uvec4(tri.idx, 1u, 0u, 0u)
 			});
 		}
 
@@ -1311,15 +1327,15 @@ struct VulkanComputePreview::Impl {
 		std::array<VkDescriptorBufferInfo, kTotalBindings> bufferInfos{};
 		std::array<VkWriteDescriptorSet, kTotalBindings> writes{};
 		for (uint32_t binding = 0; binding < writes.size(); ++binding) {
-			if (binding == 0) {
+			if (binding == kBindingPixels) {
 				bufferInfos[binding].buffer = pixelBuffer;
 				bufferInfos[binding].range = static_cast<VkDeviceSize>(pixelBufferSize);
 			}
-			else if (binding == 5) {
+			else if (binding == kBindingAccum) {
 				bufferInfos[binding].buffer = accumBuffer;
 				bufferInfos[binding].range = static_cast<VkDeviceSize>(accumBufferSize);
 			}
-			else if (binding == 6) {
+			else if (binding == kBindingSettings) {
 				bufferInfos[binding].buffer = settingsBuffer;
 				bufferInfos[binding].range = static_cast<VkDeviceSize>(settingsBufferSize);
 			}
@@ -1491,8 +1507,7 @@ struct VulkanComputePreview::Impl {
 			return false;
 		}
 
-		currentSample = 0;
-		accumNeedsClear = true;
+		resetAccumState();
 		frameCount = 0;
 		lastGpuMs = 0.0;
 		setActiveStatus();
@@ -1566,7 +1581,8 @@ const char* VulkanComputePreview::shaderName(int index) {
 }
 
 bool VulkanComputePreview::isModelPreviewIndex(int index) {
-	return index == kModelShaderIndex;
+	if (index < 0 || index >= kShaderCount) return false;
+	return kShaders[index].requiresModel;
 }
 
 bool VulkanComputePreview::setModel(int index) {

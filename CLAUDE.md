@@ -10,7 +10,7 @@ N-Ray is a CPU path tracing renderer (educational project). It uses **raylib** f
 
 Project skills live in `.claude/skills/` as one folder per skill, each with a `SKILL.md` using the same frontmatter/body model as Codex skills. Treat this as the single repo-local skill source for Claude Code and other agents, and keep these links in sync between `CLAUDE.md` and `AGENTS.md`.
 
-- `.claude/skills/nray-vulkan-tutorials/SKILL.md` - use for Vulkan issues, compute shader experiments, Tutorial28/VulkanCore references, vendored glTF import reference examples (`tutorials/saschawillems/gltf/`), descriptor/synchronization/debugging work, and porting the CPU path tracer toward Vulkan compute.
+- `.claude/skills/nray-vulkan-tutorials/SKILL.md` - use for Vulkan issues, compute shader experiments, Tutorial28/VulkanCore references, vendored glTF import reference examples (`tutorials/saschawillems/gltf/`), upstream glTF skinning guidance, descriptor/synchronization/debugging work, Vulkan PBR pipelines (material push constants, IBL pre-computation via BRDF LUT/irradiance cube/prefiltered cube, textured PBR with tangent vertex attributes), and porting the CPU path tracer toward Vulkan compute.
 - `.claude/skills/cpp-smart-pointers/SKILL.md` - use for C++ ownership/lifetime changes, asset/resource registry design, buffer/texture/mesh lifetime reviews, or audits for hidden allocations and smart-pointer traffic in hot render paths.
 
 When a skill applies, read its `SKILL.md` before designing or changing code.

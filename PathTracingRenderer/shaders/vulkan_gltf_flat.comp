@@ -78,7 +78,8 @@ layout(push_constant) uniform PushConstants {
 
 const float PI = 3.14159265358979323846;
 const float EPSILON = 0.0000001;
-const float RAY_EPSILON = 0.001;
+const float MIN_DET_EPSILON = 0.000000000001;
+const float MIN_RAY_BIAS = 0.000001;
 const float INF_T = 3.402823466e+38;
 
 bool invalidVec3(vec3 value) {
@@ -216,6 +217,23 @@ bool rayAabb(vec3 origin, vec3 invDir, vec3 boxMin, vec3 boxMax, float maxT) {
 	return tmax >= tmin;
 }
 
+float rayBias() {
+	return max(pc.cameraParams.z, MIN_RAY_BIAS);
+}
+
+float triangleDetEpsilon(GpuTriIntersect tri) {
+	if (invalidVec3(tri.eA.xyz) || invalidVec3(tri.eB.xyz)) {
+		return MIN_DET_EPSILON;
+	}
+
+	float edgeScaleSq = max(dot(tri.eA.xyz, tri.eA.xyz), dot(tri.eB.xyz, tri.eB.xyz));
+	if (isnan(edgeScaleSq) || isinf(edgeScaleSq) || !(edgeScaleSq > 0.0)) {
+		return MIN_DET_EPSILON;
+	}
+
+	return max(edgeScaleSq * 0.0000001, MIN_DET_EPSILON);
+}
+
 bool rayIntersectsTriangle(
 	vec3 origin,
 	vec3 dir,
@@ -226,13 +244,14 @@ bool rayIntersectsTriangle(
 ) {
 	vec3 h = cross(dir, tri.eB.xyz);
 	float det = dot(tri.eA.xyz, h);
+	float detEpsilon = triangleDetEpsilon(tri);
 
 	if (tri.ids.y != 0u) {
-		if (det > -EPSILON && det < EPSILON) {
+		if (abs(det) <= detEpsilon) {
 			return false;
 		}
 	}
-	else if (det < EPSILON) {
+	else if (det <= detEpsilon) {
 		return false;
 	}
 
@@ -470,7 +489,7 @@ void main() {
 			break;
 		}
 
-		origin = hitPos + normal * RAY_EPSILON;
+		origin = hitPos + normal * rayBias();
 		dir = safeNormalize(nextDir, normal);
 		invDir = 1.0 / dir;
 

@@ -204,7 +204,7 @@ glm::vec4 averageBaseColorTexture(const tinygltf::Model& model, int textureIndex
 		return glm::vec4(1.0f);
 	}
 
-	glm::dvec4 sum(0.0);
+	glm::vec4 sum(0.0f);
 	size_t pixelCount = static_cast<size_t>(image.width) * static_cast<size_t>(image.height);
 	size_t components = static_cast<size_t>(image.component);
 	if (image.bits == 8) {
@@ -218,7 +218,7 @@ glm::vec4 averageBaseColorTexture(const tinygltf::Model& model, int textureIndex
 			float g = components > 1 ? pixel[1] / 255.0f : r;
 			float b = components > 2 ? pixel[2] / 255.0f : r;
 			float a = components > 3 ? pixel[3] / 255.0f : 1.0f;
-			sum += glm::dvec4(r, g, b, a);
+			sum += glm::vec4(r, g, b, a);
 		}
 	}
 	else if (image.bits == 16) {
@@ -237,15 +237,14 @@ glm::vec4 averageBaseColorTexture(const tinygltf::Model& model, int textureIndex
 			float g = components > 1 ? read16(1) / 65535.0f : r;
 			float b = components > 2 ? read16(2) / 65535.0f : r;
 			float a = components > 3 ? read16(3) / 65535.0f : 1.0f;
-			sum += glm::dvec4(r, g, b, a);
+			sum += glm::vec4(r, g, b, a);
 		}
 	}
 	else {
 		return glm::vec4(1.0f);
 	}
 
-	glm::dvec4 average = sum / static_cast<double>(pixelCount);
-	return glm::vec4(average);
+	return sum / static_cast<float>(pixelCount);
 }
 
 PBRMaterial convertMaterial(
@@ -755,6 +754,31 @@ glm::vec3 safeNormal(const glm::vec3& value, const glm::vec3& fallback) {
 	return glm::normalize(value);
 }
 
+bool finiteVec3(const glm::vec3& value) {
+	return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+}
+
+bool validTriangleGeometry(const glm::vec3& a, const glm::vec3& b, const glm::vec3& c) {
+	if (!finiteVec3(a) || !finiteVec3(b) || !finiteVec3(c)) {
+		return false;
+	}
+
+	glm::vec3 ab = b - a;
+	glm::vec3 ac = c - a;
+	glm::vec3 bc = c - b;
+	float abLenSq = glm::dot(ab, ab);
+	float acLenSq = glm::dot(ac, ac);
+	float bcLenSq = glm::dot(bc, bc);
+	float maxEdgeLenSq = std::max(abLenSq, std::max(acLenSq, bcLenSq));
+	if (!std::isfinite(maxEdgeLenSq) || maxEdgeLenSq <= 1e-24f) {
+		return false;
+	}
+
+	glm::vec3 area = glm::cross(ab, ac);
+	float areaSq = glm::dot(area, area);
+	return std::isfinite(areaSq) && areaSq > maxEdgeLenSq * maxEdgeLenSq * 1e-14f;
+}
+
 glm::vec4 makeTangent(
 	const glm::vec3& tangent,
 	const glm::vec3& normal,
@@ -797,6 +821,30 @@ void includeBounds(GltfPreviewScene& scene, const Tri& tri, bool& haveBounds) {
 
 	scene.boundsMin = glm::min(scene.boundsMin, tri.min);
 	scene.boundsMax = glm::max(scene.boundsMax, tri.max);
+}
+
+float previewBoundsPadding(const GltfPreviewScene& scene) {
+	glm::vec3 extent = scene.boundsMax - scene.boundsMin;
+	float diagonal = glm::length(extent);
+	if (!std::isfinite(diagonal) || diagonal <= 0.0f) {
+		return 0.0f;
+	}
+
+	return std::clamp(diagonal * 0.00001f, 0.000001f, 0.01f);
+}
+
+void padTriangleBoundsForPreview(GltfPreviewScene& scene) {
+	float padding = previewBoundsPadding(scene);
+	if (padding <= 0.0f) {
+		return;
+	}
+
+	glm::vec3 pad(padding);
+	for (Tri& tri : scene.tris) {
+		tri.calculateAABB();
+		tri.min -= pad;
+		tri.max += pad;
+	}
 }
 
 glm::mat4 weightedSkinMatrix(
@@ -928,7 +976,7 @@ bool appendPrimitive(
 		effectiveWorld = glm::mat4(1.0f);
 	}
 
-	glm::mat3 normalMatrix = skinMatrices ? glm::mat3(1.0f) : glm::transpose(glm::inverse(glm::mat3(world)));
+	glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(effectiveWorld)));
 	uint32_t materialIndex = defaultMaterialIndex;
 	bool doubleSided = false;
 	if (primitive.material >= 0 && primitive.material < static_cast<int>(model.materials.size())) {
@@ -936,10 +984,16 @@ bool appendPrimitive(
 		doubleSided = model.materials[primitive.material].doubleSided;
 	}
 
+	// A negative-determinant world matrix (e.g. from a mirrored node with scale [-1,1,1])
+	// flips triangle winding from CCW to CW, causing single-sided faces to be silently
+	// culled by the Möller-Trumbore det < 0 backface test. Correct by swapping two indices.
+	const bool windingFlipped = glm::determinant(glm::mat3(effectiveWorld)) < 0.0f;
+
+	uint32_t appendedTriangles = 0;
 	for (size_t i = 0; i < indices.size(); i += 3) {
 		uint32_t ia = indices[i + 0];
-		uint32_t ib = indices[i + 1];
-		uint32_t ic = indices[i + 2];
+		uint32_t ib = windingFlipped ? indices[i + 2] : indices[i + 1];
+		uint32_t ic = windingFlipped ? indices[i + 1] : indices[i + 2];
 		if (ia >= positions.size() || ib >= positions.size() || ic >= positions.size()) {
 			error = "primitive index is out of range";
 			return false;
@@ -948,6 +1002,9 @@ bool appendPrimitive(
 		glm::vec3 a = glm::vec3(effectiveWorld * glm::vec4(positions[ia], 1.0f));
 		glm::vec3 b = glm::vec3(effectiveWorld * glm::vec4(positions[ib], 1.0f));
 		glm::vec3 c = glm::vec3(effectiveWorld * glm::vec4(positions[ic], 1.0f));
+		if (!validTriangleGeometry(a, b, c)) {
+			continue;
+		}
 
 		glm::vec3 faceNormal = safeNormal(glm::cross(b - a, c - a), glm::vec3(0.0f, 0.0f, 1.0f));
 		glm::vec3 aN = faceNormal;
@@ -958,13 +1015,15 @@ bool appendPrimitive(
 			aN = safeNormal(normalMatrix * normals[ia], faceNormal);
 			bN = safeNormal(normalMatrix * normals[ib], faceNormal);
 			cN = safeNormal(normalMatrix * normals[ic], faceNormal);
+			if (windingFlipped) std::swap(bN, cN);
 		}
 
 		scene.tris.emplace_back(a, b, c, aN, bN, cN, materialIndex, primitiveIndex, doubleSided);
 		includeBounds(scene, scene.tris.back(), haveBounds);
+		++appendedTriangles;
 	}
 
-	scene.stats.triangleCount += static_cast<uint32_t>(indices.size() / 3);
+	scene.stats.triangleCount += appendedTriangles;
 	return true;
 }
 
@@ -1115,6 +1174,8 @@ void buildSceneAcceleration(GltfPreviewScene& scene) {
 	if (scene.tris.empty()) {
 		return;
 	}
+
+	padTriangleBoundsForPreview(scene);
 
 	std::vector<BVH> buildBvh;
 	buildBvh.reserve(scene.tris.size() * 2);

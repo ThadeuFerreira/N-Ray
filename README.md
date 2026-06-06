@@ -59,6 +59,7 @@ The top-level `assets/` directory is the local glTF validation corpus for Vulkan
 Current glTF entry points include:
 
 - `assets/2018_garage_mak_nissan_s15_silvia_-_reggie_mah/scene.gltf`
+- `assets/2024_lbsilhouette_works_murcielago_gt_evo/scene.gltf`
 - `assets/accurate_torvosaurus_tanneri/scene.gltf`
 - `assets/beretta_arx160/scene.gltf`
 - `assets/beretta_m9_gameready/scene.gltf`
@@ -80,7 +81,9 @@ the shader finds a surface hit, it still needs physically plausible glTF materia
 data to decide how light is absorbed, reflected, refracted, emitted, or scattered
 into the next ray. The current flat glTF Vulkan preview only validates scene
 flattening, material indexing, and BVH traversal; full PBR evaluation, texture
-sampling, bounces, and accumulation come later. See
+sampling, bounces, and strict glTF backface-culling conformance come later. The
+preview currently treats imported triangles as two-sided so thin validation
+geometry stays visible while the compute path is being stabilized. See
 [`docs/gltf-vulkan-pbr-import.md`](docs/gltf-vulkan-pbr-import.md#pbr-is-the-material-model-not-the-transport-algorithm)
 for the detailed comparison.
 

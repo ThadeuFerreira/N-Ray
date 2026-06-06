@@ -8,6 +8,7 @@ flat glTF preview importer for local validation assets.
 References:
 
 - [glTF 2.0 Specification](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html)
+- [Khronos glTF skins tutorial](https://github.com/KhronosGroup/glTF-Tutorials/blob/main/gltfTutorial/gltfTutorial_020_Skins.md)
 - [Khronos glTF PBR overview](https://www.khronos.org/gltf/pbr)
 - [TinyGLTF](https://github.com/syoyo/tinygltf)
 - [Vulkan descriptor set specification](https://docs.vulkan.org/spec/latest/chapters/descriptorsets.html)
@@ -15,6 +16,8 @@ References:
 - Local reference loaders: [`tutorials/saschawillems/gltf/`](../tutorials/saschawillems/gltf/) — vendored, reference-only copies of the
   [`SaschaWillems/Vulkan`](https://github.com/SaschaWillems/Vulkan) `gltfloading` and `gltfscenerendering` examples (see
   [Reference Implementations](#reference-implementations) below).
+- Upstream animated-skinning reference:
+  [`SaschaWillems/Vulkan` `examples/gltfskinning`](https://github.com/SaschaWillems/Vulkan/tree/master/examples/gltfskinning).
 
 ## Role In N-Ray
 
@@ -28,6 +31,12 @@ asset with TinyGLTF, flattens it into `Tri`/`TriIntersect`/`PBRMaterial`/compact
 BVH data, uploads explicit storage-buffer structs, and renders through the
 progressive Vulkan compute preview. It does not replace the CPU runtime scene or
 implement full PBR texture sampling yet.
+
+For robust validation visibility, the compute preview also applies small
+scene-scale ray/BVH tolerances and uploads imported triangles as two-sided. This
+is a preview-path simplification for thin panels, wheels, mirrors, and similar
+assets; future strict glTF raster/PBR paths should honor material `doubleSided`
+state and backface-culling rules directly.
 
 After that contract is proven in the renderer path, a glTF importer should
 replace the hardcoded `ObjImporter` scene frontend by flattening glTF meshes and
@@ -96,6 +105,7 @@ these bundles as the first importer/PBR validation source before reaching for
 external sample repositories:
 
 - `assets/2018_garage_mak_nissan_s15_silvia_-_reggie_mah/scene.gltf`
+- `assets/2024_lbsilhouette_works_murcielago_gt_evo/scene.gltf`
 - `assets/accurate_torvosaurus_tanneri/scene.gltf`
 - `assets/beretta_arx160/scene.gltf`
 - `assets/beretta_m9_gameready/scene.gltf`
@@ -122,6 +132,67 @@ conversion, then flattens the skinned bind-pose triangle into the same BVH data
 as rigid meshes. This keeps assets with Blender/FBX root-axis correction nodes
 upright in the current static preview while leaving runtime skeletal animation
 and GPU joint-palette skinning as future work.
+
+## glTF Skinning And Animation Contract
+
+The current bind-pose bake is intentionally a bridge. A real animated glTF path
+should follow the same structure used by the upstream Sascha Willems
+`gltfskinning` sample and the Khronos glTF skin tutorial:
+
+- Nodes must keep both hierarchy links and mutable TRS components:
+  `parent`, `children`, `index`, `translation`, `rotation`, `scale`, `matrix`,
+  and `skin`. Animation channels modify TRS independently, so do not collapse a
+  node permanently into one matrix at load time.
+- Vertices need `JOINTS_0` and `WEIGHTS_0` in addition to position, normal, UV,
+  tangent, and material data. glTF supports up to four joint influences in those
+  base attributes; handle normalized integer and float accessor variants
+  explicitly.
+- A skin owns its `joints` node list, optional `skeleton` root, inverse bind
+  matrices, and a per-skin joint-matrix upload buffer. In a graphics sample this
+  is usually an SSBO bound beside the mesh; in N-Ray's compute path it should be
+  a scene buffer indexed from a skinned primitive or instance record.
+- Animations are sampler/channel pairs. Samplers contain keyframe input times
+  and output values; channels bind a sampler to a target node and path
+  (`translation`, `rotation`, `scale`, or morph-target `weights`). Implement
+  `LINEAR` first: use `glm::mix` for translation/scale and normalized
+  `glm::slerp` for quaternion rotation. `STEP` and `CUBICSPLINE` can be added
+  after the basic animated path is correct.
+
+For a runtime joint palette, evaluate the current node globals from the animated
+TRS hierarchy every frame, then build joint matrices with:
+
+```cpp
+glm::mat4 inverseTransform = glm::inverse(getNodeMatrix(meshNode));
+jointMatrices[i] =
+	inverseTransform *
+	getNodeMatrix(skin.joints[i]) *
+	skin.inverseBindMatrices[i];
+```
+
+The leading `inverseTransform` converts the joint result back into the mesh
+node's local space. N-Ray's current CPU bind-pose bake omits that inverse because
+it flattens final world-space triangles directly into the BVH; an animated GPU
+path should keep the mesh transform and joint palette separate until shading or
+vertex evaluation.
+
+Shader-side linear blend skinning is the weighted matrix sum:
+
+```glsl
+mat4 skinMat =
+	inJointWeights.x * jointMatrices[int(inJointIndices.x)] +
+	inJointWeights.y * jointMatrices[int(inJointIndices.y)] +
+	inJointWeights.z * jointMatrices[int(inJointIndices.z)] +
+	inJointWeights.w * jointMatrices[int(inJointIndices.w)];
+```
+
+A graphics pipeline applies `projection * view * model * skinMat * position`.
+For N-Ray compute/path tracing there is no vertex shader stage, so the same math
+must either run on the CPU before BVH build for static validation, in a compute
+deformation pass before building/refitting acceleration data, or in a future
+skinned-ray intersection strategy. Do not mix these spaces casually: the common
+90-degree "lying down" bug appears when rigid node transforms include root axis
+corrections but skinned vertices are evaluated without the equivalent skeleton
+root/global transform.
 
 ## Geometry Contract
 
@@ -273,7 +344,9 @@ Two canonical tinygltf-based loaders are vendored locally under
 [`tutorials/saschawillems/gltf/`](../tutorials/saschawillems/gltf/) as
 reference-only material (not built; they depend on the upstream example
 framework). Read them before writing or extending the importer — they are the
-worked examples for the rules above.
+worked examples for the rules above. For animated skinning, use the upstream
+`examples/gltfskinning` sample alongside those local files; it is not currently
+vendored into N-Ray.
 
 - `tutorials/saschawillems/gltf/gltfloading/gltfloading.cpp` (`VulkanglTFModel`,
   FlightHelmet) — minimal end-to-end loader: `LoadASCIIFromFile`, node hierarchy
@@ -286,6 +359,12 @@ worked examples for the rules above.
   load + TBN reconstruction, `doubleSided`/`alphaMode`/`alphaCutoff`, per-material
   pipelines via specialization constants, external texture loading, and node
   visibility toggling.
+- Upstream `SaschaWillems/Vulkan` `examples/gltfskinning` (not currently
+  vendored in this tree) — the worked animated-skinning reference: node `skin`
+  links, mutable TRS node components, `JOINTS_0`/`WEIGHTS_0` vertex attributes,
+  `Skin` records with inverse bind matrices and per-frame joint-matrix SSBOs,
+  animation samplers/channels, `updateAnimation`, `updateJoints`, descriptor set
+  binding for joint matrices, and GLSL weighted skin matrices.
 
 Mapping to N-Ray's current importer
 (`PathTracingRenderer/src/gltf_scene.cpp`): N-Ray already does node hierarchy +
