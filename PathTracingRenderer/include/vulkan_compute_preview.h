@@ -52,11 +52,29 @@ struct VulkanPreviewSettings {
 // baseColor re-tints an otherwise grayscale albedo. The texture flags let the UI
 // note that a slider multiplies an underlying texture.
 struct VulkanPreviewMaterialState {
-	glm::vec3 baseColor = glm::vec3(1.0f);
-	float roughness = 1.0f;
-	float metalness = 1.0f;
-	bool hasBaseColorTexture = false;
-	bool hasMetallicRoughnessTexture = false;
+	// Editable factor overrides — each multiplied by its texture sample in the shader
+	glm::vec3 baseColor       = glm::vec3(1.0f);
+	float     alpha           = 1.0f;
+	float     roughness       = 1.0f;
+	float     metalness       = 1.0f;
+	glm::vec3 emissiveFactor  = glm::vec3(0.0f);
+	float     emissiveIntensity = 1.0f;
+	float     transmission    = 0.0f;
+	float     ior             = 1.5f;
+	float     normalScale     = 1.0f;
+
+	// Read-only texture-presence flags — used by the UI to show "(× tex)" hints
+	bool hasBaseColorTexture          = false;
+	bool hasMetallicRoughnessTexture  = false;
+	bool hasNormalTexture             = false;
+	bool hasEmissiveTexture           = false;
+	bool hasOcclusionTexture          = false;
+
+	// Read-only display info
+	std::string name;           // original glTF material name (may be empty)
+	std::string semanticLabel;  // normalizedSemantic ("car_paint", "metal surface", …)
+	uint32_t    materialKind    = 0u;  // GLTF_PREVIEW_MATERIAL_* constant
+	bool        isTransmission  = false;  // thin or volume transmission material
 };
 
 struct GpuStats {
@@ -117,6 +135,7 @@ public:
 	// material SSBO and restarts accumulation; resetMaterialStates restores the
 	// as-imported factors.
 	int materialCount() const;
+	const char* materialName(int index) const;
 	bool materialState(int index, VulkanPreviewMaterialState& out) const;
 	bool setMaterialState(int index, const VulkanPreviewMaterialState& state);
 	void resetMaterialStates();

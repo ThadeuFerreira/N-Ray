@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_nonuniform_qualifier : require
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -7,6 +8,27 @@ struct GpuTriIntersect {
 	vec4 eA;
 	vec4 eB;
 	uvec4 ids;
+};
+
+struct GpuTriShading {
+	vec4 aN;
+	vec4 bN;
+	vec4 cN;
+	vec4 aTangent;
+	vec4 bTangent;
+	vec4 cTangent;
+	vec4 uv01;
+	vec4 uv2;
+	uvec4 ids;
+};
+
+struct GpuMaterial {
+	vec4 baseColor;
+	vec4 params;
+	vec4 emissionIor;
+	uvec4 textureIndices;
+	uvec4 textureInfo;
+	vec4 textureParams;
 };
 
 struct GpuSettings {
@@ -26,9 +48,19 @@ layout(std430, binding = 1) readonly buffer TriIntersectBuffer {
 	GpuTriIntersect triIsect[];
 };
 
+layout(std430, binding = 2) readonly buffer TriShadingBuffer {
+	GpuTriShading triShading[];
+};
+
+layout(std430, binding = 3) readonly buffer MaterialBuffer {
+	GpuMaterial materials[];
+};
+
 layout(std430, binding = 6) readonly buffer SettingsBuffer {
 	GpuSettings cfg;
 };
+
+layout(binding = 7) uniform sampler2D sceneTextures[256];
 
 layout(std430, binding = 8) buffer ShadowMapBuffer {
 	uint shadowMap[];
@@ -46,6 +78,111 @@ layout(push_constant) uniform PushConstants {
 	vec4 cameraParams;
 	uvec4 sceneCounts;
 } pc;
+
+const uint INVALID_TEXTURE = 0xffffffffu;
+const uint GLTF_ALPHA_OPAQUE = 0u;
+const uint GLTF_ALPHA_MASK = 1u;
+const uint GLTF_ALPHA_BLEND = 2u;
+const uint MATERIAL_OPAQUE_DIELECTRIC = 0u;
+const uint MATERIAL_OPAQUE_METAL = 1u;
+const uint MATERIAL_ALPHA_MASK = 2u;
+const uint MATERIAL_ALPHA_BLEND_COVERAGE = 3u;
+const uint MATERIAL_THIN_TRANSMISSION = 4u;
+const uint MATERIAL_VOLUME_TRANSMISSION = 5u;
+const uint MATERIAL_UNLIT = 6u;
+const uint MATERIAL_CAR_PAINT = 7u;
+const uint MATERIAL_RUBBER = 8u;
+const uint MATERIAL_EMISSIVE = 9u;
+
+uint pcgHash(uint inputValue) {
+	uint state = inputValue * 747796405u + 2891336453u;
+	uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+	return (word >> 22u) ^ word;
+}
+
+bool validTexture(uint textureIndex) {
+	return textureIndex != INVALID_TEXTURE && textureIndex < pc.sceneCounts.w;
+}
+
+vec4 sampleSceneTexture(uint textureIndex, vec2 uv, vec4 fallback) {
+	if (!validTexture(textureIndex)) {
+		return fallback;
+	}
+	return textureLod(sceneTextures[nonuniformEXT(textureIndex)], uv, 0.0);
+}
+
+vec2 interpolateUv(GpuTriShading shading, float hitU, float hitV) {
+	float hitW = 1.0 - hitU - hitV;
+	vec2 aUv = shading.uv01.xy;
+	vec2 bUv = shading.uv01.zw;
+	vec2 cUv = shading.uv2.xy;
+	return aUv * hitW + bUv * hitU + cUv * hitV;
+}
+
+float materialAlpha(GpuMaterial material, vec2 uv) {
+	float alpha = material.baseColor.a;
+	if (validTexture(material.textureIndices.x)) {
+		alpha *= sampleSceneTexture(material.textureIndices.x, uv, vec4(1.0)).a;
+	}
+	return alpha;
+}
+
+float materialTransmissionStrength(GpuMaterial material, vec2 uv) {
+	uint materialKind = material.textureInfo.w;
+	if (materialKind != MATERIAL_THIN_TRANSMISSION && materialKind != MATERIAL_VOLUME_TRANSMISSION) {
+		return 0.0;
+	}
+
+	float transmission = clamp(material.params.w, 0.0, 1.0);
+	if (validTexture(material.textureInfo.z)) {
+		transmission *= clamp(sampleSceneTexture(material.textureInfo.z, uv, vec4(1.0)).r, 0.0, 1.0);
+	}
+	return transmission;
+}
+
+bool materialIsTransmission(GpuMaterial material) {
+	uint materialKind = material.textureInfo.w;
+	return materialKind == MATERIAL_THIN_TRANSMISSION || materialKind == MATERIAL_VOLUME_TRANSMISSION;
+}
+
+bool alphaCoverageAccepted(float alpha, uint triIdx, uvec2 texel) {
+	uint seed =
+		triIdx ^
+		pcgHash(pc.sampleIndex + 0x9E3779B9u) ^
+		pcgHash(texel.x * 1664525u + texel.y * 1013904223u);
+	float threshold = float(pcgHash(seed) >> 8u) * (1.0 / 16777216.0);
+	return alpha > 0.0 && alpha >= threshold;
+}
+
+bool shadowTexelAccepted(uint triIdx, float hitU, float hitV, uvec2 texel) {
+	if (triIdx >= pc.sceneCounts.x) {
+		return true;
+	}
+
+	GpuTriShading shading = triShading[triIdx];
+	uint materialIndex = shading.ids.x;
+	if (materialIndex >= pc.sceneCounts.z) {
+		return true;
+	}
+
+	GpuMaterial material = materials[materialIndex];
+	uint alphaMode = material.textureInfo.y;
+	if (alphaMode == GLTF_ALPHA_OPAQUE && !materialIsTransmission(material)) {
+		return true;
+	}
+
+	vec2 uv = interpolateUv(shading, hitU, hitV);
+	if (materialTransmissionStrength(material, uv) > 0.001) {
+		return false;
+	}
+
+	float alpha = materialAlpha(material, uv);
+	if (alphaMode == GLTF_ALPHA_MASK) {
+		return alpha >= material.textureParams.x;
+	}
+
+	return alphaCoverageAccepted(alpha, triIdx, texel);
+}
 
 float edgeFunction(vec2 a, vec2 b, vec2 p) {
 	return (p.x - a.x) * (b.y - a.y) - (p.y - a.y) * (b.x - a.x);
@@ -67,7 +204,7 @@ uint packShadowDepth(float depth) {
 	return uint(clampedDepth * 4294967294.0 + 0.5);
 }
 
-void rasterizeTriangle(vec3 a, vec3 b, vec3 c, uint mapSize) {
+void rasterizeTriangle(uint triIdx, vec3 a, vec3 b, vec3 c, uint mapSize) {
 	float mapSizeF = float(mapSize);
 	vec2 pa = projectShadowPixel(a, mapSizeF);
 	vec2 pb = projectShadowPixel(b, mapSizeF);
@@ -97,6 +234,10 @@ void rasterizeTriangle(vec3 a, vec3 b, vec3 c, uint mapSize) {
 				continue;
 			}
 
+			if (!shadowTexelAccepted(triIdx, w1, w2, uvec2(uint(x), uint(y)))) {
+				continue;
+			}
+
 			float depth = w0 * da + w1 * db + w2 * dc;
 			uint shadowIndex = uint(y) * mapSize + uint(x);
 			atomicMin(shadowMap[shadowIndex], packShadowDepth(depth));
@@ -115,5 +256,5 @@ void main() {
 	vec3 a = tri.a.xyz;
 	vec3 b = tri.a.xyz + tri.eA.xyz;
 	vec3 c = tri.a.xyz + tri.eB.xyz;
-	rasterizeTriangle(a, b, c, mapSize);
+	rasterizeTriangle(tri.ids.x, a, b, c, mapSize);
 }

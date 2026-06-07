@@ -5,12 +5,18 @@
 #include <globalParams.h>
 #include <renderer.h>
 #include <camera.h>
+#include <algorithm>
 #include <random>
 
 struct MouseRay {
 
 	PathRay mouseRay(Params& params, Data& data, Screen& screen, PathTracer& pt, PTCam& myCam) {
-		glm::vec2 mPos = { GetMousePosition().x / params.screenSize.x, GetMousePosition().y / params.screenSize.y };
+		Vector2 mouse = GetMousePosition();
+		float normalizedX = (mouse.x - screen.viewportX) / screen.screenSizeX;
+		float normalizedY = (mouse.y - screen.viewportY) / screen.screenSizeY;
+		normalizedX = std::min(std::max(normalizedX, 0.0f), 0.9999f);
+		normalizedY = std::min(std::max(normalizedY, 0.0f), 0.9999f);
+		glm::vec2 mPos = { normalizedX, normalizedY };
 
 		int x = int(screen.resX * mPos.x);
 		int y = int(screen.resY * mPos.y);

@@ -1,16 +1,16 @@
 #include "ui.h"
 
-void UI::logic(Params& params, Data& data, PTCam& myCam) {
+void UI::logic(Params& params, Data& data, PTCam& myCam, const UiLayout& layout) {
 	LayoutSizes sizes;
 
-	drawSettingsWindow(params, data, myCam, sizes);
-	drawStatsWindow(params, data);
+	drawSettingsWindow(params, data, myCam, sizes, layout);
+	drawStatsWindow(params, data, layout);
 }
 
-void UI::drawSettingsWindow(Params& params, Data& data, PTCam& myCam, const LayoutSizes& sizes) {
-	ImGui::SetNextWindowSize(ImVec2(200.0f, float(params.screenSize.y)), ImGuiCond_Once);
-	ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Once);
-	ImGui::Begin("Settings", nullptr);
+void UI::drawSettingsWindow(Params& params, Data& data, PTCam& myCam, const LayoutSizes& sizes, const UiLayout& layout) {
+	ImGui::SetNextWindowSize(ImVec2(layout.settingsPanel.width, layout.settingsPanel.height), ImGuiCond_Always);
+	ImGui::SetNextWindowPos(ImVec2(layout.settingsPanel.x, layout.settingsPanel.y), ImGuiCond_Always);
+	ImGui::Begin("Settings", nullptr, kLockedPanelFlags);
 
 	drawRenderSettings(params, sizes);
 	drawSkySettings(params, sizes);

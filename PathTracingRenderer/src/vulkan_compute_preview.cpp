@@ -72,7 +72,7 @@ struct GpuMaterial {
 	glm::vec4 params;         // roughness, metalness, emissionIntensity, transmission
 	glm::vec4 emissionIor;    // rgb emissiveFactor, a IOR
 	glm::uvec4 textureIndices; // baseColor, metallicRoughness, normal, emissive
-	glm::uvec4 textureInfo;    // occlusion, alphaMode, unused, unused
+	glm::uvec4 textureInfo;    // occlusion, normalizedAlphaMode, transmission, materialKind
 	glm::vec4 textureParams;   // alphaCutoff, normalScale, occlusionStrength, unused
 };
 
@@ -1243,9 +1243,14 @@ struct VulkanComputePreview::Impl {
 			return false;
 		}
 		GpuMaterial& material = materialsCurrent[static_cast<size_t>(index)];
-		material.baseColor = glm::vec4(state.baseColor, material.baseColor.w);
-		material.params.x = std::clamp(state.roughness, 0.0f, 1.0f);
-		material.params.y = std::clamp(state.metalness, 0.0f, 1.0f);
+		material.baseColor      = glm::vec4(state.baseColor, std::clamp(state.alpha, 0.0f, 1.0f));
+		material.params.x       = std::clamp(state.roughness, 0.0f, 1.0f);
+		material.params.y       = std::clamp(state.metalness, 0.0f, 1.0f);
+		material.params.z       = std::max(state.emissiveIntensity, 0.0f);
+		material.params.w       = std::clamp(state.transmission, 0.0f, 1.0f);
+		material.emissionIor    = glm::vec4(glm::max(state.emissiveFactor, glm::vec3(0.0f)),
+		                                    std::max(state.ior, 1.001f));
+		material.textureParams.y = std::clamp(state.normalScale, 0.0f, 4.0f);
 		if (!updateMaterialBuffer()) {
 			return false;
 		}
@@ -2227,27 +2232,30 @@ struct VulkanComputePreview::Impl {
 		for (size_t i = 0; i < modelScene.materials.size(); ++i) {
 			const PBRMaterial& material = modelScene.materials[i];
 			const GltfPreviewMaterialMeta* meta = i < modelScene.materialMeta.size() ? &modelScene.materialMeta[i] : nullptr;
-			float transmission = i < modelScene.materialTransmission.size() ? modelScene.materialTransmission[i] : 0.0f;
-			glm::vec4 baseColor = meta ? meta->baseColorFactor : glm::vec4(material.albedo, 1.0f);
+			float transmission = meta ? meta->normalizedTransmission : (i < modelScene.materialTransmission.size() ? modelScene.materialTransmission[i] : 0.0f);
+			glm::vec4 baseColor = meta ? meta->normalizedBaseColorFactor : glm::vec4(material.albedo, 1.0f);
 			glm::vec3 emission = meta ? meta->emissiveFactor : material.emissionCol;
-			float roughness = meta ? meta->roughness : material.roughness;
-			float metalness = meta ? meta->metalness : material.metalness;
+			float roughness = meta ? meta->normalizedRoughness : material.roughness;
+			float metalness = meta ? meta->normalizedMetalness : material.metalness;
 			float emissionIntensity = meta ? meta->emissiveStrength : material.emissionIntensity;
+			float ior = meta ? meta->normalizedIor : material.IOR;
 			uint32_t baseColorTexture = meta ? gpuTextureIndex(meta->baseColorTexture) : GLTF_PREVIEW_INVALID_TEXTURE;
 			uint32_t metallicRoughnessTexture = meta ? gpuTextureIndex(meta->metallicRoughnessTexture) : GLTF_PREVIEW_INVALID_TEXTURE;
 			uint32_t normalTexture = meta ? gpuTextureIndex(meta->normalTexture) : GLTF_PREVIEW_INVALID_TEXTURE;
 			uint32_t emissiveTexture = meta ? gpuTextureIndex(meta->emissiveTexture) : GLTF_PREVIEW_INVALID_TEXTURE;
 			uint32_t occlusionTexture = meta ? gpuTextureIndex(meta->occlusionTexture) : GLTF_PREVIEW_INVALID_TEXTURE;
+			uint32_t transmissionTexture = meta ? gpuTextureIndex(meta->transmissionTexture) : GLTF_PREVIEW_INVALID_TEXTURE;
 			float alphaCutoff = meta ? meta->alphaCutoff : 0.5f;
 			float normalScale = meta ? meta->normalScale : 1.0f;
 			float occlusionStrength = meta ? meta->occlusionStrength : 1.0f;
-			uint32_t alphaMode = meta ? meta->alphaMode : GLTF_PREVIEW_ALPHA_OPAQUE;
+			uint32_t alphaMode = meta ? meta->normalizedAlphaMode : GLTF_PREVIEW_ALPHA_OPAQUE;
+			uint32_t materialKind = meta ? meta->materialKind : GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC;
 			gpuMaterials.push_back({
 				baseColor,
 				glm::vec4(roughness, metalness, emissionIntensity, transmission),
-				glm::vec4(emission, material.IOR),
+				glm::vec4(emission, ior),
 				glm::uvec4(baseColorTexture, metallicRoughnessTexture, normalTexture, emissiveTexture),
-				glm::uvec4(occlusionTexture, alphaMode, 0u, 0u),
+				glm::uvec4(occlusionTexture, alphaMode, transmissionTexture, materialKind),
 				glm::vec4(alphaCutoff, normalScale, occlusionStrength, 0.0f)
 			});
 		}
@@ -2988,12 +2996,41 @@ bool VulkanComputePreview::materialState(int index, VulkanPreviewMaterialState& 
 		return false;
 	}
 	const GpuMaterial& material = m_impl->materialsCurrent[static_cast<size_t>(index)];
-	out.baseColor = glm::vec3(material.baseColor);
-	out.roughness = material.params.x;
-	out.metalness = material.params.y;
-	out.hasBaseColorTexture = material.textureIndices.x != GLTF_PREVIEW_INVALID_TEXTURE;
+	out.baseColor         = glm::vec3(material.baseColor);
+	out.alpha             = material.baseColor.a;
+	out.roughness         = material.params.x;
+	out.metalness         = material.params.y;
+	out.emissiveIntensity = material.params.z;
+	out.transmission      = material.params.w;
+	out.emissiveFactor    = glm::vec3(material.emissionIor);
+	out.ior               = material.emissionIor.a;
+	out.normalScale       = material.textureParams.y;
+	out.hasBaseColorTexture         = material.textureIndices.x != GLTF_PREVIEW_INVALID_TEXTURE;
 	out.hasMetallicRoughnessTexture = material.textureIndices.y != GLTF_PREVIEW_INVALID_TEXTURE;
+	out.hasNormalTexture            = material.textureIndices.z != GLTF_PREVIEW_INVALID_TEXTURE;
+	out.hasEmissiveTexture          = material.textureIndices.w != GLTF_PREVIEW_INVALID_TEXTURE;
+	out.hasOcclusionTexture         = material.textureInfo.x   != GLTF_PREVIEW_INVALID_TEXTURE;
+	out.materialKind    = material.textureInfo.w;
+	out.isTransmission  = (material.textureInfo.w == GLTF_PREVIEW_MATERIAL_THIN_TRANSMISSION
+	                    || material.textureInfo.w == GLTF_PREVIEW_MATERIAL_VOLUME_TRANSMISSION);
+	const auto sz = static_cast<int>(m_impl->modelScene.materialMeta.size());
+	if (index < sz) {
+		const GltfPreviewMaterialMeta& meta = m_impl->modelScene.materialMeta[static_cast<size_t>(index)];
+		out.name          = meta.name;
+		out.semanticLabel = meta.normalizedSemantic;
+	} else {
+		out.name.clear();
+		out.semanticLabel.clear();
+	}
 	return true;
+}
+
+const char* VulkanComputePreview::materialName(int index) const {
+	if (!m_impl->modelBuffersReady || index < 0
+		|| index >= static_cast<int>(m_impl->modelScene.materialMeta.size())) {
+		return "";
+	}
+	return m_impl->modelScene.materialMeta[static_cast<size_t>(index)].name.c_str();
 }
 
 bool VulkanComputePreview::setMaterialState(int index, const VulkanPreviewMaterialState& state) {

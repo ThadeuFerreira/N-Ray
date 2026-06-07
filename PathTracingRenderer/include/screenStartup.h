@@ -8,6 +8,8 @@ struct Screen {
 
 	float screenSizeX = 0.0f;
 	float screenSizeY = 0.0f;
+	float viewportX = 0.0f;
+	float viewportY = 0.0f;
 
 	float ratio = 0.0f;
 
@@ -19,9 +21,14 @@ struct Screen {
 	}
 
 	void initScreen(int& res, std::vector<RenderPixel>& framebuffer, std::vector<glm::vec3>& accumBuffer) {
+		initScreen(res, 0.0f, 0.0f, float(GetScreenWidth()), float(GetScreenHeight()), framebuffer, accumBuffer);
+	}
 
-		screenSizeX = float(GetScreenWidth());
-		screenSizeY = float(GetScreenHeight());
+	void initScreen(int& res, float displayX, float displayY, float displayWidth, float displayHeight, std::vector<RenderPixel>& framebuffer, std::vector<glm::vec3>& accumBuffer) {
+		viewportX = displayX;
+		viewportY = displayY;
+		screenSizeX = displayWidth > 1.0f ? displayWidth : 1.0f;
+		screenSizeY = displayHeight > 1.0f ? displayHeight : 1.0f;
 
 		ratio = screenSizeX / screenSizeY;
 

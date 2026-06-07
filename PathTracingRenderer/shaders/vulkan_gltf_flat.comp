@@ -109,6 +109,16 @@ const uint INVALID_TEXTURE = 0xffffffffu;
 const uint GLTF_ALPHA_OPAQUE = 0u;
 const uint GLTF_ALPHA_MASK = 1u;
 const uint GLTF_ALPHA_BLEND = 2u;
+const uint MATERIAL_OPAQUE_DIELECTRIC = 0u;
+const uint MATERIAL_OPAQUE_METAL = 1u;
+const uint MATERIAL_ALPHA_MASK = 2u;
+const uint MATERIAL_ALPHA_BLEND_COVERAGE = 3u;
+const uint MATERIAL_THIN_TRANSMISSION = 4u;
+const uint MATERIAL_VOLUME_TRANSMISSION = 5u;
+const uint MATERIAL_UNLIT = 6u;
+const uint MATERIAL_CAR_PAINT = 7u;
+const uint MATERIAL_RUBBER = 8u;
+const uint MATERIAL_EMISSIVE = 9u;
 const uint SHADOW_MODE_NONE = 0u;
 const uint SHADOW_MODE_RAY_TRACED = 1u;
 const uint SHADOW_MODE_SHADOW_MAP = 2u;
@@ -282,6 +292,57 @@ float materialAlpha(GpuMaterial material, vec2 uv) {
 	return alpha;
 }
 
+float materialTransmissionStrength(GpuMaterial material, vec2 uv) {
+	uint materialKind = material.textureInfo.w;
+	if (materialKind != MATERIAL_THIN_TRANSMISSION && materialKind != MATERIAL_VOLUME_TRANSMISSION) {
+		return 0.0;
+	}
+
+	float transmission = clamp(material.params.w, 0.0, 1.0);
+	if (validTexture(material.textureInfo.z)) {
+		transmission *= clamp(sampleSceneTexture(material.textureInfo.z, uv, vec4(1.0)).r, 0.0, 1.0);
+	}
+	return transmission;
+}
+
+bool materialIsTransmission(GpuMaterial material) {
+	uint materialKind = material.textureInfo.w;
+	return materialKind == MATERIAL_THIN_TRANSMISSION || materialKind == MATERIAL_VOLUME_TRANSMISSION;
+}
+
+bool materialIsThinTransmission(GpuMaterial material) {
+	return material.textureInfo.w == MATERIAL_THIN_TRANSMISSION;
+}
+
+bool materialIsUnlit(GpuMaterial material) {
+	return material.textureInfo.w == MATERIAL_UNLIT;
+}
+
+vec3 transmissionTint(GpuMaterial material, vec3 albedo) {
+	if (!materialIsTransmission(material)) {
+		return albedo;
+	}
+
+	if (maxComponent(albedo) >= 0.05) {
+		return albedo;
+	}
+
+	float alphaHint = clamp(material.baseColor.a, 0.0, 1.0);
+	float tintFloor = clamp(0.35 + (1.0 - alphaHint) * 0.5, 0.35, 0.85);
+	return max(albedo, vec3(tintFloor));
+}
+
+bool alphaCoverageAccepted(float alpha, uint triIdx, float hitU, float hitV) {
+	uint uBits = floatBitsToUint(hitU);
+	uint vBits = floatBitsToUint(hitV);
+	uint seed =
+		triIdx ^
+		pcgHash(pc.sampleIndex + 0x9E3779B9u) ^
+		pcgHash(uBits ^ (vBits * 1664525u));
+	float threshold = float(pcgHash(seed) >> 8u) * (1.0 / 16777216.0);
+	return alpha > 0.0 && alpha >= threshold;
+}
+
 bool alphaHitAccepted(uint triIdx, float hitU, float hitV) {
 	GpuTriShading shading = triShading[triIdx];
 	uint materialIndex = shading.ids.x;
@@ -301,7 +362,7 @@ bool alphaHitAccepted(uint triIdx, float hitU, float hitV) {
 		return alpha >= material.textureParams.x;
 	}
 
-	return alpha > 0.001;
+	return alphaCoverageAccepted(alpha, triIdx, hitU, hitV);
 }
 
 bool rayAabb(vec3 origin, vec3 invDir, vec3 boxMin, vec3 boxMax, float maxT) {
@@ -480,17 +541,43 @@ bool traverseBvh(
 }
 
 float rayTracedShadowVisibility(vec3 hitPos, vec3 normal, vec3 lightDir) {
-	uint hitTriIdx;
-	float closestT;
-	float hitU;
-	float hitV;
-	bool stackOverflow;
-	vec3 shadowOrigin = hitPos + normal * rayBias();
-	bool hit = traverseBvh(shadowOrigin, lightDir, 1.0 / lightDir, hitTriIdx, closestT, hitU, hitV, stackOverflow);
-	if (stackOverflow) {
-		return 1.0;
+	float bias = rayBias();
+	vec3 shadowOrigin = hitPos + normal * bias;
+	vec3 invLightDir = 1.0 / lightDir;
+	float visibility = 1.0;
+
+	for (int i = 0; i < 8; ++i) {
+		uint hitTriIdx;
+		float closestT;
+		float hitU;
+		float hitV;
+		bool stackOverflow;
+		bool hit = traverseBvh(shadowOrigin, lightDir, invLightDir, hitTriIdx, closestT, hitU, hitV, stackOverflow);
+		if (stackOverflow || !hit) {
+			return visibility;
+		}
+
+		GpuTriShading shading = triShading[hitTriIdx];
+		uint materialIndex = shading.ids.x;
+		if (materialIndex >= pc.sceneCounts.z) {
+			return 0.0;
+		}
+
+		vec2 hitUv = interpolateUv(shading, hitU, hitV);
+		float transmission = materialTransmissionStrength(materials[materialIndex], hitUv);
+		if (transmission <= 0.001) {
+			return 0.0;
+		}
+
+		visibility *= transmission;
+		if (visibility <= 0.01) {
+			return 0.0;
+		}
+
+		shadowOrigin += lightDir * (closestT + bias);
 	}
-	return hit ? 0.0 : 1.0;
+
+	return visibility;
 }
 
 bool projectShadowMap(vec3 worldPos, out vec2 uv, out float depth) {
@@ -626,7 +713,8 @@ void main() {
 		GpuTriShading shading = triShading[hitTriIdx];
 		float hitW = 1.0 - hitU - hitV;
 		vec3 faceNormal = safeNormalize(cross(hitTri.eA.xyz, hitTri.eB.xyz), -dir);
-		if (dot(faceNormal, -dir) < 0.0) {
+		bool enteringMedium = dot(dir, faceNormal) < 0.0;
+		if (!enteringMedium) {
 			faceNormal = -faceNormal;
 		}
 		vec3 normal = safeNormalize(shading.aN.xyz * hitW + shading.bN.xyz * hitU + shading.cN.xyz * hitV, faceNormal);
@@ -642,6 +730,9 @@ void main() {
 		float emissionIntensity = 0.0;
 		vec3 emissionColor = vec3(0.0);
 		float ior = 1.5;
+		float transmissionStrength = 0.0;
+		bool thinTransmission = false;
+		bool unlitMaterial = false;
 		if (materialIndex < pc.sceneCounts.z) {
 			GpuMaterial material = materials[materialIndex];
 			vec4 baseColor = material.baseColor;
@@ -650,6 +741,7 @@ void main() {
 				baseColor *= vec4(srgbToLinear(baseSample.rgb), baseSample.a);
 			}
 			albedo = max(baseColor.rgb, vec3(0.0));
+			albedo = transmissionTint(material, albedo);
 			roughness = clamp(material.params.x, 0.02, 1.0);
 			metalness = clamp(material.params.y, 0.0, 1.0);
 			if (validTexture(material.textureIndices.y)) {
@@ -664,6 +756,9 @@ void main() {
 				emissionColor *= emissiveSample;
 			}
 			ior = max(material.emissionIor.a, 1.001);
+			transmissionStrength = materialTransmissionStrength(material, hitUv);
+			thinTransmission = materialIsThinTransmission(material);
+			unlitMaterial = materialIsUnlit(material);
 
 			if (validTexture(material.textureIndices.z)) {
 				vec3 tangentSample = sampleSceneTexture(material.textureIndices.z, hitUv, vec4(0.5, 0.5, 1.0, 1.0)).rgb * 2.0 - 1.0;
@@ -688,11 +783,17 @@ void main() {
 
 		vec3 hitPos = origin + dir * closestT;
 
+		if (unlitMaterial) {
+			radiance += throughput * max(albedo + emissionColor * emissionIntensity, vec3(0.0));
+			break;
+		}
+
 		if (emissionIntensity > 0.0 && maxComponent(emissionColor) > 0.0) {
 			radiance += throughput * emissionColor * emissionIntensity;
 		}
 
-		vec3 directSun = directSunLighting(hitPos, normal, albedo, metalness);
+		vec3 directSun = directSunLighting(hitPos, normal, albedo, metalness) *
+			clamp(1.0 - transmissionStrength, 0.0, 1.0);
 		if (maxComponent(directSun) > 0.0) {
 			radiance += throughput * directSun;
 		}
@@ -703,19 +804,43 @@ void main() {
 		float r0 = mix(r0Dielectric, 1.0, metalness);
 		float cosThetaI = clamp(-dot(dir, microfacetNormal), 0.0, 1.0);
 		float rTheta = r0 + (1.0 - r0) * pow(1.0 - cosThetaI, 5.0);
+		float transmissionProbability = transmissionStrength * (1.0 - rTheta);
 
 		bool isSpecular = false;
+		bool isTransmission = false;
 		vec3 nextDir = normal;
-		if (rngFloat(rng) <= rTheta) {
+		float eventSample = rngFloat(rng);
+		if (eventSample <= rTheta) {
 			vec3 reflectedDir = safeNormalize(reflect(dir, microfacetNormal), normal);
 			if (dot(reflectedDir, normal) > 0.0 && dot(reflectedDir, faceNormal) > 0.0) {
 				nextDir = reflectedDir;
 				isSpecular = true;
 			}
 		}
+		else if (eventSample <= rTheta + transmissionProbability) {
+			if (thinTransmission) {
+				nextDir = dir;
+				isTransmission = true;
+			}
+			else {
+				float eta = enteringMedium ? (1.0 / ior) : ior;
+				vec3 refractedDir = refract(dir, normal, eta);
+				if (!invalidVec3(refractedDir) && dot(refractedDir, refractedDir) > EPSILON) {
+					nextDir = safeNormalize(refractedDir, dir);
+					isTransmission = true;
+				}
+				else {
+					nextDir = safeNormalize(reflect(dir, microfacetNormal), faceNormal);
+					isSpecular = true;
+				}
+			}
+		}
 
 		if (isSpecular) {
 			throughput *= mix(vec3(1.0), albedo, metalness);
+		}
+		else if (isTransmission) {
+			throughput *= mix(vec3(1.0), albedo, 1.0 - metalness);
 		}
 		else {
 			throughput *= albedo;
@@ -726,7 +851,11 @@ void main() {
 			break;
 		}
 
-		origin = hitPos + normal * rayBias();
+		vec3 originBiasDir = faceNormal;
+		if (isTransmission) {
+			originBiasDir = thinTransmission ? nextDir : -faceNormal;
+		}
+		origin = hitPos + originBiasDir * rayBias();
 		dir = safeNormalize(nextDir, normal);
 		invDir = 1.0 / dir;
 

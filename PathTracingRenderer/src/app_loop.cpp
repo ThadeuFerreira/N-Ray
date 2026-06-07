@@ -10,11 +10,47 @@
 #include <iostream>
 #include <string>
 #include <rlImGui.h>
+#include <ui_layout.h>
 
 namespace {
 void frameVulkanPreviewModel(RuntimeResources& runtime);
 
 VulkanPreviewShadowMode gVulkanPreviewShadowMode = VulkanPreviewShadowMode::RayTraced;
+char gModelFolderPath[512] = {};
+std::string gModelFolderImportStatus;
+
+bool vulkanMaterialPanelVisible(const RuntimeResources& runtime) {
+	return runtime.vulkanPreview.isAvailable() &&
+		VulkanComputePreview::isModelPreviewIndex(runtime.vulkanPreview.shaderIndex()) &&
+		runtime.vulkanPreview.materialCount() > 0;
+}
+
+UiLayout makeUiLayout(const RuntimeResources& runtime) {
+	float windowWidth = float(GetScreenWidth());
+	float windowHeight = float(GetScreenHeight());
+	float menuHeight = ImGui::GetFrameHeight();
+	bool showMaterialPanel = vulkanMaterialPanelVisible(runtime);
+	float bottomHeight = showMaterialPanel ? kUiMaterialPanelHeight : 0.0f;
+	float panelHeight = std::max(1.0f, windowHeight - menuHeight);
+
+	float viewportX = kUiSettingsPanelWidth;
+	float viewportY = menuHeight;
+	float viewportWidth = std::max(1.0f, windowWidth - kUiSettingsPanelWidth - kUiStatsPanelWidth);
+	float viewportHeight = std::max(1.0f, windowHeight - menuHeight - bottomHeight);
+
+	UiLayout layout{};
+	layout.settingsPanel = { 0.0f, menuHeight, kUiSettingsPanelWidth, panelHeight };
+	layout.statsPanel = { windowWidth - kUiStatsPanelWidth, menuHeight, kUiStatsPanelWidth, panelHeight };
+	layout.viewport = { viewportX, viewportY, viewportWidth, viewportHeight };
+	layout.materialPanelVisible = showMaterialPanel;
+	layout.materialPanel = {
+		viewportX,
+		std::max(menuHeight, windowHeight - bottomHeight),
+		viewportWidth,
+		std::max(1.0f, bottomHeight)
+	};
+	return layout;
+}
 
 std::string trimWhitespace(std::string text) {
 	while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
@@ -149,9 +185,13 @@ bool activateModelPreview(RuntimeResources& runtime, int modelIndex, std::string
 }
 
 void importModelFolderFromUiPath(RuntimeResources& runtime, char* modelFolderPath, std::string& importStatus) {
-	std::string requestedPath = modelFolderPath != nullptr ? modelFolderPath : "";
+	std::string requestedPath = trimWhitespace(modelFolderPath != nullptr ? modelFolderPath : "");
+	if (requestedPath.empty()) {
+		importStatus = "Import path is empty";
+		return;
+	}
 	logModelImportUi("import requested path=\"" + requestedPath + "\" shaderIndex=" + std::to_string(runtime.vulkanPreview.shaderIndex()));
-	int importedModel = runtime.vulkanPreview.importModelFromFolder(modelFolderPath);
+	int importedModel = runtime.vulkanPreview.importModelFromFolder(requestedPath);
 	importStatus = firstLine(runtime.vulkanPreview.statusMessage());
 	logModelImportUi("import returned index=" + std::to_string(importedModel) + " status=\"" + importStatus + "\"");
 	if (importedModel >= 0) {
@@ -163,12 +203,12 @@ void updateUiHoverState() {
 	params.isMouseHoveringUI = ImGui::IsAnyItemHovered() || ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow);
 }
 
-void rebuildRenderTarget(RuntimeResources& runtime) {
+void rebuildRenderTarget(RuntimeResources& runtime, const Rectangle& viewport) {
 	runtime.prevRes = params.res;
 	runtime.renderWorker.shutdown();
 	runtime.renderWorker.discardFrame();
 	resetRenderStats(params);
-	screen.initScreen(params.res, data.frameBuffer, data.accumBuffer);
+	screen.initScreen(params.res, viewport.x, viewport.y, viewport.width, viewport.height, data.frameBuffer, data.accumBuffer);
 	runtime.asyncFrame.clear();
 	runtime.asyncAccum.clear();
 	runtime.vulkanFrame.clear();
@@ -193,9 +233,14 @@ void rebuildRenderTarget(RuntimeResources& runtime) {
 	params.displayInvalidated = false;
 }
 
-void handleRenderTargetResize(RuntimeResources& runtime) {
-	if (runtime.prevRes != params.res) {
-		rebuildRenderTarget(runtime);
+void handleRenderTargetResize(RuntimeResources& runtime, const Rectangle& viewport) {
+	bool viewportChanged =
+		std::fabs(screen.viewportX - viewport.x) > 0.5f ||
+		std::fabs(screen.viewportY - viewport.y) > 0.5f ||
+		std::fabs(screen.screenSizeX - viewport.width) > 0.5f ||
+		std::fabs(screen.screenSizeY - viewport.height) > 0.5f;
+	if (runtime.prevRes != params.res || viewportChanged) {
+		rebuildRenderTarget(runtime, viewport);
 	}
 }
 
@@ -443,6 +488,12 @@ void updateCamera() {
 }
 
 void drawViewport(RuntimeResources& runtime, bool vulkanFrameDrawn) {
+	BeginScissorMode(
+		static_cast<int>(screen.viewportX),
+		static_cast<int>(screen.viewportY),
+		static_cast<int>(screen.screenSizeX),
+		static_cast<int>(screen.screenSizeY)
+	);
 	BeginMode3D(cam3D);
 
 	if (params.enableDebugRay) {
@@ -455,215 +506,214 @@ void drawViewport(RuntimeResources& runtime, bool vulkanFrameDrawn) {
 	}
 
 	EndMode3D();
+	EndScissorMode();
 }
 
-void drawVulkanPreviewPanel(RuntimeResources& runtime, bool vulkanFrameDrawn) {
-	ImGui::SetNextWindowSize(ImVec2(420.0f, 340.0f), ImGuiCond_Once);
-	ImGui::SetNextWindowPos(ImVec2(220.0f, 20.0f), ImGuiCond_Once);
-	ImGui::Begin("Vulkan Compute");
-
-	ImGui::Text("Preview: %s", params.useVulkanPreview ? "enabled" : "disabled");
-	ImGui::TextWrapped("%s", runtime.vulkanPreview.statusMessage().c_str());
-
-	if (runtime.vulkanPreview.isAvailable()) {
-		ImGui::Separator();
-
-		GpuStats gs = runtime.vulkanPreview.gpuStats();
-		ImGui::Text("Resolution:  %d x %d", runtime.vulkanPreview.width(), runtime.vulkanPreview.height());
-		ImGui::Text("Frames:      %u", gs.frameCount);
-		if (VulkanComputePreview::isModelPreviewIndex(runtime.vulkanPreview.shaderIndex())) {
-			ImGui::Text("Sample:      %u / %u", gs.samplesAccumulated, gs.maxSamples);
-			ImGui::Text("Primary rays: %.2f M", static_cast<double>(gs.primaryRaysTraced) / 1000000.0);
-			if (gs.primaryRaysPerSec > 0.0) {
-				ImGui::Text("Primary rays/sec: %.2f M", gs.primaryRaysPerSec / 1000000.0);
-			}
-			else {
-				ImGui::TextDisabled("Primary rays/sec: unavailable");
-			}
+void setVulkanShader(RuntimeResources& runtime, int shaderIndex) {
+	if (runtime.vulkanPreview.setShader(shaderIndex)) {
+		runtime.vulkanFrameValid = false;
+		runtime.vulkanFrameDispatched = false;
+		if (VulkanComputePreview::isModelPreviewIndex(shaderIndex)) {
+			frameVulkanPreviewModel(runtime);
 		}
+	}
+}
 
-		if (gs.timestampAvailable) {
-			if (!runtime.vulkanFrameDispatched &&
-				runtime.vulkanFrameValid &&
-				VulkanComputePreview::isModelPreviewIndex(runtime.vulkanPreview.shaderIndex())) {
-				ImGui::Text("GPU dispatch: cached");
-				ImGui::Text("GPU load est: 0.0%%");
-			}
-			else {
-				float frameDeltaMs = params.dt * 1000.0f;
-				float gpuLoad = frameDeltaMs > 0.0f ? static_cast<float>(gs.gpuDispatchMs / frameDeltaMs * 100.0) : 0.0f;
-				ImGui::Text("GPU dispatch: %.3f ms", gs.gpuDispatchMs);
-				ImGui::Text("GPU load est: %.1f%%", gpuLoad);
-			}
-		} else {
-			ImGui::TextDisabled("GPU timing: not supported");
-		}
-
-		if (gs.localHeapBytes > 0) {
-			ImGui::Text("VRAM total:  %.1f MB", gs.localHeapBytes / (1024.0 * 1024.0));
-			if (gs.memBudgetAvailable) {
-				ImGui::Text("VRAM used:   %.1f MB", gs.localHeapUsed / (1024.0 * 1024.0));
-			} else {
-				ImGui::TextDisabled("VRAM used: budget ext unavailable");
-			}
-		}
-		ImGui::Text("Pixel buf:   %.1f MB", gs.pixelBufferBytes / (1024.0 * 1024.0));
-
-		ImGui::Separator();
-
-		if (!params.useVulkanPreview || !vulkanFrameDrawn) {
-			ImGui::TextDisabled("Preview image is not current this frame");
-		}
-		ImVec2 available = ImGui::GetContentRegionAvail();
-		float aspect = static_cast<float>(runtime.vulkanPreview.width()) / static_cast<float>(std::max(runtime.vulkanPreview.height(), 1));
-		float imageWidth = std::max(1.0f, available.x);
-		float imageHeight = imageWidth / aspect;
-		float maxHeight = std::max(1.0f, available.y);
-		if (imageHeight > maxHeight) {
-			imageHeight = maxHeight;
-			imageWidth = imageHeight * aspect;
-		}
-		rlImGuiImageSizeV(&runtime.render, Vector2{ imageWidth, imageHeight });
+void drawVulkanMainMenuBar(RuntimeResources& runtime) {
+	if (!ImGui::BeginMainMenuBar()) {
+		return;
 	}
 
-	ImGui::End();
+	bool vulkanAvailable = runtime.vulkanPreview.isAvailable();
+
+	if (ImGui::BeginMenu("Scene", vulkanAvailable)) {
+		if (ImGui::BeginMenu("Load Scene")) {
+				int modelCount = VulkanComputePreview::modelCount();
+				if (modelCount == 0) {
+					ImGui::TextDisabled("No imported scenes");
+				}
+				for (int i = 0; i < modelCount; i++) {
+					bool selected = i == runtime.vulkanPreview.modelIndex();
+					if (ImGui::MenuItem(VulkanComputePreview::modelName(i), nullptr, selected)) {
+						logModelImportUi("menu requested model index=" + std::to_string(i) + " name=\"" + VulkanComputePreview::modelName(i) + "\"");
+						activateModelPreview(runtime, i, gModelFolderImportStatus);
+					}
+				}
+				ImGui::EndMenu();
+			}
+
+			ImGui::Separator();
+			ImGui::TextUnformatted("Import glTF scene folder");
+			ImGui::SetNextItemWidth(440.0f);
+			if (ImGui::InputText("##menuModelFolderPath", gModelFolderPath, sizeof(gModelFolderPath), ImGuiInputTextFlags_EnterReturnsTrue)) {
+				importModelFolderFromUiPath(runtime, gModelFolderPath, gModelFolderImportStatus);
+			}
+			if (ImGui::Button("Paste")) {
+				applyClipboardToModelFolder(gModelFolderPath, sizeof(gModelFolderPath));
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Browse")) {
+				std::string selectedFolder;
+				if (browseFolderByOsDialog(selectedFolder) && !selectedFolder.empty()) {
+					setModelFolderPath(gModelFolderPath, sizeof(gModelFolderPath), selectedFolder);
+					importModelFolderFromUiPath(runtime, gModelFolderPath, gModelFolderImportStatus);
+				}
+				else {
+					gModelFolderImportStatus = "Browse folder cancelled or unavailable on this OS";
+				}
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Import")) {
+				importModelFolderFromUiPath(runtime, gModelFolderPath, gModelFolderImportStatus);
+			}
+			if (!gModelFolderImportStatus.empty()) {
+				ImGui::TextWrapped("Import: %s", gModelFolderImportStatus.c_str());
+			}
+		ImGui::EndMenu();
+	}
+
+	if (ImGui::BeginMenu("Vulkan", vulkanAvailable)) {
+		if (ImGui::BeginMenu("Preview Mode")) {
+			int current = runtime.vulkanPreview.shaderIndex();
+			int count = VulkanComputePreview::shaderCount();
+			for (int i = 0; i < count; i++) {
+				if (ImGui::MenuItem(VulkanComputePreview::shaderName(i), nullptr, i == current)) {
+					setVulkanShader(runtime, i);
+				}
+			}
+			ImGui::EndMenu();
+		}
+		if (ImGui::BeginMenu("Shadows")) {
+			static const char* shadowLabels[] = { "None", "Ray Traced", "Shadow Map" };
+			for (int i = 0; i < 3; i++) {
+				bool selected = static_cast<int>(gVulkanPreviewShadowMode) == i;
+				if (ImGui::MenuItem(shadowLabels[i], nullptr, selected)) {
+					gVulkanPreviewShadowMode = static_cast<VulkanPreviewShadowMode>(i);
+					runtime.vulkanFrameValid = false;
+					runtime.vulkanFrameDispatched = false;
+					params.renderInvalidated = true;
+				}
+			}
+			ImGui::EndMenu();
+		}
+		if (ImGui::MenuItem("Frame Active Scene")) {
+			frameVulkanPreviewModel(runtime);
+		}
+		ImGui::EndMenu();
+	}
+
+	if (vulkanAvailable) {
+		ImGui::Separator();
+		ImGui::TextDisabled("%s", firstLine(runtime.vulkanPreview.statusMessage()).c_str());
+	}
+
+	ImGui::EndMainMenuBar();
 }
 
-void drawShaderSelectorPanel(RuntimeResources& runtime) {
-	ImGui::SetNextWindowSize(ImVec2(420.0f, 190.0f), ImGuiCond_Once);
-	ImGui::SetNextWindowPos(ImVec2(650.0f, 20.0f), ImGuiCond_Once);
-	ImGui::Begin("Vulkan Mode");
-	static char modelFolderPath[512] = {};
-	static std::string modelFolderImportStatus;
+void drawVulkanMaterialPanel(RuntimeResources& runtime, const UiLayout& layout) {
+	if (!layout.materialPanelVisible) {
+		return;
+	}
 
-	if (runtime.vulkanPreview.isAvailable()) {
-		int current = runtime.vulkanPreview.shaderIndex();
-		int count   = VulkanComputePreview::shaderCount();
+	int materialCount = runtime.vulkanPreview.materialCount();
+	if (materialCount <= 0) {
+		return;
+	}
 
-		// Build label list for ImGui combo
-		std::string allLabels;
-		for (int i = 0; i < count; i++) {
-			allLabels += VulkanComputePreview::shaderName(i);
-			allLabels += '\0';
-		}
-		allLabels += '\0';
+	ImGui::SetNextWindowPos(ImVec2(layout.materialPanel.x, layout.materialPanel.y), ImGuiCond_Always);
+	ImGui::SetNextWindowSize(ImVec2(layout.materialPanel.width, layout.materialPanel.height), ImGuiCond_Always);
+	ImGui::Begin("Vulkan Materials", nullptr, kLockedPanelFlags);
 
-		if (ImGui::Combo("##mode", &current, allLabels.c_str())) {
-			if (runtime.vulkanPreview.setShader(current)) {
-				runtime.vulkanFrameValid = false;
-				runtime.vulkanFrameDispatched = false;
-				if (VulkanComputePreview::isModelPreviewIndex(current)) {
-					frameVulkanPreviewModel(runtime);
-				}
-			}
+	static int selectedMaterial = 0;
+	if (selectedMaterial >= materialCount) {
+		selectedMaterial = 0;
+	}
+
+	VulkanPreviewMaterialState matState;
+	if (!runtime.vulkanPreview.materialState(selectedMaterial, matState)) {
+		ImGui::TextDisabled("No editable material state");
+		ImGui::End();
+		return;
+	}
+
+	ImGuiTableFlags tableFlags =
+		ImGuiTableFlags_SizingStretchProp |
+		ImGuiTableFlags_BordersInnerV |
+		ImGuiTableFlags_Resizable;
+	if (ImGui::BeginTable("VulkanMaterialOverrides", 3, tableFlags)) {
+		ImGui::TableSetupColumn("Material", ImGuiTableColumnFlags_WidthFixed, 300.0f);
+		ImGui::TableSetupColumn("Surface", ImGuiTableColumnFlags_WidthStretch);
+		ImGui::TableSetupColumn("Light/Optics", ImGuiTableColumnFlags_WidthStretch);
+		ImGui::TableNextRow();
+
+		ImGui::TableSetColumnIndex(0);
+		ImGui::TextUnformatted("Material");
+		if (materialCount > 1) {
+			ImGui::SetNextItemWidth(-1.0f);
+			ImGui::SliderInt("##vulkanMaterialIndex", &selectedMaterial, 0, materialCount - 1);
+		}
+		std::string label = matState.name.empty()
+			? matState.semanticLabel
+			: (matState.semanticLabel.empty()
+				? matState.name
+				: matState.name + " (" + matState.semanticLabel + ")");
+		if (!label.empty()) {
+			ImGui::TextWrapped("%s", label.c_str());
+		}
+		if (ImGui::Button("Reset materials")) {
+			runtime.vulkanPreview.resetMaterialStates();
 		}
 
-		if (VulkanComputePreview::isModelPreviewIndex(runtime.vulkanPreview.shaderIndex())) {
-			int model = runtime.vulkanPreview.modelIndex();
-			int modelCount = VulkanComputePreview::modelCount();
+		bool changed = false;
+		ImGui::TableSetColumnIndex(1);
+		ImGui::TextUnformatted("Surface");
+		ImGui::SetNextItemWidth(-1.0f);
+		changed |= ImGui::ColorEdit3("Albedo##vulkanMaterial", &matState.baseColor.x);
+		if (matState.hasBaseColorTexture) {
+			ImGui::SameLine();
+			ImGui::TextDisabled("(x tex)");
+		}
+		ImGui::SetNextItemWidth(-1.0f);
+		changed |= ImGui::SliderFloat("Alpha##vulkanMaterial", &matState.alpha, 0.0f, 1.0f);
+		ImGui::SetNextItemWidth(-1.0f);
+		changed |= ImGui::SliderFloat("Metalness##vulkanMaterial", &matState.metalness, 0.0f, 1.0f);
+		if (matState.hasMetallicRoughnessTexture) {
+			ImGui::SameLine();
+			ImGui::TextDisabled("(x tex)");
+		}
+		ImGui::SetNextItemWidth(-1.0f);
+		changed |= ImGui::SliderFloat("Roughness##vulkanMaterial", &matState.roughness, 0.0f, 1.0f);
+		if (matState.hasMetallicRoughnessTexture) {
+			ImGui::SameLine();
+			ImGui::TextDisabled("(x tex)");
+		}
 
-			// The model list only changes on import, so rebuild the '\0'-delimited
-			// label buffer when the count changes instead of every frame.
-			static std::string modelLabels;
-			static int cachedModelCount = -1;
-			if (cachedModelCount != modelCount) {
-				modelLabels.clear();
-				for (int i = 0; i < modelCount; i++) {
-					modelLabels += VulkanComputePreview::modelName(i);
-					modelLabels += '\0';
-				}
-				modelLabels += '\0';
-				cachedModelCount = modelCount;
-			}
+		ImGui::TableSetColumnIndex(2);
+		ImGui::TextUnformatted("Light/Optics");
+		ImGui::SetNextItemWidth(-1.0f);
+		changed |= ImGui::ColorEdit3("Emission##vulkanMaterial", &matState.emissiveFactor.x);
+		if (matState.hasEmissiveTexture) {
+			ImGui::SameLine();
+			ImGui::TextDisabled("(x tex)");
+		}
+		ImGui::SetNextItemWidth(-1.0f);
+		changed |= ImGui::SliderFloat("Intensity##vulkanMaterial", &matState.emissiveIntensity, 0.0f, 20.0f);
+		if (matState.isTransmission) {
+			ImGui::SetNextItemWidth(-1.0f);
+			changed |= ImGui::SliderFloat("Transmission##vulkanMaterial", &matState.transmission, 0.0f, 1.0f);
+			ImGui::SetNextItemWidth(-1.0f);
+			changed |= ImGui::SliderFloat("IOR##vulkanMaterial", &matState.ior, 1.0f, 2.5f);
+		}
+		if (matState.hasNormalTexture) {
+			ImGui::SetNextItemWidth(-1.0f);
+			changed |= ImGui::SliderFloat("Normal Scale##vulkanMaterial", &matState.normalScale, 0.0f, 4.0f);
+		}
 
-			if (modelCount == 0) {
-				ImGui::TextDisabled("No models imported yet");
-			}
-			else if (ImGui::Combo("##model", &model, modelLabels.c_str())) {
-				logModelImportUi("combo requested model index=" + std::to_string(model) + " name=\"" + VulkanComputePreview::modelName(model) + "\"");
-				activateModelPreview(runtime, model, modelFolderImportStatus);
-			}
+		if (changed) {
+			runtime.vulkanPreview.setMaterialState(selectedMaterial, matState);
+		}
 
-			static const char* shadowModeLabels = "None\0Ray Traced\0Shadow Map\0\0";
-			int shadowMode = static_cast<int>(gVulkanPreviewShadowMode);
-			if (ImGui::Combo("Shadows", &shadowMode, shadowModeLabels)) {
-				gVulkanPreviewShadowMode = static_cast<VulkanPreviewShadowMode>(std::clamp(shadowMode, 0, 2));
-				runtime.vulkanFrameValid = false;
-				runtime.vulkanFrameDispatched = false;
-				params.renderInvalidated = true;
-			}
-
-			// Live PBR-factor overrides for the active model. The imported
-			// factors multiply any bound textures, so these let an over-metallic
-			// or flat/grayscale-albedo asset be corrected without editing the
-			// glTF (e.g. drop Metalness to turn chrome back into diffuse).
-			int materialCount = runtime.vulkanPreview.materialCount();
-			if (materialCount > 0) {
-				ImGui::Separator();
-				ImGui::TextUnformatted("Material overrides:");
-				static int selectedMaterial = 0;
-				if (selectedMaterial >= materialCount) {
-					selectedMaterial = 0;
-				}
-				if (materialCount > 1) {
-					ImGui::SliderInt("Material", &selectedMaterial, 0, materialCount - 1);
-				}
-				VulkanPreviewMaterialState matState;
-				if (runtime.vulkanPreview.materialState(selectedMaterial, matState)) {
-					bool changed = false;
-					changed |= ImGui::SliderFloat("Metalness", &matState.metalness, 0.0f, 1.0f);
-					if (matState.hasMetallicRoughnessTexture) {
-						ImGui::SameLine();
-						ImGui::TextDisabled("(x tex)");
-					}
-					changed |= ImGui::SliderFloat("Roughness", &matState.roughness, 0.0f, 1.0f);
-					if (matState.hasMetallicRoughnessTexture) {
-						ImGui::SameLine();
-						ImGui::TextDisabled("(x tex)");
-					}
-					changed |= ImGui::ColorEdit3("Base color", &matState.baseColor.x);
-					if (matState.hasBaseColorTexture) {
-						ImGui::SameLine();
-						ImGui::TextDisabled("(x tex)");
-					}
-					if (changed) {
-						runtime.vulkanPreview.setMaterialState(selectedMaterial, matState);
-					}
-					if (ImGui::Button("Reset materials")) {
-						runtime.vulkanPreview.resetMaterialStates();
-					}
-				}
-			}
-		}
-		ImGui::Spacing();
-		ImGui::Text("Import model folder:");
-		if (ImGui::InputText("##modelFolderPath", modelFolderPath, sizeof(modelFolderPath), ImGuiInputTextFlags_EnterReturnsTrue)) {
-			importModelFolderFromUiPath(runtime, modelFolderPath, modelFolderImportStatus);
-		}
-		ImGui::SameLine();
-		if (ImGui::Button("Paste")) {
-			applyClipboardToModelFolder(modelFolderPath, sizeof(modelFolderPath));
-		}
-		ImGui::SameLine();
-		if (ImGui::Button("Browse")) {
-			std::string selectedFolder;
-			if (browseFolderByOsDialog(selectedFolder) && !selectedFolder.empty()) {
-				setModelFolderPath(modelFolderPath, sizeof(modelFolderPath), selectedFolder);
-				importModelFolderFromUiPath(runtime, modelFolderPath, modelFolderImportStatus);
-			}
-			else {
-				modelFolderImportStatus = "Browse folder cancelled or unavailable on this OS";
-			}
-		}
-		ImGui::SameLine();
-		if (ImGui::Button("Import Model Folder")) {
-			importModelFolderFromUiPath(runtime, modelFolderPath, modelFolderImportStatus);
-		}
-		if (!modelFolderImportStatus.empty()) {
-			ImGui::TextWrapped("Import: %s", modelFolderImportStatus.c_str());
-		}
-	} else {
-		ImGui::TextDisabled("Vulkan unavailable");
+		ImGui::EndTable();
 	}
 
 	ImGui::End();
@@ -679,8 +729,9 @@ void runMainLoop(RuntimeResources& runtime) {
 
 		rlImGuiBegin();
 
+		UiLayout layout = makeUiLayout(runtime);
 		updateUiHoverState();
-		handleRenderTargetResize(runtime);
+		handleRenderTargetResize(runtime, layout.viewport);
 		updateSamplingGate();
 		handleViewportActions();
 		updateCamera();
@@ -688,13 +739,15 @@ void runMainLoop(RuntimeResources& runtime) {
 		drawViewport(runtime, vulkanFrameDrawn);
 
 		params.shouldSample = true;
-		ui.logic(params, data, myCam);
-		drawVulkanPreviewPanel(runtime, vulkanFrameDrawn);
-		drawShaderSelectorPanel(runtime);
+		drawVulkanMainMenuBar(runtime);
+		ui.logic(params, data, myCam, layout);
+		drawVulkanMaterialPanel(runtime, layout);
 
 		rlImGuiEnd();
 
-		mousePosDisplay();
+		if (params.enableDebugRay && !params.isMouseHoveringUI) {
+			mousePosDisplay();
+		}
 
 		EndDrawing();
 	}

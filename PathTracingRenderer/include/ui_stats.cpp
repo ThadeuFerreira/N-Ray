@@ -16,13 +16,13 @@ float UI::updateAverageUiFrameMs(float currentMs) {
 	return totalMs / float(avgMsIdxAmount);
 }
 
-void UI::drawStatsWindow(Params& params, Data& data) {
+void UI::drawStatsWindow(Params& params, Data& data, const UiLayout& layout) {
 	float uiFrameMs = params.dt * 1000.0f;
 	float avgUiFrameMs = updateAverageUiFrameMs(uiFrameMs);
 
-	ImGui::SetNextWindowSize(ImVec2(250.0f, 400.0f), ImGuiCond_Once);
-	ImGui::SetNextWindowPos(ImVec2(params.screenSize.x - 250.0f, 0.0f), ImGuiCond_Once);
-	ImGui::Begin("Stats", nullptr);
+	ImGui::SetNextWindowSize(ImVec2(layout.statsPanel.width, layout.statsPanel.height), ImGuiCond_Always);
+	ImGui::SetNextWindowPos(ImVec2(layout.statsPanel.x, layout.statsPanel.y), ImGuiCond_Always);
+	ImGui::Begin("Stats", nullptr, kLockedPanelFlags);
 
 	const char* renderStatus = "Idle";
 	if (params.renderStatsActive) {

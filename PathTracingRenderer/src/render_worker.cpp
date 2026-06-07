@@ -303,7 +303,7 @@ void drawRenderTexture(Texture2D& render, const Screen& screen) {
 	DrawTexturePro(
 		render,
 		{ 0, 0, (float)screen.resX, (float)screen.resY },
-		{ 0, 0, (float)GetScreenWidth(), (float)GetScreenHeight() },
+		{ screen.viewportX, screen.viewportY, screen.screenSizeX, screen.screenSizeY },
 		{ 0, 0 },
 		0.0f,
 		WHITE

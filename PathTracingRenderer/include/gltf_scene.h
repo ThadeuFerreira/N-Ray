@@ -18,6 +18,19 @@ enum GltfPreviewAlphaMode : uint32_t {
 	GLTF_PREVIEW_ALPHA_BLEND = 2
 };
 
+enum GltfPreviewMaterialKind : uint32_t {
+	GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC = 0,
+	GLTF_PREVIEW_MATERIAL_OPAQUE_METAL = 1,
+	GLTF_PREVIEW_MATERIAL_ALPHA_MASK = 2,
+	GLTF_PREVIEW_MATERIAL_ALPHA_BLEND_COVERAGE = 3,
+	GLTF_PREVIEW_MATERIAL_THIN_TRANSMISSION = 4,
+	GLTF_PREVIEW_MATERIAL_VOLUME_TRANSMISSION = 5,
+	GLTF_PREVIEW_MATERIAL_UNLIT = 6,
+	GLTF_PREVIEW_MATERIAL_CAR_PAINT = 7,
+	GLTF_PREVIEW_MATERIAL_RUBBER = 8,
+	GLTF_PREVIEW_MATERIAL_EMISSIVE = 9
+};
+
 struct GltfPreviewStats {
 	uint32_t nodeCount = 0;
 	uint32_t meshCount = 0;
@@ -49,12 +62,33 @@ struct GltfPreviewMaterialMeta {
 	float normalScale = 1.0f;
 	float occlusionStrength = 1.0f;
 	float transmission = 0.0f;
+	float ior = 1.5f;
+	float volumeThickness = 0.0f;
+	float attenuationDistance = 0.0f;
+	glm::vec3 attenuationColor = glm::vec3(1.0f);
 	uint32_t baseColorTexture = GLTF_PREVIEW_INVALID_TEXTURE;
 	uint32_t metallicRoughnessTexture = GLTF_PREVIEW_INVALID_TEXTURE;
 	uint32_t normalTexture = GLTF_PREVIEW_INVALID_TEXTURE;
 	uint32_t occlusionTexture = GLTF_PREVIEW_INVALID_TEXTURE;
 	uint32_t emissiveTexture = GLTF_PREVIEW_INVALID_TEXTURE;
+	uint32_t transmissionTexture = GLTF_PREVIEW_INVALID_TEXTURE;
+	uint32_t thicknessTexture = GLTF_PREVIEW_INVALID_TEXTURE;
 	uint32_t alphaMode = GLTF_PREVIEW_ALPHA_OPAQUE;
+	bool unlit = false;
+
+	uint32_t materialKind = GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC;
+	uint32_t normalizedAlphaMode = GLTF_PREVIEW_ALPHA_OPAQUE;
+	glm::vec4 normalizedBaseColorFactor = glm::vec4(1.0f);
+	float normalizedRoughness = 1.0f;
+	float normalizedMetalness = 0.0f;
+	float normalizedTransmission = 0.0f;
+	float normalizedAlphaCoverage = 1.0f;
+	float normalizedIor = 1.5f;
+	bool inferredTransmission = false;
+	bool repairedTransmissionTint = false;
+	bool repairedMetallicTransmission = false;
+	std::string normalizedSemantic;
+	std::string name;
 };
 
 struct GltfPreviewTriSurface {

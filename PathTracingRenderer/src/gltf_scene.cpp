@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -57,6 +58,13 @@ float maxComponent(const glm::vec3& value) {
 	return std::max(value.x, std::max(value.y, value.z));
 }
 
+std::string lowerAscii(std::string value) {
+	std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+		return static_cast<char>(std::tolower(c));
+	});
+	return value;
+}
+
 float readTransmissionFactor(const tinygltf::Material& material) {
 	auto extIt = material.extensions.find("KHR_materials_transmission");
 	if (extIt == material.extensions.end() || !extIt->second.IsObject()) {
@@ -69,6 +77,20 @@ float readTransmissionFactor(const tinygltf::Material& material) {
 	}
 
 	return clamp01(static_cast<float>(factor.GetNumberAsDouble()));
+}
+
+float readIor(const tinygltf::Material& material) {
+	auto extIt = material.extensions.find("KHR_materials_ior");
+	if (extIt == material.extensions.end() || !extIt->second.IsObject()) {
+		return 1.5f;
+	}
+
+	const tinygltf::Value& ior = extIt->second.Get("ior");
+	if (!ior.IsReal() && !ior.IsInt()) {
+		return 1.5f;
+	}
+
+	return std::max(1.0f, static_cast<float>(ior.GetNumberAsDouble()));
 }
 
 float readEmissiveStrength(const tinygltf::Material& material) {
@@ -92,6 +114,79 @@ uint32_t textureIndexOrInvalid(int textureIndex, size_t textureCount) {
 	return static_cast<uint32_t>(textureIndex);
 }
 
+uint32_t readTransmissionTexture(const tinygltf::Material& material, size_t textureCount) {
+	auto extIt = material.extensions.find("KHR_materials_transmission");
+	if (extIt == material.extensions.end() || !extIt->second.IsObject()) {
+		return GLTF_PREVIEW_INVALID_TEXTURE;
+	}
+
+	const tinygltf::Value& textureInfo = extIt->second.Get("transmissionTexture");
+	if (!textureInfo.IsObject()) {
+		return GLTF_PREVIEW_INVALID_TEXTURE;
+	}
+
+	const tinygltf::Value& index = textureInfo.Get("index");
+	if (!index.IsInt()) {
+		return GLTF_PREVIEW_INVALID_TEXTURE;
+	}
+
+	return textureIndexOrInvalid(index.GetNumberAsInt(), textureCount);
+}
+
+struct VolumeExtension {
+	float thickness = 0.0f;
+	float attenuationDistance = 0.0f;
+	glm::vec3 attenuationColor = glm::vec3(1.0f);
+	uint32_t thicknessTexture = GLTF_PREVIEW_INVALID_TEXTURE;
+};
+
+VolumeExtension readVolumeExtension(const tinygltf::Material& material, size_t textureCount) {
+	VolumeExtension result;
+	auto extIt = material.extensions.find("KHR_materials_volume");
+	if (extIt == material.extensions.end() || !extIt->second.IsObject()) {
+		return result;
+	}
+
+	const tinygltf::Value& thickness = extIt->second.Get("thicknessFactor");
+	if (thickness.IsReal() || thickness.IsInt()) {
+		result.thickness = std::max(0.0f, static_cast<float>(thickness.GetNumberAsDouble()));
+	}
+
+	const tinygltf::Value& attenuationDistance = extIt->second.Get("attenuationDistance");
+	if (attenuationDistance.IsReal() || attenuationDistance.IsInt()) {
+		result.attenuationDistance = std::max(0.0f, static_cast<float>(attenuationDistance.GetNumberAsDouble()));
+	}
+
+	const tinygltf::Value& attenuationColor = extIt->second.Get("attenuationColor");
+	if (attenuationColor.IsArray() && attenuationColor.ArrayLen() >= 3) {
+		const tinygltf::Value& r = attenuationColor.Get(0);
+		const tinygltf::Value& g = attenuationColor.Get(1);
+		const tinygltf::Value& b = attenuationColor.Get(2);
+		if (r.IsNumber() && g.IsNumber() && b.IsNumber()) {
+			result.attenuationColor = glm::vec3(
+				clamp01(static_cast<float>(r.GetNumberAsDouble())),
+				clamp01(static_cast<float>(g.GetNumberAsDouble())),
+				clamp01(static_cast<float>(b.GetNumberAsDouble()))
+			);
+		}
+	}
+
+	const tinygltf::Value& thicknessTexture = extIt->second.Get("thicknessTexture");
+	if (thicknessTexture.IsObject()) {
+		const tinygltf::Value& index = thicknessTexture.Get("index");
+		if (index.IsInt()) {
+			result.thicknessTexture = textureIndexOrInvalid(index.GetNumberAsInt(), textureCount);
+		}
+	}
+
+	return result;
+}
+
+bool hasUnlitExtension(const tinygltf::Material& material) {
+	auto extIt = material.extensions.find("KHR_materials_unlit");
+	return extIt != material.extensions.end() && extIt->second.IsObject();
+}
+
 uint32_t alphaModeValue(const tinygltf::Material& material) {
 	if (material.alphaMode == "MASK") {
 		return GLTF_PREVIEW_ALPHA_MASK;
@@ -100,6 +195,29 @@ uint32_t alphaModeValue(const tinygltf::Material& material) {
 		return GLTF_PREVIEW_ALPHA_BLEND;
 	}
 	return GLTF_PREVIEW_ALPHA_OPAQUE;
+}
+
+const char* alphaModeName(uint32_t alphaMode) {
+	switch (alphaMode) {
+	case GLTF_PREVIEW_ALPHA_MASK: return "MASK";
+	case GLTF_PREVIEW_ALPHA_BLEND: return "BLEND";
+	default: return "OPAQUE";
+	}
+}
+
+const char* materialKindName(uint32_t materialKind) {
+	switch (materialKind) {
+	case GLTF_PREVIEW_MATERIAL_OPAQUE_METAL: return "OpaqueMetal";
+	case GLTF_PREVIEW_MATERIAL_ALPHA_MASK: return "AlphaMask";
+	case GLTF_PREVIEW_MATERIAL_ALPHA_BLEND_COVERAGE: return "AlphaBlendCoverage";
+	case GLTF_PREVIEW_MATERIAL_THIN_TRANSMISSION: return "ThinTransmission";
+	case GLTF_PREVIEW_MATERIAL_VOLUME_TRANSMISSION: return "VolumeTransmission";
+	case GLTF_PREVIEW_MATERIAL_UNLIT: return "Unlit";
+	case GLTF_PREVIEW_MATERIAL_CAR_PAINT: return "CarPaint";
+	case GLTF_PREVIEW_MATERIAL_RUBBER: return "Rubber";
+	case GLTF_PREVIEW_MATERIAL_EMISSIVE: return "Emissive";
+	default: return "OpaqueDielectric";
+	}
 }
 
 std::string joinExtensions(const std::vector<std::string>& extensions) {
@@ -312,6 +430,209 @@ std::string channelStatsString(const TextureChannelStats& stats) {
 	return out.str();
 }
 
+bool textureAlphaLooksLikeCoverage(uint32_t textureIndex, const std::vector<GltfPreviewTexture>& textures) {
+	if (textureIndex == GLTF_PREVIEW_INVALID_TEXTURE || textureIndex >= textures.size()) {
+		return false;
+	}
+
+	TextureChannelStats alpha = textureChannelStats(textures[textureIndex], 3);
+	if (!alpha.valid) {
+		return false;
+	}
+
+	return alpha.min < 0.95f && (alpha.max - alpha.min) > 0.1f;
+}
+
+bool textContainsAny(const std::string& text, std::initializer_list<const char*> needles) {
+	for (const char* needle : needles) {
+		if (text.find(needle) != std::string::npos) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool looksLikeTransmissiveSurface(
+	const tinygltf::Material& material,
+	const std::string& sourcePath,
+	const GltfPreviewMaterialMeta& meta,
+	const glm::vec4& averagedBaseColor
+) {
+	std::string text = lowerAscii(material.name + " " + sourcePath);
+	bool nameLooksTransmissive =
+		text.find("glass") != std::string::npos ||
+		text.find("window") != std::string::npos ||
+		text.find("windshield") != std::string::npos ||
+		text.find("windscreen") != std::string::npos ||
+		text.find("lens") != std::string::npos ||
+		text.find("crystal") != std::string::npos ||
+		text.find("water") != std::string::npos ||
+		text.find("liquid") != std::string::npos;
+
+	if (nameLooksTransmissive) {
+		return true;
+	}
+
+	bool simpleBlendMaterial =
+		meta.alphaMode == GLTF_PREVIEW_ALPHA_BLEND &&
+		meta.baseColorTexture == GLTF_PREVIEW_INVALID_TEXTURE &&
+		meta.metallicRoughnessTexture == GLTF_PREVIEW_INVALID_TEXTURE &&
+		meta.roughness <= 0.15f &&
+		averagedBaseColor.a < 0.85f;
+	return simpleBlendMaterial;
+}
+
+void normalizeOpaqueMaterialSemantics(const tinygltf::Material& material, GltfPreviewMaterialMeta& meta) {
+	std::string name = lowerAscii(material.name);
+	bool hasMetallicRoughnessTexture = meta.metallicRoughnessTexture != GLTF_PREVIEW_INVALID_TEXTURE;
+	float rawMetalness = meta.normalizedMetalness;
+	float rawRoughness = meta.normalizedRoughness;
+
+	if (textContainsAny(name, {"tire", "tyre", "rubber", "gasket", "seal"})) {
+		meta.materialKind = GLTF_PREVIEW_MATERIAL_RUBBER;
+		meta.normalizedMetalness = 0.0f;
+		meta.normalizedRoughness = std::max(meta.normalizedRoughness, 0.55f);
+		meta.normalizedSemantic = "rubber dielectric";
+		return;
+	}
+
+	if (textContainsAny(name, {"paint", "body", "colour", "color", "lacquer", "clearcoat"})) {
+		meta.materialKind = GLTF_PREVIEW_MATERIAL_CAR_PAINT;
+		if (!hasMetallicRoughnessTexture || meta.normalizedMetalness > 0.35f) {
+			meta.normalizedMetalness = std::min(meta.normalizedMetalness, 0.08f);
+		}
+		meta.normalizedRoughness = std::clamp(meta.normalizedRoughness, 0.03f, 0.65f);
+		meta.normalizedSemantic = "paint dielectric";
+		return;
+	}
+
+	if (textContainsAny(name, {"plastic", "interior", "leather", "cloth", "fabric", "carbon", "cab", "seat", "dash", "trim", "steering"})) {
+		meta.materialKind = GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC;
+		if (!hasMetallicRoughnessTexture || meta.normalizedMetalness > 0.25f) {
+			meta.normalizedMetalness = 0.0f;
+		}
+		meta.normalizedRoughness = std::max(meta.normalizedRoughness, 0.32f);
+		meta.normalizedSemantic = "nonmetal dielectric";
+		return;
+	}
+
+	if (textContainsAny(name, {"light", "lamp", "indicator", "signal"})) {
+		meta.materialKind = GLTF_PREVIEW_MATERIAL_EMISSIVE;
+		meta.normalizedMetalness = 0.0f;
+		meta.normalizedRoughness = std::clamp(meta.normalizedRoughness, 0.02f, 0.25f);
+		meta.normalizedSemantic = "light surface";
+		return;
+	}
+
+	if (meta.emissiveTexture != GLTF_PREVIEW_INVALID_TEXTURE || meta.emissiveStrength > 1.0f) {
+		meta.materialKind = GLTF_PREVIEW_MATERIAL_EMISSIVE;
+		meta.normalizedMetalness = 0.0f;
+		meta.normalizedRoughness = std::clamp(meta.normalizedRoughness, 0.02f, 0.35f);
+		meta.normalizedSemantic = "emissive surface";
+		return;
+	}
+
+	if (textContainsAny(name, {"metal", "chrome", "steel", "aluminum", "aluminium", "wheel", "rim", "brake", "disc", "rotor", "caliper", "calliper", "exhaust"})) {
+		meta.materialKind = GLTF_PREVIEW_MATERIAL_OPAQUE_METAL;
+		meta.normalizedMetalness = std::max(meta.normalizedMetalness, 0.75f);
+		meta.normalizedSemantic = "metal surface";
+		return;
+	}
+
+	if (!hasMetallicRoughnessTexture && std::abs(rawMetalness - 0.5f) < 0.001f) {
+		meta.materialKind = GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC;
+		meta.normalizedMetalness = 0.0f;
+		meta.normalizedSemantic = "sparse default dielectric";
+		return;
+	}
+
+	meta.materialKind = meta.normalizedMetalness > 0.5f
+		? GLTF_PREVIEW_MATERIAL_OPAQUE_METAL
+		: GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC;
+
+	if (meta.materialKind == GLTF_PREVIEW_MATERIAL_OPAQUE_METAL && !hasMetallicRoughnessTexture && rawMetalness > 0.5f && rawRoughness > 0.65f) {
+		meta.normalizedMetalness = 0.0f;
+		meta.materialKind = GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC;
+		meta.normalizedSemantic = "rough sparse material";
+	}
+}
+
+void normalizeMaterialMeta(
+	const tinygltf::Material& material,
+	const std::string& sourcePath,
+	const std::vector<GltfPreviewTexture>& textures,
+	GltfPreviewMaterialMeta& meta,
+	const glm::vec4& averagedBaseColor
+) {
+	float rawAlphaCoverage = meta.alphaMode == GLTF_PREVIEW_ALPHA_OPAQUE ? 1.0f : clamp01(averagedBaseColor.a);
+	float transmission = clamp01(meta.transmission);
+
+	if (transmission <= 0.001f && looksLikeTransmissiveSurface(material, sourcePath, meta, averagedBaseColor)) {
+		transmission = std::clamp(1.0f - rawAlphaCoverage, 0.35f, 1.0f);
+		meta.inferredTransmission = true;
+	}
+
+	meta.normalizedBaseColorFactor = meta.baseColorFactor;
+	meta.normalizedRoughness = std::clamp(meta.roughness, 0.02f, 1.0f);
+	meta.normalizedMetalness = clamp01(meta.metalness);
+	meta.normalizedTransmission = transmission;
+	meta.normalizedAlphaCoverage = rawAlphaCoverage;
+	meta.normalizedIor = std::max(meta.ior, 1.001f);
+	meta.normalizedAlphaMode = meta.alphaMode;
+
+	bool transmissive = transmission > 0.001f;
+	if (transmissive) {
+		meta.materialKind = meta.volumeThickness > 0.001f
+			? GLTF_PREVIEW_MATERIAL_VOLUME_TRANSMISSION
+			: GLTF_PREVIEW_MATERIAL_THIN_TRANSMISSION;
+
+		if (meta.normalizedMetalness > 0.001f) {
+			meta.normalizedMetalness = 0.0f;
+			meta.repairedMetallicTransmission = true;
+		}
+
+		bool alphaTextureCoverage = textureAlphaLooksLikeCoverage(meta.baseColorTexture, textures);
+		meta.normalizedAlphaMode = meta.alphaMode == GLTF_PREVIEW_ALPHA_MASK
+			? GLTF_PREVIEW_ALPHA_MASK
+			: (alphaTextureCoverage ? GLTF_PREVIEW_ALPHA_BLEND : GLTF_PREVIEW_ALPHA_OPAQUE);
+
+		glm::vec3 averagedRgb(averagedBaseColor);
+		if (maxComponent(averagedRgb) < 0.05f) {
+			float tintFloor = std::clamp(0.35f + (1.0f - rawAlphaCoverage) * 0.5f, 0.35f, 0.85f);
+			meta.normalizedBaseColorFactor.r = std::max(meta.normalizedBaseColorFactor.r, tintFloor);
+			meta.normalizedBaseColorFactor.g = std::max(meta.normalizedBaseColorFactor.g, tintFloor);
+			meta.normalizedBaseColorFactor.b = std::max(meta.normalizedBaseColorFactor.b, tintFloor);
+			meta.repairedTransmissionTint = true;
+		}
+		return;
+	}
+
+	if (meta.unlit) {
+		meta.materialKind = GLTF_PREVIEW_MATERIAL_UNLIT;
+		return;
+	}
+
+	if (meta.alphaMode == GLTF_PREVIEW_ALPHA_MASK) {
+		meta.normalizedAlphaMode = GLTF_PREVIEW_ALPHA_MASK;
+	}
+	else if (meta.alphaMode == GLTF_PREVIEW_ALPHA_BLEND) {
+		meta.normalizedAlphaMode = GLTF_PREVIEW_ALPHA_BLEND;
+	}
+	else {
+		meta.normalizedAlphaMode = GLTF_PREVIEW_ALPHA_OPAQUE;
+	}
+
+	normalizeOpaqueMaterialSemantics(material, meta);
+	if (meta.normalizedSemantic.empty()) {
+		if (meta.normalizedAlphaMode == GLTF_PREVIEW_ALPHA_MASK) {
+			meta.materialKind = GLTF_PREVIEW_MATERIAL_ALPHA_MASK;
+		}
+		else if (meta.normalizedAlphaMode == GLTF_PREVIEW_ALPHA_BLEND) {
+			meta.materialKind = GLTF_PREVIEW_MATERIAL_ALPHA_BLEND_COVERAGE;
+		}
+	}
+}
+
 std::string previewTextureLabel(uint32_t textureIndex, const std::vector<GltfPreviewTexture>& textures) {
 	if (textureIndex == GLTF_PREVIEW_INVALID_TEXTURE) {
 		return "none";
@@ -351,11 +672,32 @@ void logGltfPreviewMaterialImport(
 		<< meta.baseColorFactor.a << ")"
 		<< " roughnessFactor=" << meta.roughness
 		<< " metallicFactor=" << meta.metalness
+		<< " alphaMode=" << alphaModeName(meta.alphaMode);
+
+	if (meta.alphaMode == GLTF_PREVIEW_ALPHA_MASK) {
+		std::cout << " alphaCutoff=" << meta.alphaCutoff;
+	}
+
+	std::cout
+		<< " doubleSided=" << (material.doubleSided ? "true" : "false")
 		<< " textures baseColor=" << previewTextureLabel(meta.baseColorTexture, textures)
 		<< " metallicRoughness=" << previewTextureLabel(meta.metallicRoughnessTexture, textures)
 		<< " normal=" << previewTextureLabel(meta.normalTexture, textures)
 		<< " occlusion=" << previewTextureLabel(meta.occlusionTexture, textures)
-		<< " emissive=" << previewTextureLabel(meta.emissiveTexture, textures);
+		<< " emissive=" << previewTextureLabel(meta.emissiveTexture, textures)
+		<< " transmissionTex=" << previewTextureLabel(meta.transmissionTexture, textures)
+		<< " transmissionFactor=" << meta.transmission
+		<< " ior=" << meta.ior
+		<< " normalized kind=" << materialKindName(meta.materialKind)
+		<< " alphaMode=" << alphaModeName(meta.normalizedAlphaMode)
+		<< " roughness=" << meta.normalizedRoughness
+		<< " metalness=" << meta.normalizedMetalness
+		<< " transmission=" << meta.normalizedTransmission
+		<< " baseColor=("
+		<< meta.normalizedBaseColorFactor.r << ", "
+		<< meta.normalizedBaseColorFactor.g << ", "
+		<< meta.normalizedBaseColorFactor.b << ", "
+		<< meta.normalizedBaseColorFactor.a << ")";
 
 	if (meta.metallicRoughnessTexture != GLTF_PREVIEW_INVALID_TEXTURE &&
 		meta.metallicRoughnessTexture < textures.size()) {
@@ -366,11 +708,41 @@ void logGltfPreviewMaterialImport(
 	}
 
 	std::cout << std::endl;
+
+	if (meta.inferredTransmission) {
+		std::cout << "  NORMALIZED material[" << materialIndex << "]: inferred thin transmission from material name/alpha/roughness cues\n";
+	}
+	if (meta.repairedMetallicTransmission) {
+		std::cout << "  WARNING material[" << materialIndex << "]: metallicFactor=" << meta.metalness
+			<< " with transmissionFactor=" << meta.transmission
+			<< " -- normalized to dielectric transmission\n";
+	}
+	if (meta.repairedTransmissionTint) {
+		std::cout << "  NORMALIZED material[" << materialIndex << "]: near-black transmissive tint lifted to keep glass physically visible\n";
+	}
+	if (!meta.normalizedSemantic.empty()) {
+		std::cout << "  NORMALIZED material[" << materialIndex << "]: semantic class " << meta.normalizedSemantic
+			<< " mapped to roughness=" << meta.normalizedRoughness
+			<< " metalness=" << meta.normalizedMetalness << "\n";
+	}
+	if (meta.alphaMode == GLTF_PREVIEW_ALPHA_BLEND && meta.transmission < 0.001f) {
+		std::string lowerName = material.name;
+		std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+			[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		if (lowerName.find("glass") != std::string::npos ||
+			lowerName.find("window") != std::string::npos ||
+			lowerName.find("windshield") != std::string::npos) {
+			std::cout << "  NOTE material[" << materialIndex << "]: alphaMode=BLEND with no KHR_materials_transmission"
+				<< " -- surface will composite as coverage, not physically transmissive glass\n";
+		}
+	}
 }
 
 PBRMaterial convertMaterial(
 	const tinygltf::Model& model,
 	const tinygltf::Material& material,
+	const std::string& sourcePath,
+	const std::vector<GltfPreviewTexture>& textures,
 	GltfPreviewMaterialMeta& meta,
 	float& opacity,
 	float& transmission
@@ -379,6 +751,7 @@ PBRMaterial convertMaterial(
 
 	const auto& pbr = material.pbrMetallicRoughness;
 	meta = GltfPreviewMaterialMeta{};
+	meta.name = material.name;
 	if (pbr.baseColorFactor.size() >= 4) {
 		meta.baseColorFactor = {
 			static_cast<float>(pbr.baseColorFactor[0]),
@@ -400,6 +773,14 @@ PBRMaterial convertMaterial(
 	meta.alphaMode = alphaModeValue(material);
 	meta.alphaCutoff = static_cast<float>(material.alphaCutoff);
 	meta.transmission = readTransmissionFactor(material);
+	meta.transmissionTexture = readTransmissionTexture(material, model.textures.size());
+	meta.ior = readIor(material);
+	VolumeExtension volume = readVolumeExtension(material, model.textures.size());
+	meta.volumeThickness = volume.thickness;
+	meta.attenuationDistance = volume.attenuationDistance;
+	meta.attenuationColor = volume.attenuationColor;
+	meta.thicknessTexture = volume.thicknessTexture;
+	meta.unlit = hasUnlitExtension(material);
 	meta.emissiveStrength = readEmissiveStrength(material);
 	if (material.emissiveFactor.size() >= 3) {
 		meta.emissiveFactor = {
@@ -411,23 +792,22 @@ PBRMaterial convertMaterial(
 
 	glm::vec4 textureAverage = averageBaseColorTexture(model, pbr.baseColorTexture.index);
 	glm::vec4 baseColor = meta.baseColorFactor * textureAverage;
-	result.albedo = glm::vec3(baseColor);
+	normalizeMaterialMeta(material, sourcePath, textures, meta, baseColor);
 
-	opacity = meta.alphaMode == GLTF_PREVIEW_ALPHA_OPAQUE ? 1.0f : clamp01(baseColor.a);
-	transmission = meta.transmission;
-	if (transmission > 0.0f) {
-		opacity = std::min(opacity, 1.0f - transmission * 0.75f);
-	}
+	glm::vec4 normalizedBaseColor = meta.normalizedBaseColorFactor * textureAverage;
+	result.albedo = glm::vec3(normalizedBaseColor);
 
-	// Some transmission materials encode colorless glass as black RGB plus alpha.
-	// The flat one-hit Vulkan preview cannot trace through glass yet, so give
-	// near-black transparent panes a visible tint instead of drawing them opaque.
-	if ((opacity < 0.999f || transmission > 0.0f) && maxComponent(result.albedo) < 0.03f) {
-		result.albedo = glm::vec3(0.34f, 0.46f, 0.56f);
-	}
+	opacity = meta.normalizedAlphaMode == GLTF_PREVIEW_ALPHA_OPAQUE ? 1.0f : meta.normalizedAlphaCoverage;
+	transmission = meta.normalizedTransmission;
 
-	result.roughness = meta.roughness;
-	result.metalness = meta.metalness;
+	result.roughness = meta.normalizedRoughness;
+	result.metalness = meta.normalizedMetalness;
+	result.IOR = meta.normalizedIor;
+	result.refraction = meta.normalizedTransmission;
+	result.absorptionCol = meta.attenuationColor;
+	result.absorption = meta.attenuationDistance > 0.0f ? 1.0f / meta.attenuationDistance : 0.0f;
+	result.volume = meta.volumeThickness;
+	result.volumeCol = meta.attenuationColor;
 	result.emissionCol = meta.emissiveFactor;
 	result.emissionIntensity = meta.emissiveStrength;
 
@@ -1041,6 +1421,14 @@ uint32_t appendShadowTestMaterial(GltfPreviewScene& scene, const glm::vec3& colo
 	meta.roughness = roughness;
 	meta.metalness = 0.0f;
 	meta.alphaMode = GLTF_PREVIEW_ALPHA_OPAQUE;
+	meta.materialKind = GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC;
+	meta.normalizedAlphaMode = GLTF_PREVIEW_ALPHA_OPAQUE;
+	meta.normalizedBaseColorFactor = glm::vec4(color, 1.0f);
+	meta.normalizedRoughness = roughness;
+	meta.normalizedMetalness = 0.0f;
+	meta.normalizedTransmission = 0.0f;
+	meta.normalizedAlphaCoverage = 1.0f;
+	meta.normalizedIor = 1.5f;
 	scene.materialMeta.push_back(meta);
 	scene.materialOpacity.push_back(1.0f);
 	scene.materialTransmission.push_back(0.0f);
@@ -1744,7 +2132,7 @@ bool loadGltfPreviewScene(const std::string& requestedPath, GltfPreviewScene& sc
 		GltfPreviewMaterialMeta meta;
 		float opacity = 1.0f;
 		float transmission = 0.0f;
-		scene.materials.push_back(convertMaterial(model, material, meta, opacity, transmission));
+		scene.materials.push_back(convertMaterial(model, material, scene.sourcePath, scene.textures, meta, opacity, transmission));
 		scene.materialMeta.push_back(meta);
 		scene.materialOpacity.push_back(opacity);
 		scene.materialTransmission.push_back(transmission);

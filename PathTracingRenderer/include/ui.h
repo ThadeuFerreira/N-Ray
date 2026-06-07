@@ -8,10 +8,11 @@
 #include <globalParams.h>
 #include <camera.h>
 #include <pbr_model.h>
+#include <ui_layout.h>
 
 struct UI {
 
-	void logic(Params& params, Data& data, PTCam& myCam);
+	void logic(Params& params, Data& data, PTCam& myCam, const UiLayout& layout);
 
 private:
 	struct LayoutSizes {
@@ -44,14 +45,14 @@ private:
 		LogSlider
 	};
 
-	void drawSettingsWindow(Params& params, Data& data, PTCam& myCam, const LayoutSizes& sizes);
+	void drawSettingsWindow(Params& params, Data& data, PTCam& myCam, const LayoutSizes& sizes, const UiLayout& layout);
 	void drawRenderSettings(Params& params, const LayoutSizes& sizes);
 	void drawSkySettings(Params& params, const LayoutSizes& sizes);
 	void drawCameraSettings(Params& params, PTCam& myCam, const LayoutSizes& sizes);
 	void drawPostSettings(Params& params, const LayoutSizes& sizes);
 	void drawSceneSettings(Params& params, Data& data, const LayoutSizes& sizes);
 	void drawDebugSettings(Params& params, const LayoutSizes& sizes);
-	void drawStatsWindow(Params& params, Data& data);
+	void drawStatsWindow(Params& params, Data& data, const UiLayout& layout);
 
 	float updateAverageUiFrameMs(float currentMs);
 
