@@ -40,6 +40,15 @@ PBRMaterial makeDefaultMaterial() {
 	};
 }
 
+PBRMaterial makePreviewMaterial(const glm::vec3& albedo, float roughness = 0.75f) {
+	PBRMaterial material = makeDefaultMaterial();
+	material.albedo = albedo;
+	material.roughness = roughness;
+	material.metalness = 0.0f;
+	material.emissionIntensity = 0.0f;
+	return material;
+}
+
 float clamp01(float value) {
 	return std::clamp(value, 0.0f, 1.0f);
 }
@@ -1023,6 +1032,245 @@ void padTriangleBoundsForPreview(GltfPreviewScene& scene) {
 	}
 }
 
+uint32_t appendShadowTestMaterial(GltfPreviewScene& scene, const glm::vec3& color, float roughness = 0.75f) {
+	uint32_t materialIndex = static_cast<uint32_t>(scene.materials.size());
+	scene.materials.push_back(makePreviewMaterial(color, roughness));
+
+	GltfPreviewMaterialMeta meta{};
+	meta.baseColorFactor = glm::vec4(color, 1.0f);
+	meta.roughness = roughness;
+	meta.metalness = 0.0f;
+	meta.alphaMode = GLTF_PREVIEW_ALPHA_OPAQUE;
+	scene.materialMeta.push_back(meta);
+	scene.materialOpacity.push_back(1.0f);
+	scene.materialTransmission.push_back(0.0f);
+	return materialIndex;
+}
+
+GltfPreviewTriSurface makeProceduralSurface(
+	const glm::vec2& aUv,
+	const glm::vec2& bUv,
+	const glm::vec2& cUv,
+	const glm::vec3& normal
+) {
+	GltfPreviewTriSurface surface{};
+	surface.aUv = aUv;
+	surface.bUv = bUv;
+	surface.cUv = cUv;
+	glm::vec3 tangent = orthogonalTangent(normal);
+	surface.aTangent = glm::vec4(tangent, 1.0f);
+	surface.bTangent = glm::vec4(tangent, 1.0f);
+	surface.cTangent = glm::vec4(tangent, 1.0f);
+	return surface;
+}
+
+void appendProceduralTriangle(
+	GltfPreviewScene& scene,
+	bool& haveBounds,
+	const glm::vec3& a,
+	const glm::vec3& b,
+	const glm::vec3& c,
+	const glm::vec3& aN,
+	const glm::vec3& bN,
+	const glm::vec3& cN,
+	uint32_t materialIndex,
+	const GltfPreviewTriSurface& surface
+) {
+	uint32_t originalTriIndex = static_cast<uint32_t>(scene.tris.size());
+	scene.tris.emplace_back(a, b, c, aN, bN, cN, materialIndex, 0u, true);
+	scene.tris.back().idx = originalTriIndex;
+	scene.triSurfaces.push_back(surface);
+	includeBounds(scene, scene.tris.back(), haveBounds);
+	scene.stats.triangleCount++;
+}
+
+void appendProceduralQuad(
+	GltfPreviewScene& scene,
+	bool& haveBounds,
+	const glm::vec3& a,
+	const glm::vec3& b,
+	const glm::vec3& c,
+	const glm::vec3& d,
+	uint32_t materialIndex
+) {
+	glm::vec3 normal = safeNormal(glm::cross(b - a, c - a), glm::vec3(0.0f, 0.0f, 1.0f));
+	appendProceduralTriangle(
+		scene,
+		haveBounds,
+		a,
+		b,
+		c,
+		normal,
+		normal,
+		normal,
+		materialIndex,
+		makeProceduralSurface(glm::vec2(0.0f, 0.0f), glm::vec2(1.0f, 0.0f), glm::vec2(1.0f, 1.0f), normal)
+	);
+	appendProceduralTriangle(
+		scene,
+		haveBounds,
+		a,
+		c,
+		d,
+		normal,
+		normal,
+		normal,
+		materialIndex,
+		makeProceduralSurface(glm::vec2(0.0f, 0.0f), glm::vec2(1.0f, 1.0f), glm::vec2(0.0f, 1.0f), normal)
+	);
+}
+
+void appendProceduralCube(
+	GltfPreviewScene& scene,
+	bool& haveBounds,
+	const glm::vec3& center,
+	float sideLength,
+	uint32_t materialIndex
+) {
+	float half = sideLength * 0.5f;
+	glm::vec3 mn = center - glm::vec3(half);
+	glm::vec3 mx = center + glm::vec3(half);
+
+	glm::vec3 v000(mn.x, mn.y, mn.z);
+	glm::vec3 v100(mx.x, mn.y, mn.z);
+	glm::vec3 v110(mx.x, mx.y, mn.z);
+	glm::vec3 v010(mn.x, mx.y, mn.z);
+	glm::vec3 v001(mn.x, mn.y, mx.z);
+	glm::vec3 v101(mx.x, mn.y, mx.z);
+	glm::vec3 v111(mx.x, mx.y, mx.z);
+	glm::vec3 v011(mn.x, mx.y, mx.z);
+
+	appendProceduralQuad(scene, haveBounds, v000, v010, v110, v100, materialIndex);
+	appendProceduralQuad(scene, haveBounds, v001, v101, v111, v011, materialIndex);
+	appendProceduralQuad(scene, haveBounds, v000, v100, v101, v001, materialIndex);
+	appendProceduralQuad(scene, haveBounds, v010, v011, v111, v110, materialIndex);
+	appendProceduralQuad(scene, haveBounds, v000, v001, v011, v010, materialIndex);
+	appendProceduralQuad(scene, haveBounds, v100, v110, v111, v101, materialIndex);
+}
+
+glm::vec3 spherePoint(const glm::vec3& center, float radius, float theta, float phi) {
+	float sinTheta = std::sin(theta);
+	return center + radius * glm::vec3(
+		std::cos(phi) * sinTheta,
+		std::sin(phi) * sinTheta,
+		std::cos(theta)
+	);
+}
+
+void appendProceduralSphere(
+	GltfPreviewScene& scene,
+	bool& haveBounds,
+	const glm::vec3& center,
+	float radius,
+	uint32_t materialIndex
+) {
+	constexpr int kSegments = 24;
+	constexpr int kRings = 12;
+
+	for (int ring = 0; ring < kRings; ++ring) {
+		float theta0 = PI * static_cast<float>(ring) / static_cast<float>(kRings);
+		float theta1 = PI * static_cast<float>(ring + 1) / static_cast<float>(kRings);
+		for (int segment = 0; segment < kSegments; ++segment) {
+			float phi0 = 2.0f * PI * static_cast<float>(segment) / static_cast<float>(kSegments);
+			float phi1 = 2.0f * PI * static_cast<float>(segment + 1) / static_cast<float>(kSegments);
+
+			glm::vec3 p00 = spherePoint(center, radius, theta0, phi0);
+			glm::vec3 p01 = spherePoint(center, radius, theta0, phi1);
+			glm::vec3 p10 = spherePoint(center, radius, theta1, phi0);
+			glm::vec3 p11 = spherePoint(center, radius, theta1, phi1);
+
+			auto normalAt = [&](const glm::vec3& point) {
+				return safeNormal(point - center, glm::vec3(0.0f, 0.0f, 1.0f));
+			};
+
+			if (ring > 0) {
+				appendProceduralTriangle(
+					scene,
+					haveBounds,
+					p00,
+					p10,
+					p11,
+					normalAt(p00),
+					normalAt(p10),
+					normalAt(p11),
+					materialIndex,
+					makeProceduralSurface(
+						glm::vec2(static_cast<float>(segment) / kSegments, static_cast<float>(ring) / kRings),
+						glm::vec2(static_cast<float>(segment) / kSegments, static_cast<float>(ring + 1) / kRings),
+						glm::vec2(static_cast<float>(segment + 1) / kSegments, static_cast<float>(ring + 1) / kRings),
+						normalAt(p00)
+					)
+				);
+			}
+			if (ring + 1 < kRings) {
+				appendProceduralTriangle(
+					scene,
+					haveBounds,
+					p00,
+					p11,
+					p01,
+					normalAt(p00),
+					normalAt(p11),
+					normalAt(p01),
+					materialIndex,
+					makeProceduralSurface(
+						glm::vec2(static_cast<float>(segment) / kSegments, static_cast<float>(ring) / kRings),
+						glm::vec2(static_cast<float>(segment + 1) / kSegments, static_cast<float>(ring + 1) / kRings),
+						glm::vec2(static_cast<float>(segment + 1) / kSegments, static_cast<float>(ring) / kRings),
+						normalAt(p00)
+					)
+				);
+			}
+		}
+	}
+}
+
+void appendShadowValidationRig(GltfPreviewScene& scene, bool& haveBounds) {
+	if (!haveBounds) {
+		return;
+	}
+
+	glm::vec3 modelMin = scene.boundsMin;
+	glm::vec3 modelMax = scene.boundsMax;
+	glm::vec3 extent = glm::max(modelMax - modelMin, glm::vec3(0.0001f));
+	glm::vec3 center = (modelMin + modelMax) * 0.5f;
+	float diagonal = glm::length(extent);
+	if (!std::isfinite(diagonal) || diagonal <= 0.0f) {
+		diagonal = 1.0f;
+	}
+
+	float maxExtent = std::max(extent.x, std::max(extent.y, extent.z));
+	float propSize = std::clamp(diagonal * 0.18f, maxExtent * 0.18f, maxExtent * 0.45f);
+	propSize = std::max(propSize, 0.001f);
+	float propRadius = propSize * 0.5f;
+	float sideGap = std::max(propSize * 0.8f, maxExtent * 0.08f);
+	float groundDrop = std::max(propSize * 0.04f, diagonal * 0.002f);
+	float groundZ = modelMin.z - groundDrop;
+
+	float cubeX = modelMin.x - sideGap - propRadius;
+	float sphereX = modelMax.x + sideGap + propRadius;
+	glm::vec3 cubeCenter(cubeX, center.y, groundZ + propRadius);
+	glm::vec3 sphereCenter(sphereX, center.y, groundZ + propRadius);
+
+	float rigMinX = cubeX - propRadius;
+	float rigMaxX = sphereX + propRadius;
+	float groundCenterX = (rigMinX + rigMaxX) * 0.5f;
+	float groundHalfX = (rigMaxX - rigMinX) * 0.5f + propSize * 0.75f;
+	float groundHalfY = std::max(extent.y * 0.5f + propSize * 1.25f, propSize * 2.0f);
+
+	uint32_t groundMaterial = appendShadowTestMaterial(scene, glm::vec3(0.58f, 0.60f, 0.56f), 0.9f);
+	uint32_t cubeMaterial = appendShadowTestMaterial(scene, glm::vec3(0.86f, 0.32f, 0.20f), 0.65f);
+	uint32_t sphereMaterial = appendShadowTestMaterial(scene, glm::vec3(0.22f, 0.42f, 0.86f), 0.55f);
+
+	glm::vec3 g0(groundCenterX - groundHalfX, center.y - groundHalfY, groundZ);
+	glm::vec3 g1(groundCenterX + groundHalfX, center.y - groundHalfY, groundZ);
+	glm::vec3 g2(groundCenterX + groundHalfX, center.y + groundHalfY, groundZ);
+	glm::vec3 g3(groundCenterX - groundHalfX, center.y + groundHalfY, groundZ);
+	appendProceduralQuad(scene, haveBounds, g0, g1, g2, g3, groundMaterial);
+	appendProceduralCube(scene, haveBounds, cubeCenter, propSize, cubeMaterial);
+	appendProceduralSphere(scene, haveBounds, sphereCenter, propRadius, sphereMaterial);
+}
+
 glm::mat4 weightedSkinMatrix(
 	const std::vector<glm::mat4>& skinMatrices,
 	const glm::uvec4& joints,
@@ -1545,13 +1793,14 @@ bool loadGltfPreviewScene(const std::string& requestedPath, GltfPreviewScene& sc
 		return false;
 	}
 
+	appendShadowValidationRig(scene, haveBounds);
 	buildSceneAcceleration(scene);
 	scene.loaded = true;
 
 	std::ostringstream out;
 	out << "glTF model ready: " << scene.stats.primitiveCount << " primitives, "
 		<< scene.stats.triangleCount << " triangles, "
-		<< scene.stats.materialCount << " materials";
+		<< scene.stats.materialCount << " materials, shadow validation rig";
 	if (!warning.empty()) {
 		out << " (warning: " << warning << ")";
 	}

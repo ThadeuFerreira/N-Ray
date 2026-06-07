@@ -14,6 +14,8 @@
 namespace {
 void frameVulkanPreviewModel(RuntimeResources& runtime);
 
+VulkanPreviewShadowMode gVulkanPreviewShadowMode = VulkanPreviewShadowMode::RayTraced;
+
 std::string trimWhitespace(std::string text) {
 	while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
 		text.erase(text.begin());
@@ -249,6 +251,7 @@ VulkanPreviewSettings makeVulkanPreviewSettings() {
 	settings.sunAngle = params.sunAngle;
 	settings.sunColor = params.sunColor;
 	settings.sunIntensity = params.sunIntensity;
+	settings.shadowMode = gVulkanPreviewShadowMode;
 	return settings;
 }
 
@@ -579,6 +582,15 @@ void drawShaderSelectorPanel(RuntimeResources& runtime) {
 			else if (ImGui::Combo("##model", &model, modelLabels.c_str())) {
 				logModelImportUi("combo requested model index=" + std::to_string(model) + " name=\"" + VulkanComputePreview::modelName(model) + "\"");
 				activateModelPreview(runtime, model, modelFolderImportStatus);
+			}
+
+			static const char* shadowModeLabels = "None\0Ray Traced\0Shadow Map\0\0";
+			int shadowMode = static_cast<int>(gVulkanPreviewShadowMode);
+			if (ImGui::Combo("Shadows", &shadowMode, shadowModeLabels)) {
+				gVulkanPreviewShadowMode = static_cast<VulkanPreviewShadowMode>(std::clamp(shadowMode, 0, 2));
+				runtime.vulkanFrameValid = false;
+				runtime.vulkanFrameDispatched = false;
+				params.renderInvalidated = true;
 			}
 
 			// Live PBR-factor overrides for the active model. The imported

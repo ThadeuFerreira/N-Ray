@@ -49,6 +49,12 @@ struct GpuSettings {
 	vec4 skyParams;
 	vec4 sunDir;
 	vec4 sunColor;
+	vec4 shadowParams;
+	vec4 shadowBasisX;
+	vec4 shadowBasisY;
+	vec4 shadowBasisZ;
+	vec4 shadowBounds;
+	vec4 shadowDepth;
 };
 
 layout(std430, binding = 1) readonly buffer TriIntersectBuffer {
@@ -77,6 +83,10 @@ layout(std430, binding = 6) readonly buffer SettingsBuffer {
 
 layout(binding = 7) uniform sampler2D sceneTextures[256];
 
+layout(std430, binding = 8) readonly buffer ShadowMapBuffer {
+	uint shadowMap[];
+};
+
 layout(push_constant) uniform PushConstants {
 	int width;
 	int height;
@@ -99,6 +109,10 @@ const uint INVALID_TEXTURE = 0xffffffffu;
 const uint GLTF_ALPHA_OPAQUE = 0u;
 const uint GLTF_ALPHA_MASK = 1u;
 const uint GLTF_ALPHA_BLEND = 2u;
+const uint SHADOW_MODE_NONE = 0u;
+const uint SHADOW_MODE_RAY_TRACED = 1u;
+const uint SHADOW_MODE_SHADOW_MAP = 2u;
+const uint SHADOW_MAP_EMPTY = 0xffffffffu;
 
 bool invalidVec3(vec3 value) {
 	return any(isnan(value)) || any(isinf(value));
@@ -465,6 +479,102 @@ bool traverseBvh(
 	return hit && hitTriIdx < triCount;
 }
 
+float rayTracedShadowVisibility(vec3 hitPos, vec3 normal, vec3 lightDir) {
+	uint hitTriIdx;
+	float closestT;
+	float hitU;
+	float hitV;
+	bool stackOverflow;
+	vec3 shadowOrigin = hitPos + normal * rayBias();
+	bool hit = traverseBvh(shadowOrigin, lightDir, 1.0 / lightDir, hitTriIdx, closestT, hitU, hitV, stackOverflow);
+	if (stackOverflow) {
+		return 1.0;
+	}
+	return hit ? 0.0 : 1.0;
+}
+
+bool projectShadowMap(vec3 worldPos, out vec2 uv, out float depth) {
+	float lightX = dot(worldPos, cfg.shadowBasisX.xyz);
+	float lightY = dot(worldPos, cfg.shadowBasisY.xyz);
+	uv = (vec2(lightX, lightY) - cfg.shadowBounds.xy) * cfg.shadowBounds.zw;
+	if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+		return false;
+	}
+
+	depth = (cfg.shadowDepth.x - dot(worldPos, cfg.shadowBasisZ.xyz)) * cfg.shadowDepth.y;
+	return depth >= 0.0 && depth <= 1.0;
+}
+
+float unpackShadowDepth(uint packedDepth) {
+	if (packedDepth == SHADOW_MAP_EMPTY) {
+		return 1.0;
+	}
+	return float(packedDepth) * (1.0 / 4294967294.0);
+}
+
+float shadowMapVisibility(vec3 hitPos, vec3 normal, vec3 lightDir) {
+	uint mapSize = max(1u, uint(cfg.shadowParams.y + 0.5));
+	vec2 uv;
+	float receiverDepth;
+	vec3 samplePos = hitPos + normal * cfg.shadowDepth.w;
+	if (!projectShadowMap(samplePos, uv, receiverDepth)) {
+		return 1.0;
+	}
+
+	ivec2 baseTexel = ivec2(floor(uv * float(mapSize)));
+	float slopeBias = cfg.shadowDepth.z * (1.0 + 3.0 * (1.0 - clamp(dot(normal, lightDir), 0.0, 1.0)));
+	float visibility = 0.0;
+	float sampleCount = 0.0;
+	for (int y = -1; y <= 1; ++y) {
+		for (int x = -1; x <= 1; ++x) {
+			ivec2 texel = baseTexel + ivec2(x, y);
+			if (texel.x < 0 || texel.y < 0 || texel.x >= int(mapSize) || texel.y >= int(mapSize)) {
+				visibility += 1.0;
+				sampleCount += 1.0;
+				continue;
+			}
+
+			uint shadowIndex = uint(texel.y) * mapSize + uint(texel.x);
+			uint storedPacked = shadowMap[shadowIndex];
+			if (storedPacked == SHADOW_MAP_EMPTY) {
+				visibility += 1.0;
+			}
+			else {
+				float storedDepth = unpackShadowDepth(storedPacked);
+				visibility += storedDepth + slopeBias >= receiverDepth ? 1.0 : 0.0;
+			}
+			sampleCount += 1.0;
+		}
+	}
+
+	return sampleCount > 0.0 ? visibility / sampleCount : 1.0;
+}
+
+float directSunVisibility(vec3 hitPos, vec3 normal, vec3 lightDir) {
+	uint shadowMode = uint(cfg.shadowParams.x + 0.5);
+	if (shadowMode == SHADOW_MODE_RAY_TRACED) {
+		return rayTracedShadowVisibility(hitPos, normal, lightDir);
+	}
+	if (shadowMode == SHADOW_MODE_SHADOW_MAP) {
+		return shadowMapVisibility(hitPos, normal, lightDir);
+	}
+	return 1.0;
+}
+
+vec3 directSunLighting(vec3 hitPos, vec3 normal, vec3 albedo, float metalness) {
+	vec3 lightDir = safeNormalize(cfg.sunDir.xyz, vec3(0.0, 0.0, 1.0));
+	float nDotL = max(dot(normal, lightDir), 0.0);
+	if (nDotL <= 0.0) {
+		return vec3(0.0);
+	}
+
+	float visibility = directSunVisibility(hitPos, normal, lightDir);
+	float sunAngularRadius = radians(max(cfg.sunDir.w, 0.01));
+	float sunSolidAngle = 2.0 * PI * (1.0 - cos(sunAngularRadius));
+	vec3 diffuseAlbedo = albedo * (1.0 - clamp(metalness, 0.0, 1.0));
+	return diffuseAlbedo * cfg.sunColor.rgb * cfg.sunColor.w * (sunSolidAngle / PI) * nDotL * visibility;
+}
+
 void main() {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
 	if (pixel.x >= pc.width || pixel.y >= pc.height) {
@@ -576,11 +686,17 @@ void main() {
 			}
 		}
 
+		vec3 hitPos = origin + dir * closestT;
+
 		if (emissionIntensity > 0.0 && maxComponent(emissionColor) > 0.0) {
 			radiance += throughput * emissionColor * emissionIntensity;
 		}
 
-		vec3 hitPos = origin + dir * closestT;
+		vec3 directSun = directSunLighting(hitPos, normal, albedo, metalness);
+		if (maxComponent(directSun) > 0.0) {
+			radiance += throughput * directSun;
+		}
+
 		vec3 microfacetNormal = sampleGGX(normal, roughness, rngFloat(rng), rngFloat(rng));
 		float r0Dielectric = (1.0 - ior) / (1.0 + ior);
 		r0Dielectric *= r0Dielectric;

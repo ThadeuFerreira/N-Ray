@@ -27,6 +27,7 @@
 #include "tut28_battered_alien_planet_comp_spv.h"
 #include "tut28_flux_core_comp_spv.h"
 #include "vulkan_gltf_flat_comp_spv.h"
+#include "vulkan_gltf_shadowmap_comp_spv.h"
 
 namespace {
 struct PushConstants {
@@ -45,6 +46,7 @@ struct PushConstants {
 static_assert(sizeof(PushConstants) == 112, "Push constants must match Vulkan preview shaders.");
 static_assert(nray_vulkan_triangle_comp_spv_len % 4 == 0, "SPIR-V bytecode size must be a multiple of 4.");
 static_assert(nray_vulkan_gltf_flat_comp_spv_len % 4 == 0, "SPIR-V bytecode size must be a multiple of 4.");
+static_assert(nray_vulkan_gltf_shadowmap_comp_spv_len % 4 == 0, "SPIR-V bytecode size must be a multiple of 4.");
 
 struct GpuTriIntersect {
 	glm::vec4 a;
@@ -83,17 +85,23 @@ struct GpuBvhNode {
 // Per-dispatch render/sky settings, uploaded to the binding 6 SSBO. Mirrors the
 // `cfg` block in vulkan_gltf_flat.comp; keep the field packing in lockstep.
 struct GpuSettings {
-	glm::vec4 renderParams; // x=maxBounces, y=rrMinBounces, z=russianRoulette(0/1), w=exposure
-	glm::vec4 skyParams;    // x=skyIntensity, y=enableSky(0/1), z=enableSun(0/1), w=contrast
-	glm::vec4 sunDir;       // xyz direction, w=sunAngle (degrees)
-	glm::vec4 sunColor;     // xyz color, w=sunIntensity
+	glm::vec4 renderParams;  // x=maxBounces, y=rrMinBounces, z=russianRoulette(0/1), w=exposure
+	glm::vec4 skyParams;     // x=skyIntensity, y=enableSky(0/1), z=enableSun(0/1), w=contrast
+	glm::vec4 sunDir;        // xyz direction to sun, w=sunAngle (degrees)
+	glm::vec4 sunColor;      // xyz color, w=sunIntensity
+	glm::vec4 shadowParams;  // x=shadowMode, y=shadow map resolution, z/w unused
+	glm::vec4 shadowBasisX;  // xyz light-space X axis
+	glm::vec4 shadowBasisY;  // xyz light-space Y axis
+	glm::vec4 shadowBasisZ;  // xyz direction to sun
+	glm::vec4 shadowBounds;  // x=minLightX, y=minLightY, z=invExtentX, w=invExtentY
+	glm::vec4 shadowDepth;   // x=maxLightZ, y=invDepthRange, z=depthBias, w=normalBias
 };
 
 static_assert(sizeof(GpuTriIntersect) == 64, "GpuTriIntersect must match std430 shader layout.");
 static_assert(sizeof(GpuTriShading) == 144, "GpuTriShading must match std430 shader layout.");
 static_assert(sizeof(GpuMaterial) == 96, "GpuMaterial must match std430 shader layout.");
 static_assert(sizeof(GpuBvhNode) == 48, "GpuBvhNode must match std430 shader layout.");
-static_assert(sizeof(GpuSettings) == 64, "GpuSettings must match std430 shader layout.");
+static_assert(sizeof(GpuSettings) == 160, "GpuSettings must match std430 shader layout.");
 
 const char* vkResultName(VkResult result) {
 	switch (result) {
@@ -123,6 +131,9 @@ uint32_t ceilDiv(uint32_t value, uint32_t divisor) {
 	return (value + divisor - 1) / divisor;
 }
 
+static constexpr uint32_t kDefaultShadowMapSize = 512;
+static constexpr uint32_t kShadowMapClearValue = 0xffffffffu;
+
 float computeModelRayBias(const GltfPreviewScene& scene) {
 	glm::vec3 extent = scene.boundsMax - scene.boundsMin;
 	float diagonal = glm::length(extent);
@@ -131,6 +142,82 @@ float computeModelRayBias(const GltfPreviewScene& scene) {
 	}
 
 	return std::clamp(diagonal * 0.00001f, 0.000001f, 0.01f);
+}
+
+bool isFiniteVec3(const glm::vec3& value) {
+	return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+}
+
+glm::vec3 safeNormalizeHost(const glm::vec3& value, const glm::vec3& fallback) {
+	float lenSq = glm::dot(value, value);
+	if (!isFiniteVec3(value) || !std::isfinite(lenSq) || lenSq <= 0.00000001f) {
+		return fallback;
+	}
+	return glm::normalize(value);
+}
+
+void fillShadowProjection(
+	GpuSettings& gpuSettings,
+	const VulkanPreviewSettings& settings,
+	const GltfPreviewScene* scene
+) {
+	gpuSettings.shadowParams = glm::vec4(
+		static_cast<float>(static_cast<uint32_t>(settings.shadowMode)),
+		static_cast<float>(kDefaultShadowMapSize),
+		0.0f,
+		0.0f
+	);
+
+	glm::vec3 lightZ = safeNormalizeHost(settings.sunDir, glm::vec3(0.0f, 0.0f, 1.0f));
+	glm::vec3 helper = std::abs(lightZ.z) < 0.95f ? glm::vec3(0.0f, 0.0f, 1.0f) : glm::vec3(0.0f, 1.0f, 0.0f);
+	glm::vec3 lightX = safeNormalizeHost(glm::cross(helper, lightZ), glm::vec3(1.0f, 0.0f, 0.0f));
+	glm::vec3 lightY = safeNormalizeHost(glm::cross(lightZ, lightX), glm::vec3(0.0f, 1.0f, 0.0f));
+
+	glm::vec3 boundsMin(-1.0f);
+	glm::vec3 boundsMax(1.0f);
+	if (scene != nullptr && scene->loaded && isFiniteVec3(scene->boundsMin) && isFiniteVec3(scene->boundsMax)) {
+		boundsMin = scene->boundsMin;
+		boundsMax = scene->boundsMax;
+	}
+
+	glm::vec3 lightMin(std::numeric_limits<float>::max());
+	glm::vec3 lightMax(-std::numeric_limits<float>::max());
+	for (int corner = 0; corner < 8; ++corner) {
+		glm::vec3 worldCorner(
+			(corner & 1) ? boundsMax.x : boundsMin.x,
+			(corner & 2) ? boundsMax.y : boundsMin.y,
+			(corner & 4) ? boundsMax.z : boundsMin.z
+		);
+		glm::vec3 lightCorner(
+			glm::dot(worldCorner, lightX),
+			glm::dot(worldCorner, lightY),
+			glm::dot(worldCorner, lightZ)
+		);
+		lightMin = glm::min(lightMin, lightCorner);
+		lightMax = glm::max(lightMax, lightCorner);
+	}
+
+	glm::vec3 extent = glm::max(boundsMax - boundsMin, glm::vec3(0.0001f));
+	float diagonal = glm::length(extent);
+	if (!std::isfinite(diagonal) || diagonal <= 0.0f) {
+		diagonal = 1.0f;
+	}
+
+	float padding = std::max(diagonal * 0.05f, 0.001f);
+	lightMin -= glm::vec3(padding);
+	lightMax += glm::vec3(padding);
+
+	float extentX = std::max(lightMax.x - lightMin.x, 0.001f);
+	float extentY = std::max(lightMax.y - lightMin.y, 0.001f);
+	float depthRange = std::max(lightMax.z - lightMin.z, 0.001f);
+	float normalBias = std::clamp(diagonal * 0.0005f, 0.000001f, 0.05f);
+	float depthBias = std::clamp((normalBias * 2.0f) / depthRange, 0.00005f, 0.01f);
+
+	gpuSettings.shadowBasisX = glm::vec4(lightX, 0.0f);
+	gpuSettings.shadowBasisY = glm::vec4(lightY, 0.0f);
+	gpuSettings.shadowBasisZ = glm::vec4(lightZ, 0.0f);
+	gpuSettings.shadowBounds = glm::vec4(lightMin.x, lightMin.y, 1.0f / extentX, 1.0f / extentY);
+	gpuSettings.shadowDepth = glm::vec4(lightMax.z, 1.0f / depthRange, depthBias, normalBias);
 }
 
 struct ShaderEntry {
@@ -159,9 +246,10 @@ static const ShaderEntry kShaders[] = {
 static const int kShaderCount = static_cast<int>(sizeof(kShaders) / sizeof(kShaders[0]));
 
 static constexpr uint32_t kMaxPreviewTextures = 256;
-// Total descriptor set bindings: 0=pixels, 1-4=scene SSBOs, 5=accum, 6=settings, 7=textures.
-static constexpr uint32_t kTotalBindings = 8;
-static constexpr uint32_t kStorageBindings = 7;
+// Total descriptor set bindings: 0=pixels, 1-4=scene SSBOs, 5=accum, 6=settings,
+// 7=textures, 8=shadow map.
+static constexpr uint32_t kTotalBindings = 9;
+static constexpr uint32_t kStorageDescriptorCount = 8;
 // Scene SSBO bindings start at index 1 (binding 0 is the pixel buffer).
 static constexpr uint32_t kFirstSceneBinding = 1;
 // Named binding slots — update if the layout in vulkan_gltf_flat.comp changes.
@@ -169,6 +257,7 @@ static constexpr uint32_t kBindingPixels   = 0;
 static constexpr uint32_t kBindingAccum    = 5;
 static constexpr uint32_t kBindingSettings = 6;
 static constexpr uint32_t kBindingTextures = 7;
+static constexpr uint32_t kBindingShadowMap = 8;
 
 // Imported models are persisted here (relative to the working directory, which
 // is the PathTracingRenderer/ folder where the app is run) so they reappear on
@@ -482,6 +571,10 @@ struct VulkanComputePreview::Impl {
 	size_t settingsBufferSize = 0;
 	bool settingsMemoryCoherent = false;
 
+	// Directional-light shadow map (binding 8): uint depth values filled to
+	// kShadowMapClearValue, then atomically minimized by a compute prepass.
+	StorageBuffer shadowMapBuffer;
+
 	// Progressive accumulation lifecycle. currentSample counts completed samples;
 	// the next dispatch uses it as the push-constant sample index. accumNeedsClear
 	// records a GPU clear before the next dispatch.
@@ -522,8 +615,10 @@ struct VulkanComputePreview::Impl {
 	VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
 	VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
 	VkShaderModule shaderModule = VK_NULL_HANDLE;
+	VkShaderModule shadowMapShaderModule = VK_NULL_HANDLE;
 	VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
 	VkPipeline pipeline = VK_NULL_HANDLE;
+	VkPipeline shadowMapPipeline = VK_NULL_HANDLE;
 	VkCommandPool commandPool = VK_NULL_HANDLE;
 	VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 	VkFence fence = VK_NULL_HANDLE;
@@ -581,6 +676,7 @@ struct VulkanComputePreview::Impl {
 			!loadModelSceneResources() ||
 			!createAccumBuffer() ||
 			!createSettingsBuffer() ||
+			!createShadowMapBuffer() ||
 			!createDescriptorSetLayout() ||
 			!createDescriptorPoolAndSet() ||
 			!createPipeline()) {
@@ -674,6 +770,11 @@ struct VulkanComputePreview::Impl {
 		);
 		gpuSettings.sunDir = glm::vec4(settings.sunDir, settings.sunAngle);
 		gpuSettings.sunColor = glm::vec4(settings.sunColor, settings.sunIntensity);
+		fillShadowProjection(
+			gpuSettings,
+			settings,
+			selectedEntry.requiresModel && modelBuffersReady ? &modelScene : nullptr
+		);
 		std::memcpy(mappedSettings, &gpuSettings, sizeof(GpuSettings));
 		if (!flushMappedRange(settingsMemory, settingsMemoryCoherent, "vkFlushMappedMemoryRanges settings")) {
 			return false;
@@ -768,9 +869,70 @@ struct VulkanComputePreview::Impl {
 			sceneCounts
 		};
 
+		bool runShadowMapPrepass =
+			selectedEntry.requiresModel &&
+			modelBuffersReady &&
+			settings.shadowMode == VulkanPreviewShadowMode::ShadowMap &&
+			shadowMapPipeline != VK_NULL_HANDLE &&
+			shadowMapBuffer.buffer != VK_NULL_HANDLE &&
+			sceneCounts.x > 0u;
+
 		if (timestampSupported && timestampPool != VK_NULL_HANDLE) {
 			vkCmdResetQueryPool(commandBuffer, timestampPool, 0, 2);
 			vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampPool, 0);
+		}
+
+		if (runShadowMapPrepass) {
+			vkCmdFillBuffer(commandBuffer, shadowMapBuffer.buffer, 0, VK_WHOLE_SIZE, kShadowMapClearValue);
+
+			VkBufferMemoryBarrier shadowClearBarrier{};
+			shadowClearBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+			shadowClearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			shadowClearBarrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+			shadowClearBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			shadowClearBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			shadowClearBarrier.buffer = shadowMapBuffer.buffer;
+			shadowClearBarrier.offset = 0;
+			shadowClearBarrier.size = VK_WHOLE_SIZE;
+			vkCmdPipelineBarrier(
+				commandBuffer,
+				VK_PIPELINE_STAGE_TRANSFER_BIT,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				0,
+				0,
+				nullptr,
+				1,
+				&shadowClearBarrier,
+				0,
+				nullptr
+			);
+
+			vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, shadowMapPipeline);
+			vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+			vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pushConstants);
+			vkCmdDispatch(commandBuffer, ceilDiv(sceneCounts.x, 64), 1, 1);
+
+			VkBufferMemoryBarrier shadowReadBarrier{};
+			shadowReadBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+			shadowReadBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+			shadowReadBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+			shadowReadBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			shadowReadBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			shadowReadBarrier.buffer = shadowMapBuffer.buffer;
+			shadowReadBarrier.offset = 0;
+			shadowReadBarrier.size = VK_WHOLE_SIZE;
+			vkCmdPipelineBarrier(
+				commandBuffer,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				0,
+				0,
+				nullptr,
+				1,
+				&shadowReadBarrier,
+				0,
+				nullptr
+			);
 		}
 
 		vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
@@ -898,18 +1060,7 @@ struct VulkanComputePreview::Impl {
 			commandPool = VK_NULL_HANDLE;
 			commandBuffer = VK_NULL_HANDLE;
 		}
-		if (pipeline != VK_NULL_HANDLE) {
-			vkDestroyPipeline(device, pipeline, nullptr);
-			pipeline = VK_NULL_HANDLE;
-		}
-		if (pipelineLayout != VK_NULL_HANDLE) {
-			vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
-			pipelineLayout = VK_NULL_HANDLE;
-		}
-		if (shaderModule != VK_NULL_HANDLE) {
-			vkDestroyShaderModule(device, shaderModule, nullptr);
-			shaderModule = VK_NULL_HANDLE;
-		}
+		destroyPipelineResources();
 		destroyDescriptorPool();
 		if (descriptorSetLayout != VK_NULL_HANDLE) {
 			vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
@@ -919,6 +1070,7 @@ struct VulkanComputePreview::Impl {
 		for (StorageBuffer& buffer : sceneBuffers) {
 			destroyStorageBuffer(buffer);
 		}
+		destroyStorageBuffer(shadowMapBuffer);
 		destroyTextureResources();
 		destroyPixelBuffer();
 		destroyAccumBuffer();
@@ -1201,6 +1353,20 @@ struct VulkanComputePreview::Impl {
 		settingsMemoryCoherent = false;
 	}
 
+	bool createShadowMapBuffer() {
+		size_t shadowMapBytes =
+			static_cast<size_t>(kDefaultShadowMapSize) *
+			static_cast<size_t>(kDefaultShadowMapSize) *
+			sizeof(uint32_t);
+		return createStorageBuffer(
+			shadowMapBuffer,
+			nullptr,
+			shadowMapBytes,
+			VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+			"shadow map"
+		);
+	}
+
 	bool fail(const std::string& message) {
 		status = message;
 		return false;
@@ -1435,7 +1601,13 @@ struct VulkanComputePreview::Impl {
 		resource.memoryCoherent = false;
 	}
 
-	bool createStorageBuffer(StorageBuffer& resource, const void* data, size_t byteSize) {
+	bool createStorageBuffer(
+		StorageBuffer& resource,
+		const void* data,
+		size_t byteSize,
+		VkBufferUsageFlags extraUsage = 0,
+		const char* tag = "scene"
+	) {
 		destroyStorageBuffer(resource);
 
 		if (byteSize == 0) {
@@ -1446,12 +1618,12 @@ struct VulkanComputePreview::Impl {
 		VkBufferCreateInfo bufferInfo{};
 		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
 		bufferInfo.size = static_cast<VkDeviceSize>(byteSize);
-		bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+		bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | extraUsage;
 		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
 		VkResult result = vkCreateBuffer(device, &bufferInfo, nullptr, &resource.buffer);
 		if (result != VK_SUCCESS) {
-			return failVk("vkCreateBuffer scene", result);
+			return failVk((std::string("vkCreateBuffer ") + tag).c_str(), result);
 		}
 
 		VkMemoryRequirements memoryReqs{};
@@ -1463,7 +1635,7 @@ struct VulkanComputePreview::Impl {
 			resource.memoryCoherent = false;
 			if (!findMemoryType(memoryReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memoryTypeIndex)) {
 				destroyStorageBuffer(resource);
-				return fail("No host-visible memory type for Vulkan scene buffer");
+				return fail(std::string("No host-visible memory type for Vulkan ") + tag + " buffer");
 			}
 		}
 
@@ -1475,7 +1647,7 @@ struct VulkanComputePreview::Impl {
 		result = vkAllocateMemory(device, &allocateInfo, nullptr, &resource.memory);
 		if (result != VK_SUCCESS) {
 			destroyStorageBuffer(resource);
-			return failVk("vkAllocateMemory scene", result);
+			return failVk((std::string("vkAllocateMemory ") + tag).c_str(), result);
 		}
 
 		resource.allocationSize = memoryReqs.size;
@@ -1484,14 +1656,14 @@ struct VulkanComputePreview::Impl {
 		result = vkBindBufferMemory(device, resource.buffer, resource.memory, 0);
 		if (result != VK_SUCCESS) {
 			destroyStorageBuffer(resource);
-			return failVk("vkBindBufferMemory scene", result);
+			return failVk((std::string("vkBindBufferMemory ") + tag).c_str(), result);
 		}
 
 		void* mapped = nullptr;
 		result = vkMapMemory(device, resource.memory, 0, resource.allocationSize, 0, &mapped);
 		if (result != VK_SUCCESS) {
 			destroyStorageBuffer(resource);
-			return failVk("vkMapMemory scene", result);
+			return failVk((std::string("vkMapMemory ") + tag).c_str(), result);
 		}
 
 		if (data != nullptr) {
@@ -1501,7 +1673,8 @@ struct VulkanComputePreview::Impl {
 			std::memset(mapped, 0, byteSize);
 		}
 
-		bool flushed = flushMappedRange(resource.memory, resource.memoryCoherent, "vkFlushMappedMemoryRanges scene");
+		std::string flushOp = std::string("vkFlushMappedMemoryRanges ") + tag;
+		bool flushed = flushMappedRange(resource.memory, resource.memoryCoherent, flushOp.c_str());
 		vkUnmapMemory(device, resource.memory);
 		if (!flushed) {
 			destroyStorageBuffer(resource);
@@ -2196,16 +2369,15 @@ struct VulkanComputePreview::Impl {
 
 	bool createDescriptorSetLayout() {
 		std::array<VkDescriptorSetLayoutBinding, kTotalBindings> bindings{};
-		for (uint32_t i = 0; i < kStorageBindings; ++i) {
-			bindings[i].binding = i;
-			bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-			bindings[i].descriptorCount = 1;
-			bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+		for (uint32_t binding = 0; binding < kTotalBindings; ++binding) {
+			bindings[binding].binding = binding;
+			bindings[binding].descriptorCount = 1;
+			bindings[binding].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+			bindings[binding].descriptorType = binding == kBindingTextures
+				? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+				: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 		}
-		bindings[kBindingTextures].binding = kBindingTextures;
-		bindings[kBindingTextures].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 		bindings[kBindingTextures].descriptorCount = kMaxPreviewTextures;
-		bindings[kBindingTextures].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
 		VkDescriptorSetLayoutCreateInfo layoutInfo{};
 		layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -2228,7 +2400,7 @@ struct VulkanComputePreview::Impl {
 
 		std::array<VkDescriptorPoolSize, 2> poolSizes{};
 		poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		poolSizes[0].descriptorCount = kStorageBindings;
+		poolSizes[0].descriptorCount = kStorageDescriptorCount;
 		poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 		poolSizes[1].descriptorCount = kMaxPreviewTextures;
 
@@ -2254,7 +2426,7 @@ struct VulkanComputePreview::Impl {
 			return failVk("vkAllocateDescriptorSets", result);
 		}
 
-		std::array<VkDescriptorBufferInfo, kStorageBindings> bufferInfos{};
+		std::array<VkDescriptorBufferInfo, kTotalBindings> bufferInfos{};
 		std::array<VkWriteDescriptorSet, kTotalBindings> writes{};
 		for (uint32_t binding = 0; binding < writes.size(); ++binding) {
 			if (binding == kBindingTextures) {
@@ -2287,6 +2459,10 @@ struct VulkanComputePreview::Impl {
 				bufferInfos[binding].buffer = settingsBuffer;
 				bufferInfos[binding].range = static_cast<VkDeviceSize>(settingsBufferSize);
 			}
+			else if (binding == kBindingShadowMap) {
+				bufferInfos[binding].buffer = shadowMapBuffer.buffer;
+				bufferInfos[binding].range = static_cast<VkDeviceSize>(shadowMapBuffer.size);
+			}
 			else {
 				const StorageBuffer& buffer = descriptorBufferForBinding(binding);
 				bufferInfos[binding].buffer = buffer.buffer;
@@ -2313,16 +2489,22 @@ struct VulkanComputePreview::Impl {
 		return true;
 	}
 
-	bool createPipeline() {
-		const ShaderEntry& entry = kShaders[selectedShader < kShaderCount ? selectedShader : 0];
+	bool createShaderModule(const unsigned char* spv, unsigned int len, VkShaderModule& outModule, const char* tag) {
 		VkShaderModuleCreateInfo shaderInfo{};
 		shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-		shaderInfo.codeSize = entry.len;
-		shaderInfo.pCode = reinterpret_cast<const uint32_t*>(entry.spv);
+		shaderInfo.codeSize = len;
+		shaderInfo.pCode = reinterpret_cast<const uint32_t*>(spv);
 
-		VkResult result = vkCreateShaderModule(device, &shaderInfo, nullptr, &shaderModule);
+		VkResult result = vkCreateShaderModule(device, &shaderInfo, nullptr, &outModule);
 		if (result != VK_SUCCESS) {
-			return failVk("vkCreateShaderModule", result);
+			return failVk((std::string("vkCreateShaderModule ") + tag).c_str(), result);
+		}
+		return true;
+	}
+
+	bool createPipelineLayout() {
+		if (pipelineLayout != VK_NULL_HANDLE) {
+			return true;
 		}
 
 		VkPushConstantRange pushRange{};
@@ -2337,9 +2519,44 @@ struct VulkanComputePreview::Impl {
 		layoutInfo.pushConstantRangeCount = 1;
 		layoutInfo.pPushConstantRanges = &pushRange;
 
-		result = vkCreatePipelineLayout(device, &layoutInfo, nullptr, &pipelineLayout);
+		VkResult result = vkCreatePipelineLayout(device, &layoutInfo, nullptr, &pipelineLayout);
 		if (result != VK_SUCCESS) {
 			return failVk("vkCreatePipelineLayout", result);
+		}
+		return true;
+	}
+
+	bool createComputePipeline(
+		VkShaderModule module,
+		const VkSpecializationInfo* specializationInfo,
+		VkPipeline& outPipeline,
+		const char* tag
+	) {
+		VkPipelineShaderStageCreateInfo stageInfo{};
+		stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+		stageInfo.module = module;
+		stageInfo.pName = "main";
+		stageInfo.pSpecializationInfo = specializationInfo;
+
+		VkComputePipelineCreateInfo pipelineInfo{};
+		pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+		pipelineInfo.stage = stageInfo;
+		pipelineInfo.layout = pipelineLayout;
+
+		VkResult result = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &outPipeline);
+		if (result != VK_SUCCESS) {
+			return failVk((std::string("vkCreateComputePipelines ") + tag).c_str(), result);
+		}
+
+		return true;
+	}
+
+	bool createPipeline() {
+		const ShaderEntry& entry = kShaders[selectedShader < kShaderCount ? selectedShader : 0];
+		if (!createPipelineLayout() ||
+			!createShaderModule(entry.spv, entry.len, shaderModule, entry.name)) {
+			return false;
 		}
 
 		// BVH_MAX_STACK_DEPTH: 32 on Intel Iris Xe (narrow register file, SAH tree depth ≤ 25),
@@ -2355,24 +2572,41 @@ struct VulkanComputePreview::Impl {
 		specInfo.dataSize      = sizeof(int);
 		specInfo.pData         = &bvhStackDepth;
 
-		VkPipelineShaderStageCreateInfo stageInfo{};
-		stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-		stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-		stageInfo.module = shaderModule;
-		stageInfo.pName = "main";
-		stageInfo.pSpecializationInfo = &specInfo;
-
-		VkComputePipelineCreateInfo pipelineInfo{};
-		pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-		pipelineInfo.stage = stageInfo;
-		pipelineInfo.layout = pipelineLayout;
-
-		result = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline);
-		if (result != VK_SUCCESS) {
-			return failVk("vkCreateComputePipelines", result);
+		if (!createComputePipeline(shaderModule, &specInfo, pipeline, entry.name) ||
+			!createShaderModule(
+				nray_vulkan_gltf_shadowmap_comp_spv,
+				nray_vulkan_gltf_shadowmap_comp_spv_len,
+				shadowMapShaderModule,
+				"glTF shadow map"
+			) ||
+			!createComputePipeline(shadowMapShaderModule, nullptr, shadowMapPipeline, "glTF shadow map")) {
+			return false;
 		}
 
 		return true;
+	}
+
+	void destroyPipelineResources() {
+		if (shadowMapPipeline != VK_NULL_HANDLE) {
+			vkDestroyPipeline(device, shadowMapPipeline, nullptr);
+			shadowMapPipeline = VK_NULL_HANDLE;
+		}
+		if (pipeline != VK_NULL_HANDLE) {
+			vkDestroyPipeline(device, pipeline, nullptr);
+			pipeline = VK_NULL_HANDLE;
+		}
+		if (pipelineLayout != VK_NULL_HANDLE) {
+			vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+			pipelineLayout = VK_NULL_HANDLE;
+		}
+		if (shadowMapShaderModule != VK_NULL_HANDLE) {
+			vkDestroyShaderModule(device, shadowMapShaderModule, nullptr);
+			shadowMapShaderModule = VK_NULL_HANDLE;
+		}
+		if (shaderModule != VK_NULL_HANDLE) {
+			vkDestroyShaderModule(device, shaderModule, nullptr);
+			shaderModule = VK_NULL_HANDLE;
+		}
 	}
 
 	bool createCommandResources() {
@@ -2441,14 +2675,7 @@ struct VulkanComputePreview::Impl {
 
 		vkDeviceWaitIdle(device);
 
-		if (pipeline != VK_NULL_HANDLE) {
-			vkDestroyPipeline(device, pipeline, nullptr);
-			pipeline = VK_NULL_HANDLE;
-		}
-		if (shaderModule != VK_NULL_HANDLE) {
-			vkDestroyShaderModule(device, shaderModule, nullptr);
-			shaderModule = VK_NULL_HANDLE;
-		}
+		destroyPipelineResources();
 
 		selectedShader = index;
 		if (!createPipeline()) {

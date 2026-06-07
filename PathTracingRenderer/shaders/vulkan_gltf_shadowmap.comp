@@ -1,0 +1,119 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct GpuTriIntersect {
+	vec4 a;
+	vec4 eA;
+	vec4 eB;
+	uvec4 ids;
+};
+
+struct GpuSettings {
+	vec4 renderParams;
+	vec4 skyParams;
+	vec4 sunDir;
+	vec4 sunColor;
+	vec4 shadowParams;
+	vec4 shadowBasisX;
+	vec4 shadowBasisY;
+	vec4 shadowBasisZ;
+	vec4 shadowBounds;
+	vec4 shadowDepth;
+};
+
+layout(std430, binding = 1) readonly buffer TriIntersectBuffer {
+	GpuTriIntersect triIsect[];
+};
+
+layout(std430, binding = 6) readonly buffer SettingsBuffer {
+	GpuSettings cfg;
+};
+
+layout(std430, binding = 8) buffer ShadowMapBuffer {
+	uint shadowMap[];
+};
+
+layout(push_constant) uniform PushConstants {
+	int width;
+	int height;
+	float time;
+	uint sampleIndex;
+	vec4 cameraPos;
+	vec4 cameraForward;
+	vec4 cameraRight;
+	vec4 cameraUp;
+	vec4 cameraParams;
+	uvec4 sceneCounts;
+} pc;
+
+float edgeFunction(vec2 a, vec2 b, vec2 p) {
+	return (p.x - a.x) * (b.y - a.y) - (p.y - a.y) * (b.x - a.x);
+}
+
+vec2 projectShadowPixel(vec3 worldPos, float mapSize) {
+	float lightX = dot(worldPos, cfg.shadowBasisX.xyz);
+	float lightY = dot(worldPos, cfg.shadowBasisY.xyz);
+	vec2 uv = (vec2(lightX, lightY) - cfg.shadowBounds.xy) * cfg.shadowBounds.zw;
+	return uv * mapSize;
+}
+
+float normalizedShadowDepth(vec3 worldPos) {
+	return (cfg.shadowDepth.x - dot(worldPos, cfg.shadowBasisZ.xyz)) * cfg.shadowDepth.y;
+}
+
+uint packShadowDepth(float depth) {
+	float clampedDepth = clamp(depth, 0.0, 1.0);
+	return uint(clampedDepth * 4294967294.0 + 0.5);
+}
+
+void rasterizeTriangle(vec3 a, vec3 b, vec3 c, uint mapSize) {
+	float mapSizeF = float(mapSize);
+	vec2 pa = projectShadowPixel(a, mapSizeF);
+	vec2 pb = projectShadowPixel(b, mapSizeF);
+	vec2 pc2 = projectShadowPixel(c, mapSizeF);
+
+	float area = edgeFunction(pa, pb, pc2);
+	if (abs(area) <= 0.000001) {
+		return;
+	}
+
+	vec2 minP = floor(min(pa, min(pb, pc2)) - vec2(1.0));
+	vec2 maxP = ceil(max(pa, max(pb, pc2)) + vec2(1.0));
+	ivec2 minTexel = clamp(ivec2(minP), ivec2(0), ivec2(int(mapSize) - 1));
+	ivec2 maxTexel = clamp(ivec2(maxP), ivec2(0), ivec2(int(mapSize) - 1));
+
+	float da = normalizedShadowDepth(a);
+	float db = normalizedShadowDepth(b);
+	float dc = normalizedShadowDepth(c);
+
+	for (int y = minTexel.y; y <= maxTexel.y; ++y) {
+		for (int x = minTexel.x; x <= maxTexel.x; ++x) {
+			vec2 p = vec2(float(x) + 0.5, float(y) + 0.5);
+			float w0 = edgeFunction(pb, pc2, p) / area;
+			float w1 = edgeFunction(pc2, pa, p) / area;
+			float w2 = edgeFunction(pa, pb, p) / area;
+			if (w0 < -0.0001 || w1 < -0.0001 || w2 < -0.0001) {
+				continue;
+			}
+
+			float depth = w0 * da + w1 * db + w2 * dc;
+			uint shadowIndex = uint(y) * mapSize + uint(x);
+			atomicMin(shadowMap[shadowIndex], packShadowDepth(depth));
+		}
+	}
+}
+
+void main() {
+	uint triIndex = gl_GlobalInvocationID.x;
+	if (triIndex >= pc.sceneCounts.x) {
+		return;
+	}
+
+	uint mapSize = max(1u, uint(cfg.shadowParams.y + 0.5));
+	GpuTriIntersect tri = triIsect[triIndex];
+	vec3 a = tri.a.xyz;
+	vec3 b = tri.a.xyz + tri.eA.xyz;
+	vec3 c = tri.a.xyz + tri.eB.xyz;
+	rasterizeTriangle(a, b, c, mapSize);
+}

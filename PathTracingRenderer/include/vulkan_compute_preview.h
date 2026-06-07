@@ -18,6 +18,12 @@ struct VulkanPreviewCamera {
 	float aspect = 1.0f;
 };
 
+enum class VulkanPreviewShadowMode : uint32_t {
+	None = 0,
+	RayTraced = 1,
+	ShadowMap = 2
+};
+
 // Per-dispatch render/sky settings for the progressive model path tracer. The
 // driver fills this from the global render params each frame; resetAccumulation
 // restarts the sample accumulation (set on any camera/model/setting change).
@@ -35,6 +41,7 @@ struct VulkanPreviewSettings {
 	float sunAngle = 7.53f;
 	glm::vec3 sunColor = glm::vec3(1.0f, 1.0f, 0.95f);
 	float sunIntensity = 100.0f;
+	VulkanPreviewShadowMode shadowMode = VulkanPreviewShadowMode::RayTraced;
 	bool resetAccumulation = false;
 };
 
