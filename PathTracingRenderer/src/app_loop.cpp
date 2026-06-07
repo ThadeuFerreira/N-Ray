@@ -1,13 +1,162 @@
 #include <app.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstring>
 #include <cmath>
 #include <exception>
+#include <cstdio>
 #include <imgui.h>
 #include <iostream>
+#include <string>
 #include <rlImGui.h>
 
 namespace {
+void frameVulkanPreviewModel(RuntimeResources& runtime);
+
+std::string trimWhitespace(std::string text) {
+	while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
+		text.erase(text.begin());
+	}
+	while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+		text.pop_back();
+	}
+	return text;
+}
+
+// First line of a (possibly multi-line) status string, for compact UI display.
+std::string firstLine(const std::string& value) {
+	std::size_t newline = value.find('\n');
+	return newline == std::string::npos ? value : value.substr(0, newline);
+}
+
+// Copy a path into a fixed-size UI buffer, guaranteeing null-termination even
+// when the source is longer than the buffer (std::strncpy does not terminate).
+void copyToPathBuffer(char* modelFolderPath, size_t pathCapacity, const std::string& value) {
+	if (pathCapacity == 0) {
+		return;
+	}
+	std::strncpy(modelFolderPath, value.c_str(), pathCapacity - 1);
+	modelFolderPath[pathCapacity - 1] = '\0';
+}
+
+void logModelImportUi(const std::string& message) {
+	std::cerr << "[VulkanModelImport:UI] " << message << '\n';
+}
+
+bool runFolderPickerCommand(const char* command, std::string& selectedPath) {
+	if (command == nullptr) {
+		return false;
+	}
+
+#ifdef _WIN32
+	FILE* pipe = _popen(command, "r");
+#else
+	FILE* pipe = popen(command, "r");
+#endif
+	if (!pipe) {
+		return false;
+	}
+
+	char buffer[512];
+	std::string output;
+	while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+		output += buffer;
+	}
+
+#ifdef _WIN32
+	int exitCode = _pclose(pipe);
+#else
+	int exitCode = pclose(pipe);
+#endif
+	if (exitCode != 0) {
+		return false;
+	}
+
+	selectedPath = trimWhitespace(output);
+	return !selectedPath.empty();
+}
+
+bool browseFolderByOsDialog(std::string& selectedPath) {
+#ifdef _WIN32
+	const char* command = "powershell -NoProfile -Command \"Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; $dialog.Description = 'Select glTF model folder'; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath }\"";
+#elif defined(__APPLE__)
+	const char* command = "osascript -e 'POSIX path of (choose folder with prompt \"Select glTF model folder\")'";
+#else
+#if __linux__
+	const char* command = "zenity --file-selection --directory --title=\"Select glTF model folder\" 2>/dev/null";
+	const char* fallback = "kdialog --getexistingdirectory \"$HOME\" --title \"Select glTF model folder\" 2>/dev/null";
+#else
+	const char* command = "";
+#endif
+#endif
+
+#if defined(__linux__)
+	if (runFolderPickerCommand(command, selectedPath)) {
+		return true;
+	}
+	return runFolderPickerCommand(fallback, selectedPath);
+#else
+	if (command[0] == '\0') {
+		return false;
+	}
+	return runFolderPickerCommand(command, selectedPath);
+#endif
+}
+
+void applyClipboardToModelFolder(char* modelFolderPath, size_t pathCapacity) {
+	const char* clipboard = ImGui::GetClipboardText();
+	if (clipboard == nullptr) {
+		return;
+	}
+	copyToPathBuffer(modelFolderPath, pathCapacity, trimWhitespace(clipboard));
+}
+
+void setModelFolderPath(char* modelFolderPath, size_t pathCapacity, const std::string& folderPath) {
+	copyToPathBuffer(modelFolderPath, pathCapacity, folderPath);
+}
+
+// Load a model index into GPU buffers and, if it succeeded, make sure the
+// model-preview shader is active so the result is visible. Shared by the model
+// combo and every import entry point. Returns true when the model is live.
+bool activateModelPreview(RuntimeResources& runtime, int modelIndex, std::string& importStatus) {
+	runtime.vulkanFrameValid = false;
+	runtime.vulkanFrameDispatched = false;
+	resetRenderStats(params);
+	params.renderInvalidated = true;
+	params.shouldSample = false;
+	if (!runtime.vulkanPreview.setModel(modelIndex)) {
+		importStatus = firstLine(runtime.vulkanPreview.statusMessage());
+		logModelImportUi("activate failed index=" + std::to_string(modelIndex) + " status=\"" + importStatus + "\"");
+		return false;
+	}
+
+	// A freshly imported model is loaded while some other shader is active; the
+	// model-preview shader can only be selected once its buffers are ready, so
+	// switch to it here now that setModel has uploaded them.
+	if (!VulkanComputePreview::isModelPreviewIndex(runtime.vulkanPreview.shaderIndex())) {
+		int previewShader = VulkanComputePreview::modelPreviewShaderIndex();
+		if (previewShader >= 0) {
+			runtime.vulkanPreview.setShader(previewShader);
+		}
+	}
+	logModelImportUi("activated model index=" + std::to_string(modelIndex) + " name=\"" + VulkanComputePreview::modelName(modelIndex) + "\"");
+	frameVulkanPreviewModel(runtime);
+	importStatus = firstLine(runtime.vulkanPreview.statusMessage());
+	return true;
+}
+
+void importModelFolderFromUiPath(RuntimeResources& runtime, char* modelFolderPath, std::string& importStatus) {
+	std::string requestedPath = modelFolderPath != nullptr ? modelFolderPath : "";
+	logModelImportUi("import requested path=\"" + requestedPath + "\" shaderIndex=" + std::to_string(runtime.vulkanPreview.shaderIndex()));
+	int importedModel = runtime.vulkanPreview.importModelFromFolder(modelFolderPath);
+	importStatus = firstLine(runtime.vulkanPreview.statusMessage());
+	logModelImportUi("import returned index=" + std::to_string(importedModel) + " status=\"" + importStatus + "\"");
+	if (importedModel >= 0) {
+		activateModelPreview(runtime, importedModel, importStatus);
+	}
+}
+
 void updateUiHoverState() {
 	params.isMouseHoveringUI = ImGui::IsAnyItemHovered() || ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow);
 }
@@ -87,7 +236,7 @@ VulkanPreviewCamera makeVulkanPreviewCamera() {
 
 VulkanPreviewSettings makeVulkanPreviewSettings() {
 	VulkanPreviewSettings settings{};
-	settings.maxSamples = std::max(1, params.maxSamples);
+	settings.maxSamples = std::clamp(params.maxSamples, kMinSamples, kMaxSamples);
 	settings.maxBounces = std::max(0, params.maxBounces);
 	settings.rrMinBounces = std::max(0, params.rrMinBounces);
 	settings.russianRoulette = params.russianRoulette;
@@ -223,6 +372,7 @@ bool updateVulkanComputePreview(RuntimeResources& runtime) {
 }
 
 bool updatePathTraceRender(RuntimeResources& runtime) {
+	params.maxSamples = std::clamp(params.maxSamples, kMinSamples, kMaxSamples);
 	if (updateVulkanComputePreview(runtime)) {
 		return true;
 	}
@@ -377,9 +527,11 @@ void drawVulkanPreviewPanel(RuntimeResources& runtime, bool vulkanFrameDrawn) {
 }
 
 void drawShaderSelectorPanel(RuntimeResources& runtime) {
-	ImGui::SetNextWindowSize(ImVec2(360.0f, 120.0f), ImGuiCond_Once);
+	ImGui::SetNextWindowSize(ImVec2(420.0f, 190.0f), ImGuiCond_Once);
 	ImGui::SetNextWindowPos(ImVec2(650.0f, 20.0f), ImGuiCond_Once);
 	ImGui::Begin("Vulkan Mode");
+	static char modelFolderPath[512] = {};
+	static std::string modelFolderImportStatus;
 
 	if (runtime.vulkanPreview.isAvailable()) {
 		int current = runtime.vulkanPreview.shaderIndex();
@@ -407,23 +559,96 @@ void drawShaderSelectorPanel(RuntimeResources& runtime) {
 			int model = runtime.vulkanPreview.modelIndex();
 			int modelCount = VulkanComputePreview::modelCount();
 
-			std::string modelLabels;
-			for (int i = 0; i < modelCount; i++) {
-				modelLabels += VulkanComputePreview::modelName(i);
+			// The model list only changes on import, so rebuild the '\0'-delimited
+			// label buffer when the count changes instead of every frame.
+			static std::string modelLabels;
+			static int cachedModelCount = -1;
+			if (cachedModelCount != modelCount) {
+				modelLabels.clear();
+				for (int i = 0; i < modelCount; i++) {
+					modelLabels += VulkanComputePreview::modelName(i);
+					modelLabels += '\0';
+				}
 				modelLabels += '\0';
+				cachedModelCount = modelCount;
 			}
-			modelLabels += '\0';
 
-			if (ImGui::Combo("##model", &model, modelLabels.c_str())) {
-				runtime.vulkanFrameValid = false;
-				runtime.vulkanFrameDispatched = false;
-				resetRenderStats(params);
-				params.renderInvalidated = true;
-				params.shouldSample = false;
-				if (runtime.vulkanPreview.setModel(model)) {
-					frameVulkanPreviewModel(runtime);
+			if (modelCount == 0) {
+				ImGui::TextDisabled("No models imported yet");
+			}
+			else if (ImGui::Combo("##model", &model, modelLabels.c_str())) {
+				logModelImportUi("combo requested model index=" + std::to_string(model) + " name=\"" + VulkanComputePreview::modelName(model) + "\"");
+				activateModelPreview(runtime, model, modelFolderImportStatus);
+			}
+
+			// Live PBR-factor overrides for the active model. The imported
+			// factors multiply any bound textures, so these let an over-metallic
+			// or flat/grayscale-albedo asset be corrected without editing the
+			// glTF (e.g. drop Metalness to turn chrome back into diffuse).
+			int materialCount = runtime.vulkanPreview.materialCount();
+			if (materialCount > 0) {
+				ImGui::Separator();
+				ImGui::TextUnformatted("Material overrides:");
+				static int selectedMaterial = 0;
+				if (selectedMaterial >= materialCount) {
+					selectedMaterial = 0;
+				}
+				if (materialCount > 1) {
+					ImGui::SliderInt("Material", &selectedMaterial, 0, materialCount - 1);
+				}
+				VulkanPreviewMaterialState matState;
+				if (runtime.vulkanPreview.materialState(selectedMaterial, matState)) {
+					bool changed = false;
+					changed |= ImGui::SliderFloat("Metalness", &matState.metalness, 0.0f, 1.0f);
+					if (matState.hasMetallicRoughnessTexture) {
+						ImGui::SameLine();
+						ImGui::TextDisabled("(x tex)");
+					}
+					changed |= ImGui::SliderFloat("Roughness", &matState.roughness, 0.0f, 1.0f);
+					if (matState.hasMetallicRoughnessTexture) {
+						ImGui::SameLine();
+						ImGui::TextDisabled("(x tex)");
+					}
+					changed |= ImGui::ColorEdit3("Base color", &matState.baseColor.x);
+					if (matState.hasBaseColorTexture) {
+						ImGui::SameLine();
+						ImGui::TextDisabled("(x tex)");
+					}
+					if (changed) {
+						runtime.vulkanPreview.setMaterialState(selectedMaterial, matState);
+					}
+					if (ImGui::Button("Reset materials")) {
+						runtime.vulkanPreview.resetMaterialStates();
+					}
 				}
 			}
+		}
+		ImGui::Spacing();
+		ImGui::Text("Import model folder:");
+		if (ImGui::InputText("##modelFolderPath", modelFolderPath, sizeof(modelFolderPath), ImGuiInputTextFlags_EnterReturnsTrue)) {
+			importModelFolderFromUiPath(runtime, modelFolderPath, modelFolderImportStatus);
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Paste")) {
+			applyClipboardToModelFolder(modelFolderPath, sizeof(modelFolderPath));
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Browse")) {
+			std::string selectedFolder;
+			if (browseFolderByOsDialog(selectedFolder) && !selectedFolder.empty()) {
+				setModelFolderPath(modelFolderPath, sizeof(modelFolderPath), selectedFolder);
+				importModelFolderFromUiPath(runtime, modelFolderPath, modelFolderImportStatus);
+			}
+			else {
+				modelFolderImportStatus = "Browse folder cancelled or unavailable on this OS";
+			}
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Import Model Folder")) {
+			importModelFolderFromUiPath(runtime, modelFolderPath, modelFolderImportStatus);
+		}
+		if (!modelFolderImportStatus.empty()) {
+			ImGui::TextWrapped("Import: %s", modelFolderImportStatus.c_str());
 		}
 	} else {
 		ImGui::TextDisabled("Vulkan unavailable");

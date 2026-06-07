@@ -15,7 +15,7 @@ void UI::drawRenderSettings(Params& params, const LayoutSizes& sizes) {
 		markRenderDirty(params);
 	}
 
-	if (sliderHelper("Max Samples", "Max amount of samples to render", sizes.slider, params.maxSamples, 1, 50000)) {
+	if (sliderHelper("Max Samples", "Max amount of samples to render", sizes.slider, params.maxSamples, kMinSamples, kMaxSamples)) {
 		markRenderDirty(params);
 	}
 

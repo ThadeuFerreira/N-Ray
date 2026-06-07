@@ -82,12 +82,14 @@ struct PTCam {
 
 	void cameraLogic(Params& params, float& ratio) {
 		float currentSpeed = camSpeed * params.dt;
+		bool rightMouseDown = IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
+		bool middleMouseDown = IsMouseButtonDown(MOUSE_BUTTON_MIDDLE);
 
-		if (!params.isMouseHoveringUI) {
+		if (!params.isMouseHoveringUI && rightMouseDown && !middleMouseDown) {
 			if (keyDownSample(KEY_A, params)) camPos -= right * currentSpeed;
 			if (keyDownSample(KEY_D, params)) camPos += right * currentSpeed;
-			if (keyDownSample(KEY_S, params)) camPos -= camNormal * currentSpeed;
-			if (keyDownSample(KEY_W, params)) camPos += camNormal * currentSpeed;
+			if (keyDownSample(KEY_S, params)) camPos -= targetNormal * currentSpeed;
+			if (keyDownSample(KEY_W, params)) camPos += targetNormal * currentSpeed;
 			if (keyDownSample(KEY_LEFT_CONTROL, params)) camPos.z -= currentSpeed;
 			if (keyDownSample(KEY_LEFT_SHIFT, params)) camPos.z += currentSpeed;
 		}
@@ -95,7 +97,8 @@ struct PTCam {
 		if (!params.isMouseHoveringUI) {
 			float wheel = GetMouseWheelMove();
 			if (wheel != 0.0f) {
-				glm::vec3 offset = camPos - orbitCenter;
+				glm::vec3 zoomPivot = (middleMouseDown ? glm::vec3(0.0f, 0.0f, 0.0f) : orbitCenter);
+				glm::vec3 offset = camPos - zoomPivot;
 				float distance = glm::length(offset);
 				if (!std::isfinite(distance) || distance <= 0.0001f) {
 					distance = 1.0f;
@@ -104,8 +107,8 @@ struct PTCam {
 
 				float zoomFactor = std::pow(1.0f - zoomSensitivity, wheel);
 				float nextDistance = std::clamp(distance * zoomFactor, 0.01f, 10000.0f);
-				camPos = orbitCenter + safeNormalize(offset, glm::vec3(0.0f, -1.0f, 0.0f)) * nextDistance;
-				targetNormal = safeNormalize(orbitCenter - camPos, targetNormal);
+				camPos = zoomPivot + safeNormalize(offset, glm::vec3(0.0f, -1.0f, 0.0f)) * nextDistance;
+				targetNormal = safeNormalize(zoomPivot - camPos, targetNormal);
 
 				params.shouldSample = false;
 				params.enableSampling = false;
@@ -115,11 +118,12 @@ struct PTCam {
 
 		glm::vec2 mDelta = { GetMouseDelta().x, GetMouseDelta().y };
 		if (!params.isMouseHoveringUI && (mDelta.x != 0.0f || mDelta.y != 0.0f)) {
-			if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+			if (middleMouseDown || (rightMouseDown && !middleMouseDown)) {
 				params.shouldSample = false;
 				params.enableSampling = false;
 				params.renderInvalidated = true;
 
+				const glm::vec3 orbitPivot = middleMouseDown ? glm::vec3(0.0f, 0.0f, 0.0f) : orbitCenter;
 				bool teleported = false;
 				if (GetMousePosition().x < 0.0f) {
 					SetMousePosition(params.screenSize.x, int(GetMousePosition().y));
@@ -140,29 +144,44 @@ struct PTCam {
 				}
 
 				if (!teleported) {
-					glm::vec3 offset = camPos - orbitCenter;
-					float distance = glm::length(offset);
-					if (!std::isfinite(distance) || distance <= 0.0001f) {
-						distance = std::max(focusDist, 1.0f);
-						offset = glm::vec3(0.0f, -distance, 0.0f);
-					}
-
 					float yaw = -mDelta.x * mouseSensitivity;
 					float pitch = -mDelta.y * ratio * mouseSensitivity;
 
-					glm::vec3 yawedOffset = glm::rotate(offset, yaw, worldUp);
-					glm::vec3 forwardAfterYaw = safeNormalize(-yawedOffset, camNormal);
-					glm::vec3 pitchAxis = safeNormalize(glm::cross(forwardAfterYaw, worldUp), right);
-					glm::vec3 pitchedOffset = glm::rotate(yawedOffset, pitch, pitchAxis);
+					if (middleMouseDown) {
+						glm::vec3 offset = camPos - orbitPivot;
+						float distance = glm::length(offset);
+						if (!std::isfinite(distance) || distance <= 0.0001f) {
+							distance = std::max(focusDist, 1.0f);
+							offset = glm::vec3(0.0f, -distance, 0.0f);
+						}
 
-					float upDot = glm::dot(safeNormalize(pitchedOffset, yawedOffset), worldUp);
-					if (std::abs(upDot) < 0.98f) {
-						camPos = orbitCenter + pitchedOffset;
+						glm::vec3 yawedOffset = glm::rotate(offset, yaw, worldUp);
+						glm::vec3 forwardAfterYaw = safeNormalize(-yawedOffset, targetNormal);
+						glm::vec3 pitchAxis = safeNormalize(glm::cross(forwardAfterYaw, worldUp), right);
+						glm::vec3 pitchedOffset = glm::rotate(yawedOffset, pitch, pitchAxis);
+
+						float upDot = glm::dot(safeNormalize(pitchedOffset, yawedOffset), worldUp);
+						if (std::abs(upDot) < 0.98f) {
+							camPos = orbitPivot + pitchedOffset;
+						}
+						else {
+							camPos = orbitPivot + yawedOffset;
+						}
+						targetNormal = safeNormalize(orbitPivot - camPos, targetNormal);
 					}
 					else {
-						camPos = orbitCenter + yawedOffset;
+						glm::vec3 forward = glm::rotate(targetNormal, yaw, worldUp);
+						glm::vec3 pitchAxis = safeNormalize(glm::cross(forward, worldUp), right);
+						glm::vec3 rotated = glm::rotate(forward, pitch, pitchAxis);
+
+						float upDot = glm::dot(safeNormalize(rotated, targetNormal), worldUp);
+						if (std::abs(upDot) < 0.98f) {
+							targetNormal = safeNormalize(rotated, targetNormal);
+						}
+						else {
+							targetNormal = safeNormalize(forward, targetNormal);
+						}
 					}
-					targetNormal = safeNormalize(orbitCenter - camPos, targetNormal);
 				}
 			}
 		}

@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <iomanip>
+#include <iostream>
 #include <limits>
 #include <sstream>
 
@@ -89,6 +91,17 @@ uint32_t alphaModeValue(const tinygltf::Material& material) {
 		return GLTF_PREVIEW_ALPHA_BLEND;
 	}
 	return GLTF_PREVIEW_ALPHA_OPAQUE;
+}
+
+std::string joinExtensions(const std::vector<std::string>& extensions) {
+	std::string result;
+	for (size_t i = 0; i < extensions.size(); ++i) {
+		if (i > 0) {
+			result += ", ";
+		}
+		result += extensions[i];
+	}
+	return result;
 }
 
 uint8_t floatToByte(float value) {
@@ -247,6 +260,105 @@ glm::vec4 averageBaseColorTexture(const tinygltf::Model& model, int textureIndex
 	return sum / static_cast<float>(pixelCount);
 }
 
+struct TextureChannelStats {
+	bool valid = false;
+	float min = 0.0f;
+	float mean = 0.0f;
+	float max = 0.0f;
+};
+
+TextureChannelStats textureChannelStats(const GltfPreviewTexture& texture, size_t channel) {
+	TextureChannelStats stats;
+	if (channel >= 4 || texture.width == 0 || texture.height == 0) {
+		return stats;
+	}
+
+	size_t pixelCount = static_cast<size_t>(texture.width) * static_cast<size_t>(texture.height);
+	if (texture.rgba.size() < pixelCount * 4) {
+		return stats;
+	}
+
+	stats.valid = true;
+	stats.min = 1.0f;
+	stats.max = 0.0f;
+	double sum = 0.0;
+	for (size_t i = 0; i < pixelCount; ++i) {
+		float value = texture.rgba[i * 4 + channel] / 255.0f;
+		stats.min = std::min(stats.min, value);
+		stats.max = std::max(stats.max, value);
+		sum += value;
+	}
+	stats.mean = static_cast<float>(sum / static_cast<double>(pixelCount));
+	return stats;
+}
+
+std::string channelStatsString(const TextureChannelStats& stats) {
+	if (!stats.valid) {
+		return "n/a";
+	}
+
+	std::ostringstream out;
+	out << std::fixed << std::setprecision(3)
+		<< stats.min << "/" << stats.mean << "/" << stats.max;
+	return out.str();
+}
+
+std::string previewTextureLabel(uint32_t textureIndex, const std::vector<GltfPreviewTexture>& textures) {
+	if (textureIndex == GLTF_PREVIEW_INVALID_TEXTURE) {
+		return "none";
+	}
+	if (textureIndex >= textures.size()) {
+		std::ostringstream out;
+		out << "invalid(" << textureIndex << ")";
+		return out.str();
+	}
+
+	const GltfPreviewTexture& texture = textures[textureIndex];
+	std::ostringstream out;
+	out << textureIndex << "(" << texture.width << "x" << texture.height;
+	if (!texture.name.empty()) {
+		out << ", " << texture.name;
+	}
+	out << ")";
+	return out.str();
+}
+
+void logGltfPreviewMaterialImport(
+	const tinygltf::Material& material,
+	const GltfPreviewMaterialMeta& meta,
+	const std::vector<GltfPreviewTexture>& textures,
+	size_t materialIndex
+) {
+	std::cout << "glTF preview material[" << materialIndex << "]";
+	if (!material.name.empty()) {
+		std::cout << " '" << material.name << "'";
+	}
+
+	std::cout
+		<< ": baseColorFactor=("
+		<< meta.baseColorFactor.r << ", "
+		<< meta.baseColorFactor.g << ", "
+		<< meta.baseColorFactor.b << ", "
+		<< meta.baseColorFactor.a << ")"
+		<< " roughnessFactor=" << meta.roughness
+		<< " metallicFactor=" << meta.metalness
+		<< " textures baseColor=" << previewTextureLabel(meta.baseColorTexture, textures)
+		<< " metallicRoughness=" << previewTextureLabel(meta.metallicRoughnessTexture, textures)
+		<< " normal=" << previewTextureLabel(meta.normalTexture, textures)
+		<< " occlusion=" << previewTextureLabel(meta.occlusionTexture, textures)
+		<< " emissive=" << previewTextureLabel(meta.emissiveTexture, textures);
+
+	if (meta.metallicRoughnessTexture != GLTF_PREVIEW_INVALID_TEXTURE &&
+		meta.metallicRoughnessTexture < textures.size()) {
+		const GltfPreviewTexture& texture = textures[meta.metallicRoughnessTexture];
+		std::cout
+			<< " mrG(min/mean/max)=" << channelStatsString(textureChannelStats(texture, 1))
+			<< " mrB(min/mean/max)=" << channelStatsString(textureChannelStats(texture, 2));
+	}
+
+	std::cout << std::endl;
+}
+
 PBRMaterial convertMaterial(
 	const tinygltf::Model& model,
 	const tinygltf::Material& material,
@@ -336,6 +448,61 @@ std::string resolveScenePath(const std::string& requestedPath) {
 	}
 
 	return requestedPath;
+}
+
+bool loadImageDataWithFallback(
+	tinygltf::Image* image,
+	const int imageIdx,
+	std::string* err,
+	std::string* warn,
+	int reqWidth,
+	int reqHeight,
+	const unsigned char* bytes,
+	int size,
+	void* userData
+) {
+	(void)err;
+	(void)userData;
+	std::string localErr;
+	std::string localWarn;
+	bool loaded = tinygltf::LoadImageData(
+		image,
+		imageIdx,
+		&localErr,
+		&localWarn,
+		reqWidth,
+		reqHeight,
+		bytes,
+		size,
+		userData
+	);
+	if (loaded) {
+		if (!localWarn.empty() && warn) {
+			*warn += localWarn;
+		}
+		return true;
+	}
+
+	const std::string fallbackName = image && !image->name.empty() ? image->name : std::string();
+	if (warn) {
+		if (!localErr.empty()) {
+			*warn += localErr;
+		}
+		else if (!localWarn.empty()) {
+			*warn += localWarn;
+		}
+		*warn += "Falling back to 1x1 white texture for image[" + std::to_string(imageIdx) +
+			"] name = \"" + fallbackName + "\".\n";
+	}
+
+	image->width = 1;
+	image->height = 1;
+	image->component = 4;
+	image->bits = 8;
+	image->pixel_type = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+	image->as_is = false;
+	image->image = { 255, 255, 255, 255 };
+	return true;
 }
 
 glm::mat4 nodeLocalMatrix(const tinygltf::Node& node) {
@@ -1280,6 +1447,7 @@ bool loadGltfPreviewScene(const std::string& requestedPath, GltfPreviewScene& sc
 	scene.sourcePath = resolveScenePath(requestedPath);
 
 	tinygltf::TinyGLTF loader;
+	loader.SetImageLoader(loadImageDataWithFallback, nullptr);
 
 	tinygltf::Model model;
 	std::string error;
@@ -1304,12 +1472,9 @@ bool loadGltfPreviewScene(const std::string& requestedPath, GltfPreviewScene& sc
 		return false;
 	}
 
+	std::string requiredExtensionWarning;
 	if (!model.extensionsRequired.empty()) {
-		scene.status = "Unsupported required glTF extension: " + model.extensionsRequired[0];
-		for (size_t i = 1; i < model.extensionsRequired.size(); ++i) {
-			scene.status += ", " + model.extensionsRequired[i];
-		}
-		return false;
+		requiredExtensionWarning = "preview ignored required glTF extensions: " + joinExtensions(model.extensionsRequired);
 	}
 
 	scene.stats.nodeCount = static_cast<uint32_t>(model.nodes.size());
@@ -1326,7 +1491,8 @@ bool loadGltfPreviewScene(const std::string& requestedPath, GltfPreviewScene& sc
 	for (int textureIndex = 0; textureIndex < static_cast<int>(model.textures.size()); ++textureIndex) {
 		scene.textures.push_back(convertTexture(model, textureIndex));
 	}
-	for (const tinygltf::Material& material : model.materials) {
+	for (size_t materialIndex = 0; materialIndex < model.materials.size(); ++materialIndex) {
+		const tinygltf::Material& material = model.materials[materialIndex];
 		GltfPreviewMaterialMeta meta;
 		float opacity = 1.0f;
 		float transmission = 0.0f;
@@ -1334,6 +1500,7 @@ bool loadGltfPreviewScene(const std::string& requestedPath, GltfPreviewScene& sc
 		scene.materialMeta.push_back(meta);
 		scene.materialOpacity.push_back(opacity);
 		scene.materialTransmission.push_back(transmission);
+		logGltfPreviewMaterialImport(material, meta, scene.textures, materialIndex);
 	}
 	uint32_t defaultMaterialIndex = static_cast<uint32_t>(scene.materials.size());
 	scene.materials.push_back(makeDefaultMaterial());
@@ -1387,6 +1554,9 @@ bool loadGltfPreviewScene(const std::string& requestedPath, GltfPreviewScene& sc
 		<< scene.stats.materialCount << " materials";
 	if (!warning.empty()) {
 		out << " (warning: " << warning << ")";
+	}
+	if (!requiredExtensionWarning.empty()) {
+		out << " (" << requiredExtensionWarning << ")";
 	}
 	scene.status = out.str();
 	return true;

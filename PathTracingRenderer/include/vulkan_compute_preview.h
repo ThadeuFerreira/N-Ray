@@ -38,6 +38,20 @@ struct VulkanPreviewSettings {
 	bool resetAccumulation = false;
 };
 
+// Live, per-material overrides for the glTF model preview. These values are the
+// imported PBR *factors* (baseColorFactor / roughnessFactor / metallicFactor),
+// which the shader multiplies by any bound textures. So dropping metalness to 0
+// turns a fully-metallic import back into a diffuse surface, and editing
+// baseColor re-tints an otherwise grayscale albedo. The texture flags let the UI
+// note that a slider multiplies an underlying texture.
+struct VulkanPreviewMaterialState {
+	glm::vec3 baseColor = glm::vec3(1.0f);
+	float roughness = 1.0f;
+	float metalness = 1.0f;
+	bool hasBaseColorTexture = false;
+	bool hasMetallicRoughnessTexture = false;
+};
+
 struct GpuStats {
 	double gpuDispatchMs = 0.0;
 	double primaryRaysPerSec = 0.0;
@@ -81,11 +95,24 @@ public:
 	static int shaderCount();
 	static const char* shaderName(int index);
 	static bool isModelPreviewIndex(int index);
+	// Index of the first shader that renders an imported glTF model, or -1 if the
+	// build has no model-preview shader. Used to auto-activate model preview on import.
+	static int modelPreviewShaderIndex();
 	bool setModel(int index);
 	int modelIndex() const;
 	static int modelCount();
 	static const char* modelName(int index);
+	int importModelFromFolder(const std::string& folderPath);
 	bool modelBounds(glm::vec3& boundsMin, glm::vec3& boundsMax) const;
+
+	// Live material overrides for the active glTF model preview. materialCount()
+	// is 0 unless a model's buffers are loaded. setMaterialState re-uploads the
+	// material SSBO and restarts accumulation; resetMaterialStates restores the
+	// as-imported factors.
+	int materialCount() const;
+	bool materialState(int index, VulkanPreviewMaterialState& out) const;
+	bool setMaterialState(int index, const VulkanPreviewMaterialState& state);
+	void resetMaterialStates();
 
 private:
 	struct Impl;

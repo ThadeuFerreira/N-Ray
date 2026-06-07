@@ -239,7 +239,7 @@ vec4 sampleSceneTexture(uint textureIndex, vec2 uv, vec4 fallback) {
 	if (!validTexture(textureIndex)) {
 		return fallback;
 	}
-	return texture(sceneTextures[nonuniformEXT(textureIndex)], uv);
+	return textureLod(sceneTextures[nonuniformEXT(textureIndex)], uv, 0.0);
 }
 
 vec2 interpolateUv(GpuTriShading shading, float hitU, float hitV) {

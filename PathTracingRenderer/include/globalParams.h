@@ -6,6 +6,11 @@
 #include <render_types.h>
 #include <pbr_model.h>
 
+// Allowed range for progressive sample accumulation. Single source of truth
+// shared by the CPU path tracer, the Vulkan preview driver, and the UI slider.
+inline constexpr int kMinSamples = 1;
+inline constexpr int kMaxSamples = 1000;
+
 struct Data {
 	std::vector<Tri> tris;
 	std::vector<TriIntersect> triIsect;
@@ -24,7 +29,7 @@ struct Params {
 	int res = 512;
 
 	int maxBounces = 5;
-	int maxSamples = 50000;
+	int maxSamples = 10;
 	int raysPerPixel = 1;
 	int currentSample = 0;
 

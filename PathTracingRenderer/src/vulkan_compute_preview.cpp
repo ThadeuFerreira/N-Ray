@@ -6,12 +6,19 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <filesystem>
+#include <fstream>
 #include <glm/glm.hpp>
+#include <iostream>
+#include <optional>
 #include <sstream>
 #include <vector>
+
+#include <json.hpp>
 
 #include "vulkan_triangle_spv.h"
 #include "tut28_star_nest_comp_spv.h"
@@ -134,8 +141,10 @@ struct ShaderEntry {
 };
 
 struct ModelEntry {
-	const char* name;
-	const char* path;
+	std::string name;       // display name (folder name, or overridden in settings)
+	std::string scenePath;  // resolved .gltf/.glb scene file (generic absolute path)
+	std::string folderPath; // canonical model folder, persisted to project_settings.json
+	std::string folderKey;  // normalized folder path used for dedup comparison
 };
 
 static const ShaderEntry kShaders[] = {
@@ -145,7 +154,7 @@ static const ShaderEntry kShaders[] = {
 	{ "Spiral Galaxy",              tut28_spiral_galaxy_comp_spv,           tut28_spiral_galaxy_comp_spv_len,           false },
 	{ "Battered Alien Planet",      tut28_battered_alien_planet_comp_spv,   tut28_battered_alien_planet_comp_spv_len,   false },
 	{ "Flux Core",                  tut28_flux_core_comp_spv,               tut28_flux_core_comp_spv_len,               false },
-	{ "Nissan S15 glTF Model",      nray_vulkan_gltf_flat_comp_spv,         nray_vulkan_gltf_flat_comp_spv_len,         true  },
+	{ "glTF Model Preview",         nray_vulkan_gltf_flat_comp_spv,         nray_vulkan_gltf_flat_comp_spv_len,         true  },
 };
 static const int kShaderCount = static_cast<int>(sizeof(kShaders) / sizeof(kShaders[0]));
 
@@ -161,17 +170,266 @@ static constexpr uint32_t kBindingAccum    = 5;
 static constexpr uint32_t kBindingSettings = 6;
 static constexpr uint32_t kBindingTextures = 7;
 
-static const ModelEntry kModels[] = {
-	{ "Nissan S15 Silvia", "assets/2018_garage_mak_nissan_s15_silvia_-_reggie_mah/scene.gltf" },
-	{ "LB Silhouette Murcielago GT Evo", "assets/2024_lbsilhouette_works_murcielago_gt_evo/scene.gltf" },
-	{ "Torvosaurus Tanneri", "assets/accurate_torvosaurus_tanneri/scene.gltf" },
-	{ "Beretta ARX160", "assets/beretta_arx160/scene.gltf" },
-	{ "Beretta M9", "assets/beretta_m9_gameready/scene.gltf" },
-	{ "Hulk Infinity Hulk", "assets/hulk_infinity_hulk/scene.gltf" },
-	{ "Luna Snow", "assets/luna_snow_-_sonic_trailblazer/scene.gltf" },
-	{ "Wolverine X-2099", "assets/wolverine_-_wolverine_-_x-2099_bundle/scene.gltf" },
-};
-static const int kModelCount = static_cast<int>(sizeof(kModels) / sizeof(kModels[0]));
+// Imported models are persisted here (relative to the working directory, which
+// is the PathTracingRenderer/ folder where the app is run) so they reappear on
+// the next run without re-importing.
+static const char* kProjectSettingsFile = "project_settings.json";
+
+void logModelImport(const std::string& message) {
+	std::cerr << "[VulkanModelImport] " << message << '\n';
+}
+
+std::string toLowerAscii(std::string value) {
+	for (char& c : value) {
+		c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	}
+	return value;
+}
+
+bool pathExists(const std::filesystem::path& path) {
+	std::error_code ec;
+	return std::filesystem::exists(path, ec) && !ec;
+}
+
+std::filesystem::path absoluteLexicallyNormal(std::filesystem::path path) {
+	std::error_code ec;
+	std::filesystem::path absolutePath = std::filesystem::absolute(path, ec);
+	if (!ec) {
+		path = absolutePath;
+	}
+	return path.lexically_normal();
+}
+
+std::filesystem::path canonicalOrAbsolute(std::filesystem::path path) {
+	std::error_code ec;
+	std::filesystem::path canonicalPath = std::filesystem::weakly_canonical(path, ec);
+	if (!ec) {
+		return canonicalPath;
+	}
+	return absoluteLexicallyNormal(path);
+}
+
+std::string trimAscii(std::string text) {
+	while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
+		text.erase(text.begin());
+	}
+	while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+		text.pop_back();
+	}
+	return text;
+}
+
+// Resolve a (possibly relative) folder against the working directory and its
+// parent (assets live at the repo root, the app runs from PathTracingRenderer/).
+// Returns the canonical folder path if an existing directory is found.
+std::optional<std::filesystem::path> resolveExistingFolder(const std::filesystem::path& input) {
+	std::error_code ec;
+	if (input.is_absolute()) {
+		if (pathExists(input) && std::filesystem::is_directory(input, ec) && !ec) {
+			return canonicalOrAbsolute(input);
+		}
+		return std::nullopt;
+	}
+
+	std::array<std::filesystem::path, 2> candidates{
+		input,
+		std::filesystem::path("..") / input
+	};
+	for (const std::filesystem::path& candidate : candidates) {
+		if (pathExists(candidate) && std::filesystem::is_directory(candidate, ec) && !ec) {
+			return canonicalOrAbsolute(candidate);
+		}
+	}
+	return std::nullopt;
+}
+
+std::string genericPathString(const std::filesystem::path& path) {
+	std::string text = path.generic_string();
+	for (char& c : text) {
+		if (c == '\\') {
+			c = '/';
+		}
+	}
+	return text;
+}
+
+std::string normalizePathKey(std::filesystem::path path) {
+	path = canonicalOrAbsolute(path);
+	std::string text = genericPathString(path);
+
+#ifdef _WIN32
+	text = toLowerAscii(text);
+#endif
+	return text;
+}
+
+std::string sceneFileNameLower(const std::filesystem::path& path) {
+	return toLowerAscii(path.filename().string());
+}
+
+std::optional<std::filesystem::path> findSceneFileInFolder(const std::filesystem::path& folderPath) {
+	std::error_code ec;
+	if (!std::filesystem::exists(folderPath, ec) || ec) {
+		return std::nullopt;
+	}
+
+	std::optional<std::filesystem::path> sceneFile;
+	std::optional<std::filesystem::path> fallbackSceneFile;
+	std::error_code iterEc;
+	for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(folderPath, iterEc)) {
+		if (iterEc) {
+			return std::nullopt;
+		}
+		if (!entry.is_regular_file()) {
+			continue;
+		}
+
+		const std::string ext = toLowerAscii(entry.path().extension().string());
+		if (ext != ".gltf" && ext != ".glb") {
+			continue;
+		}
+
+		std::string fileName = sceneFileNameLower(entry.path());
+		if (fileName == "scene.gltf" && !sceneFile.has_value()) {
+			sceneFile = entry.path();
+			break;
+		}
+		if (!fallbackSceneFile.has_value()) {
+			fallbackSceneFile = entry.path();
+		}
+	}
+
+	if (sceneFile.has_value()) {
+		return sceneFile;
+	}
+
+	return fallbackSceneFile;
+}
+
+// Build a ModelEntry from an existing (already resolved) folder by locating its
+// .gltf/.glb scene file. Returns nullopt when the folder has no scene file.
+std::optional<ModelEntry> buildModelEntryForFolder(const std::filesystem::path& folder) {
+	std::optional<std::filesystem::path> sceneFile = findSceneFileInFolder(folder);
+	if (!sceneFile.has_value()) {
+		return std::nullopt;
+	}
+
+	std::string folderName = folder.filename().string();
+	if (folderName.empty()) {
+		folderName = folder.string();
+	}
+	if (folderName.empty()) {
+		folderName = "Imported glTF Model";
+	}
+
+	ModelEntry entry;
+	entry.name = folderName;
+	entry.scenePath = genericPathString(canonicalOrAbsolute(*sceneFile));
+	entry.folderPath = genericPathString(folder);
+	entry.folderKey = normalizePathKey(folder);
+	return entry;
+}
+
+void saveModelEntriesToSettings(const std::vector<ModelEntry>& entries) {
+	nlohmann::json root;
+	root["models"] = nlohmann::json::array();
+	for (const ModelEntry& entry : entries) {
+		nlohmann::json item;
+		item["name"] = entry.name;
+		item["folder"] = entry.folderPath;
+		root["models"].push_back(item);
+	}
+
+	std::ofstream out(kProjectSettingsFile, std::ios::trunc);
+	if (!out.is_open()) {
+		logModelImport(std::string("failed to write ") + kProjectSettingsFile);
+		return;
+	}
+	out << root.dump(4) << '\n';
+	logModelImport("saved " + std::to_string(entries.size()) + " model(s) to " + kProjectSettingsFile);
+}
+
+std::vector<ModelEntry> loadModelEntriesFromSettings() {
+	std::vector<ModelEntry> entries;
+
+	std::error_code ec;
+	if (!std::filesystem::exists(kProjectSettingsFile, ec) || ec) {
+		return entries;
+	}
+
+	std::ifstream in(kProjectSettingsFile);
+	if (!in.is_open()) {
+		return entries;
+	}
+
+	nlohmann::json root;
+	try {
+		in >> root;
+	}
+	catch (const std::exception& e) {
+		logModelImport(std::string("failed to parse ") + kProjectSettingsFile + ": " + e.what());
+		return entries;
+	}
+
+	if (!root.contains("models") || !root["models"].is_array()) {
+		return entries;
+	}
+
+	for (const nlohmann::json& item : root["models"]) {
+		std::string folder;
+		std::string overrideName;
+		if (item.is_string()) {
+			folder = item.get<std::string>();
+		}
+		else if (item.is_object()) {
+			if (item.contains("folder") && item["folder"].is_string()) {
+				folder = item["folder"].get<std::string>();
+			}
+			if (item.contains("name") && item["name"].is_string()) {
+				overrideName = item["name"].get<std::string>();
+			}
+		}
+
+		folder = trimAscii(folder);
+		if (folder.empty()) {
+			continue;
+		}
+
+		std::optional<std::filesystem::path> resolved = resolveExistingFolder(folder);
+		if (!resolved.has_value()) {
+			logModelImport("settings model folder missing, skipping: " + folder);
+			continue;
+		}
+
+		std::optional<ModelEntry> entry = buildModelEntryForFolder(*resolved);
+		if (!entry.has_value()) {
+			logModelImport("settings model folder has no .gltf/.glb, skipping: " + folder);
+			continue;
+		}
+		if (!overrideName.empty()) {
+			entry->name = overrideName;
+		}
+
+		bool duplicate = false;
+		for (const ModelEntry& existing : entries) {
+			if (existing.folderKey == entry->folderKey) {
+				duplicate = true;
+				break;
+			}
+		}
+		if (!duplicate) {
+			entries.push_back(std::move(*entry));
+		}
+	}
+
+	logModelImport("loaded " + std::to_string(entries.size()) + " model(s) from " + kProjectSettingsFile);
+	return entries;
+}
+
+std::vector<ModelEntry>& activeModelEntries() {
+	static std::vector<ModelEntry> entries = loadModelEntriesFromSettings();
+	return entries;
+}
 
 }
 
@@ -251,6 +509,11 @@ struct VulkanComputePreview::Impl {
 	bool intelGpu = false;
 	GltfPreviewScene modelScene;
 	bool modelBuffersReady = false;
+	// Host-side mirror of the SCENE_MATERIAL SSBO. `materialsOriginal` is the
+	// as-imported pack; `materialsCurrent` carries live UI overrides. Both are
+	// repopulated on every model load and cleared when buffers are torn down.
+	std::vector<GpuMaterial> materialsOriginal;
+	std::vector<GpuMaterial> materialsCurrent;
 	// triCount, bvhNodeCount, materialCount, textureCount — cached once at load so
 	// render() doesn't recompute the (constant) sizes every frame.
 	glm::uvec4 sceneCounts = glm::uvec4(0u);
@@ -279,7 +542,7 @@ struct VulkanComputePreview::Impl {
 	uint32_t frameCount = 0;
 
 	int selectedShader = 0;
-	int selectedModel = 0;
+	int selectedModel = -1;
 	int renderWidth = 0;
 	int renderHeight = 0;
 	bool initialized = false;
@@ -379,6 +642,17 @@ struct VulkanComputePreview::Impl {
 		}
 
 		const ShaderEntry& selectedEntry = kShaders[selectedShader >= 0 && selectedShader < kShaderCount ? selectedShader : 0];
+		if (selectedEntry.requiresModel && !modelBuffersReady) {
+			status = "Cannot render glTF model preview: no model buffers are ready";
+			if (!modelScene.status.empty()) {
+				status += "\n";
+				status += modelScene.status;
+			}
+			return false;
+		}
+
+		// The [kMinSamples, kMaxSamples] policy is enforced upstream by the driver
+		// and UI; here we only guard against a non-positive dispatch count.
 		maxSamplesCached = static_cast<uint32_t>(std::max(1, settings.maxSamples));
 		if (settings.resetAccumulation) {
 			resetAccumState();
@@ -672,6 +946,8 @@ struct VulkanComputePreview::Impl {
 		maxSamplesCached = 1;
 		modelBuffersReady = false;
 		modelScene = {};
+		materialsOriginal.clear();
+		materialsCurrent.clear();
 		sceneCounts = glm::uvec4(0u);
 		textureDescriptorCount = 1;
 		initialized = false;
@@ -788,6 +1064,51 @@ struct VulkanComputePreview::Impl {
 	void resetAccumState() {
 		currentSample = 0;
 		accumNeedsClear = true;
+	}
+
+	// Re-upload the host material mirror into the (host-visible) SCENE_MATERIAL
+	// SSBO. Safe to call between frames: render() fully fences each dispatch, so
+	// the GPU is not reading the buffer here.
+	bool updateMaterialBuffer() {
+		StorageBuffer& buffer = sceneBuffers[SCENE_MATERIAL];
+		if (buffer.memory == VK_NULL_HANDLE || materialsCurrent.empty()) {
+			return false;
+		}
+		size_t byteSize = std::min(materialsCurrent.size() * sizeof(GpuMaterial), buffer.size);
+		void* mapped = nullptr;
+		VkResult result = vkMapMemory(device, buffer.memory, 0, buffer.allocationSize, 0, &mapped);
+		if (result != VK_SUCCESS) {
+			return failVk("vkMapMemory material update", result);
+		}
+		std::memcpy(mapped, materialsCurrent.data(), byteSize);
+		bool flushed = flushMappedRange(buffer.memory, buffer.memoryCoherent, "vkFlushMappedMemoryRanges material update");
+		vkUnmapMemory(device, buffer.memory);
+		return flushed;
+	}
+
+	bool setMaterialState(int index, const VulkanPreviewMaterialState& state) {
+		if (index < 0 || index >= static_cast<int>(materialsCurrent.size())) {
+			return false;
+		}
+		GpuMaterial& material = materialsCurrent[static_cast<size_t>(index)];
+		material.baseColor = glm::vec4(state.baseColor, material.baseColor.w);
+		material.params.x = std::clamp(state.roughness, 0.0f, 1.0f);
+		material.params.y = std::clamp(state.metalness, 0.0f, 1.0f);
+		if (!updateMaterialBuffer()) {
+			return false;
+		}
+		resetAccumState();
+		return true;
+	}
+
+	void resetMaterialStates() {
+		if (materialsOriginal.empty() || materialsCurrent.size() != materialsOriginal.size()) {
+			return;
+		}
+		materialsCurrent = materialsOriginal;
+		if (updateMaterialBuffer()) {
+			resetAccumState();
+		}
 	}
 
 	// Flush a host write to non-coherent mapped memory so the device sees it.
@@ -1371,6 +1692,12 @@ struct VulkanComputePreview::Impl {
 			uploadBytes = &fallback.rgba;
 		}
 
+		std::cout << "Vulkan glTF texture upload";
+		if (!source.name.empty()) {
+			std::cout << " '" << source.name << "'";
+		}
+		std::cout << ": " << width << "x" << height << " bytes=" << expectedBytes << std::endl;
+
 		VkBuffer stagingBuffer = VK_NULL_HANDLE;
 		VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
 		VkDeviceSize stagingAllocationSize = 0;
@@ -1618,28 +1945,74 @@ struct VulkanComputePreview::Impl {
 		modelBuffersReady = false;
 		sceneCounts = glm::uvec4(0u);
 		modelScene = {};
+		materialsOriginal.clear();
+		materialsCurrent.clear();
 		for (StorageBuffer& buffer : sceneBuffers) {
 			destroyStorageBuffer(buffer);
 		}
 		destroyTextureResources();
 
-		int modelIndex = selectedModel >= 0 && selectedModel < kModelCount ? selectedModel : 0;
-		if (!loadGltfPreviewScene(kModels[modelIndex].path, modelScene)) {
-			if (!modelScene.status.empty()) {
-				modelScene.status = std::string(kModels[modelIndex].name) + ": " + modelScene.status;
-			}
+		auto& models = activeModelEntries();
+		if (selectedModel < 0 || selectedModel >= static_cast<int>(models.size())) {
+			// No model selected (fresh start, or none imported yet). Keep the
+			// preview usable for the shader-only modes by creating the fallback
+			// texture array the descriptor set requires; model preview becomes
+			// available once a model is selected/imported.
+			logModelImport("loadModelSceneResources: no model selected; using fallback textures");
 			if (!createFallbackTextureResources()) {
+				status = "Vulkan fallback texture creation failed";
 				return false;
 			}
+			modelScene = {};
+			modelScene.status = models.empty()
+				? "No glTF models registered. Import a model folder to enable model preview."
+				: "No glTF model selected.";
 			return true;
 		}
-		modelScene.status = std::string(kModels[modelIndex].name) + ": " + modelScene.status;
+
+		const int modelIndex = selectedModel;
+		const ModelEntry& modelEntry = models[modelIndex];
+		{
+			std::ostringstream out;
+			out << "loading model resources index=" << modelIndex
+				<< " name=\"" << modelEntry.name << "\""
+				<< " scene=\"" << modelEntry.scenePath << "\"";
+			logModelImport(out.str());
+		}
+		if (!loadGltfPreviewScene(modelEntry.scenePath, modelScene)) {
+			if (!modelScene.status.empty()) {
+				modelScene.status = modelEntry.name + " (" + modelEntry.scenePath + "): " + modelScene.status;
+			}
+			status = modelScene.status;
+			logModelImport("glTF load failed: " + status);
+			return false;
+		}
+		modelScene.status = modelEntry.name + ": " + modelScene.status;
+		{
+			std::ostringstream out;
+			out << "glTF loaded index=" << modelIndex
+				<< " triangles=" << modelScene.tris.size()
+				<< " triIsect=" << modelScene.triIsect.size()
+				<< " bvhNodes=" << modelScene.flatBvh.size()
+				<< " materials=" << modelScene.materials.size()
+				<< " textures=" << modelScene.textures.size();
+			logModelImport(out.str());
+		}
 		if (!createTextureResources(modelScene.textures)) {
-			modelScene.status = "glTF model texture upload failed: " + status;
+			std::string textureFailure = status;
 			if (!createFallbackTextureResources()) {
+				modelScene.status = "glTF model texture upload failed: " + textureFailure;
+				status = modelScene.status;
+				logModelImport("texture upload failed and fallback texture creation failed: " + status);
 				return false;
 			}
-			return true;
+			modelScene.status += " (texture upload warning: " + textureFailure + "; using fallback textures)";
+			logModelImport("texture upload failed; using fallback textures: " + textureFailure);
+		}
+		else {
+			std::ostringstream out;
+			out << "textures ready descriptorCount=" << textureDescriptorCount;
+			logModelImport(out.str());
 		}
 
 		std::vector<GpuTriIntersect> gpuTriIsect;
@@ -1706,6 +2079,11 @@ struct VulkanComputePreview::Impl {
 			});
 		}
 
+		// Keep a host mirror so the UI can override PBR factors live without
+		// re-importing the glTF (see setMaterialState/updateMaterialBuffer).
+		materialsOriginal = gpuMaterials;
+		materialsCurrent = gpuMaterials;
+
 		std::vector<GpuBvhNode> gpuBvh;
 		gpuBvh.reserve(modelScene.flatBvh.size());
 		for (const CompactBVH& node : modelScene.flatBvh) {
@@ -1722,10 +2100,12 @@ struct VulkanComputePreview::Impl {
 			!createStorageBuffer(sceneBuffers[SCENE_MATERIAL], gpuMaterials.data(), gpuMaterials.size() * sizeof(GpuMaterial)) ||
 			!createStorageBuffer(sceneBuffers[SCENE_BVH], gpuBvh.data(), gpuBvh.size() * sizeof(GpuBvhNode))) {
 			modelScene.status = "glTF model Vulkan upload failed: " + status;
+			status = modelScene.status;
+			logModelImport("scene SSBO upload failed: " + status);
 			for (StorageBuffer& buffer : sceneBuffers) {
 				destroyStorageBuffer(buffer);
 			}
-			return true;
+			return false;
 		}
 
 		sceneCounts = glm::uvec4(
@@ -1735,6 +2115,17 @@ struct VulkanComputePreview::Impl {
 			textureDescriptorCount
 		);
 		modelBuffersReady = true;
+		{
+			std::ostringstream out;
+			out << "scene buffers ready"
+				<< " triIsectBytes=" << sceneBuffers[SCENE_TRI_ISECT].size
+				<< " triShadingBytes=" << sceneBuffers[SCENE_TRI_SHADING].size
+				<< " materialBytes=" << sceneBuffers[SCENE_MATERIAL].size
+				<< " bvhBytes=" << sceneBuffers[SCENE_BVH].size
+				<< " sceneCounts=(" << sceneCounts.x << ", " << sceneCounts.y
+				<< ", " << sceneCounts.z << ", " << sceneCounts.w << ")";
+			logModelImport(out.str());
+		}
 		return true;
 	}
 
@@ -1831,6 +2222,7 @@ struct VulkanComputePreview::Impl {
 
 	bool createDescriptorPoolAndSet() {
 		if (descriptorSetLayout == VK_NULL_HANDLE) {
+			logModelImport("descriptor set creation failed: descriptor set layout missing");
 			return fail("Vulkan descriptor set layout missing");
 		}
 
@@ -1867,6 +2259,11 @@ struct VulkanComputePreview::Impl {
 		for (uint32_t binding = 0; binding < writes.size(); ++binding) {
 			if (binding == kBindingTextures) {
 				if (textureDescriptorInfos.size() != kMaxPreviewTextures) {
+					std::ostringstream out;
+					out << "descriptor set creation failed: texture descriptors not ready size="
+						<< textureDescriptorInfos.size()
+						<< " expected=" << kMaxPreviewTextures;
+					logModelImport(out.str());
 					return fail("Vulkan texture descriptor array is not ready");
 				}
 				writes[binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1906,6 +2303,13 @@ struct VulkanComputePreview::Impl {
 		}
 
 		vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+		{
+			std::ostringstream out;
+			out << "descriptor set ready modelBuffersReady=" << (modelBuffersReady ? "true" : "false")
+				<< " sceneCounts=(" << sceneCounts.x << ", " << sceneCounts.y
+				<< ", " << sceneCounts.z << ", " << sceneCounts.w << ")";
+			logModelImport(out.str());
+		}
 		return true;
 	}
 
@@ -2017,13 +2421,21 @@ struct VulkanComputePreview::Impl {
 
 	bool switchPipeline(int index) {
 		if (!initialized || index < 0 || index >= kShaderCount) {
+			std::ostringstream out;
+			out << "setShader rejected index=" << index
+				<< " initialized=" << (initialized ? "true" : "false");
+			logModelImport(out.str());
 			return false;
 		}
 		if (kShaders[index].requiresModel && !modelBuffersReady) {
 			status = "Cannot select glTF model preview\n" + modelScene.status;
+			logModelImport("setShader rejected glTF preview because model buffers are not ready: " + modelScene.status);
 			return false;
 		}
 		if (index == selectedShader) {
+			std::ostringstream out;
+			out << "setShader no-op index=" << index << " name=\"" << kShaders[index].name << "\"";
+			logModelImport(out.str());
 			return true;
 		}
 
@@ -2040,6 +2452,7 @@ struct VulkanComputePreview::Impl {
 
 		selectedShader = index;
 		if (!createPipeline()) {
+			logModelImport("setShader failed while creating pipeline: " + status);
 			initialized = false;
 			return false;
 		}
@@ -2047,28 +2460,103 @@ struct VulkanComputePreview::Impl {
 		frameCount = 0;
 		lastGpuMs = 0.0;
 		setActiveStatus();
+		{
+			std::ostringstream out;
+			out << "setShader activated index=" << selectedShader
+				<< " name=\"" << kShaders[selectedShader].name << "\"";
+			logModelImport(out.str());
+		}
 		return true;
 	}
 
 	bool switchModel(int index) {
-		if (!initialized || index < 0 || index >= kModelCount) {
+		auto& models = activeModelEntries();
+		if (!initialized || index < 0 || index >= static_cast<int>(models.size())) {
+			std::ostringstream out;
+			out << "setModel rejected index=" << index
+				<< " current=" << selectedModel
+				<< " initialized=" << (initialized ? "true" : "false")
+				<< " modelCount=" << models.size();
+			logModelImport(out.str());
 			return false;
 		}
 		if (index == selectedModel) {
+			std::ostringstream out;
+			out << "setModel no-op index=" << index
+				<< " name=\"" << models[index].name << "\"";
+			logModelImport(out.str());
 			return true;
+		}
+
+		{
+			std::ostringstream out;
+			out << "setModel requested from index=" << selectedModel
+				<< " to index=" << index
+				<< " name=\"" << models[index].name << "\""
+				<< " scene=\"" << models[index].scenePath << "\"";
+			logModelImport(out.str());
 		}
 
 		VkResult result = vkDeviceWaitIdle(device);
 		if (result != VK_SUCCESS) {
+			logModelImport("setModel failed waiting for device idle: " + vkErrorMessage("vkDeviceWaitIdle model switch", result));
 			return failVk("vkDeviceWaitIdle model switch", result);
 		}
 
+		int previousModel = selectedModel;
 		destroyDescriptorPool();
 		selectedModel = index;
-		if (!loadModelSceneResources() || !createDescriptorPoolAndSet()) {
+		bool loaded = loadModelSceneResources();
+		bool descriptorsReady = loaded && createDescriptorPoolAndSet();
+		if (!loaded || !descriptorsReady) {
+			std::string failureStatus = loaded ? status : modelScene.status;
+			if (failureStatus.empty()) {
+				failureStatus = status;
+			}
+			{
+				std::ostringstream out;
+				out << "setModel failed index=" << index
+					<< " loaded=" << (loaded ? "true" : "false")
+					<< " descriptorsReady=" << (descriptorsReady ? "true" : "false")
+					<< " status=\"" << failureStatus << "\"";
+				logModelImport(out.str());
+			}
+
 			destroyDescriptorPool();
 			modelBuffersReady = false;
 			sceneCounts = glm::uvec4(0u);
+			selectedModel = previousModel;
+
+			// Restore the previous selection and rebuild its descriptor set.
+			// loadModelSceneResources handles a -1 selection gracefully (fallback
+			// textures, no model), so this also recreates a valid descriptor set
+			// when there was no previously loaded model — without it the preview
+			// would be left with a destroyed descriptor set and crash on dispatch.
+			bool restored = loadModelSceneResources() && createDescriptorPoolAndSet();
+			{
+				std::ostringstream out;
+				out << "setModel restore previous index=" << previousModel
+					<< " restored=" << (restored ? "true" : "false");
+				if (previousModel >= 0 && previousModel < static_cast<int>(models.size())) {
+					out << " name=\"" << models[previousModel].name << "\"";
+				}
+				logModelImport(out.str());
+			}
+			if (restored) {
+				setActiveStatus();
+				status += "\nFailed to select model: " + models[index].name;
+				if (!failureStatus.empty()) {
+					status += "\n";
+					status += failureStatus;
+				}
+			}
+			else {
+				status = "Failed to select model: " + models[index].name;
+				if (!failureStatus.empty()) {
+					status += "\n";
+					status += failureStatus;
+				}
+			}
 			return false;
 		}
 
@@ -2076,7 +2564,82 @@ struct VulkanComputePreview::Impl {
 		frameCount = 0;
 		lastGpuMs = 0.0;
 		setActiveStatus();
+		{
+			std::ostringstream out;
+			out << "setModel activated index=" << selectedModel
+				<< " name=\"" << models[selectedModel].name << "\""
+				<< " triangles=" << sceneCounts.x
+				<< " bvhNodes=" << sceneCounts.y
+				<< " materials=" << sceneCounts.z
+				<< " textures=" << sceneCounts.w;
+			logModelImport(out.str());
+		}
 		return modelBuffersReady;
+	}
+
+	int importModelFromFolder(const std::string& folderPath) {
+		logModelImport("import folder requested raw=\"" + folderPath + "\"");
+		std::string rawPath = trimAscii(folderPath);
+		if (rawPath.empty()) {
+			status = "Failed to import glTF model folder: path is empty";
+			logModelImport(status);
+			return -1;
+		}
+
+		std::optional<std::filesystem::path> resolved = resolveExistingFolder(rawPath);
+		if (!resolved.has_value()) {
+			status = "Failed to import glTF model folder: directory not found (" + rawPath + ")";
+			logModelImport(status);
+			return -1;
+		}
+		std::filesystem::path folder = *resolved;
+		logModelImport("import folder canonical=\"" + genericPathString(folder) + "\"");
+
+		// Already registered? Return its index instead of adding a duplicate.
+		std::string normalizedFolder = normalizePathKey(folder);
+		auto& models = activeModelEntries();
+		for (int i = 0; i < static_cast<int>(models.size()); ++i) {
+			if (models[i].folderKey == normalizedFolder) {
+				status = "Using existing model folder: " + models[i].name;
+				std::ostringstream out;
+				out << status << " index=" << i
+					<< " scene=\"" << models[i].scenePath << "\"";
+				logModelImport(out.str());
+				return i;
+			}
+		}
+
+		std::optional<ModelEntry> entry = buildModelEntryForFolder(folder);
+		if (!entry.has_value()) {
+			status = "Failed to import glTF model folder: no .gltf/.glb file found (" + rawPath + ")";
+			logModelImport(status);
+			return -1;
+		}
+
+		std::error_code texturesEc;
+		bool hasTexturesFolder = std::filesystem::exists(folder / "textures", texturesEc)
+			&& std::filesystem::is_directory(folder / "textures", texturesEc) && !texturesEc;
+
+		models.push_back(*entry);
+		int importedIndex = static_cast<int>(models.size()) - 1;
+
+		// Persist so the model reappears automatically on the next run.
+		saveModelEntriesToSettings(models);
+
+		status = "Imported model folder: " + entry->name + " -> " + entry->scenePath;
+		if (!hasTexturesFolder) {
+			status += "\nWarning: no textures folder found in imported model folder";
+		}
+		{
+			std::ostringstream out;
+			out << "import folder added index=" << importedIndex
+				<< " name=\"" << models[importedIndex].name << "\""
+				<< " scene=\"" << models[importedIndex].scenePath << "\""
+				<< " hasTexturesFolder=" << (hasTexturesFolder ? "true" : "false")
+				<< " modelCount=" << models.size();
+			logModelImport(out.str());
+		}
+		return importedIndex;
 	}
 };
 
@@ -2150,6 +2713,13 @@ bool VulkanComputePreview::isModelPreviewIndex(int index) {
 	return kShaders[index].requiresModel;
 }
 
+int VulkanComputePreview::modelPreviewShaderIndex() {
+	for (int i = 0; i < kShaderCount; ++i) {
+		if (kShaders[i].requiresModel) return i;
+	}
+	return -1;
+}
+
 bool VulkanComputePreview::setModel(int index) {
 	return m_impl->switchModel(index);
 }
@@ -2159,12 +2729,17 @@ int VulkanComputePreview::modelIndex() const {
 }
 
 int VulkanComputePreview::modelCount() {
-	return kModelCount;
+	return static_cast<int>(activeModelEntries().size());
 }
 
 const char* VulkanComputePreview::modelName(int index) {
-	if (index < 0 || index >= kModelCount) return "Unknown";
-	return kModels[index].name;
+	const auto& models = activeModelEntries();
+	if (index < 0 || index >= static_cast<int>(models.size())) return "Unknown";
+	return models[index].name.c_str();
+}
+
+int VulkanComputePreview::importModelFromFolder(const std::string& folderPath) {
+	return m_impl->importModelFromFolder(folderPath);
 }
 
 bool VulkanComputePreview::modelBounds(glm::vec3& boundsMin, glm::vec3& boundsMax) const {
@@ -2175,6 +2750,33 @@ bool VulkanComputePreview::modelBounds(glm::vec3& boundsMin, glm::vec3& boundsMa
 	boundsMin = m_impl->modelScene.boundsMin;
 	boundsMax = m_impl->modelScene.boundsMax;
 	return true;
+}
+
+int VulkanComputePreview::materialCount() const {
+	return m_impl->modelBuffersReady ? static_cast<int>(m_impl->materialsCurrent.size()) : 0;
+}
+
+bool VulkanComputePreview::materialState(int index, VulkanPreviewMaterialState& out) const {
+	if (!m_impl->modelBuffersReady || index < 0 || index >= static_cast<int>(m_impl->materialsCurrent.size())) {
+		return false;
+	}
+	const GpuMaterial& material = m_impl->materialsCurrent[static_cast<size_t>(index)];
+	out.baseColor = glm::vec3(material.baseColor);
+	out.roughness = material.params.x;
+	out.metalness = material.params.y;
+	out.hasBaseColorTexture = material.textureIndices.x != GLTF_PREVIEW_INVALID_TEXTURE;
+	out.hasMetallicRoughnessTexture = material.textureIndices.y != GLTF_PREVIEW_INVALID_TEXTURE;
+	return true;
+}
+
+bool VulkanComputePreview::setMaterialState(int index, const VulkanPreviewMaterialState& state) {
+	return m_impl->modelBuffersReady && m_impl->setMaterialState(index, state);
+}
+
+void VulkanComputePreview::resetMaterialStates() {
+	if (m_impl->modelBuffersReady) {
+		m_impl->resetMaterialStates();
+	}
 }
 
 GpuStats VulkanComputePreview::gpuStats() const {
