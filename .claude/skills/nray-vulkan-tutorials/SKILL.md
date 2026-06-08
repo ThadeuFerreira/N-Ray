@@ -1,11 +1,17 @@
 ---
 name: nray-vulkan-tutorials
-description: Use when working on Vulkan issues in the N-Ray repository, especially compute shader experiments, Vulkan hello-world/window bring-up, VulkanCore wrapper usage, synchronization barriers, descriptor sets, shader compilation, glTF asset import/conversion/skinning/animation reference examples, Vulkan PBR pipelines (material push constants, IBL pre-computation, irradiance/BRDF-LUT/prefiltered-cube descriptor layouts, textured PBR with tangent vertex attributes), hardware ray tracing (VK_KHR_ray_tracing_pipeline, BLAS/TLAS build, SBT layout, raygen/miss/closesthit/anyhit/intersection/callable shader groups, frame accumulation, glTF ray tracing with descriptor indexing, recursive secondary rays for shadows and reflections via multiple miss shaders/ray payloads/iterate-in-raygen bounce loops), or porting CPU path tracing concepts toward Vulkan compute or HW ray tracing. Always check the local ogldev tutorial tree under /home/thadeu/projects/N-Ray/tutorials/ogldev/Vulkan, the vendored glTF loaders under /home/thadeu/projects/N-Ray/tutorials/saschawillems/gltf, and the upstream Sascha Willems gltfskinning and ray tracing example guides before designing Vulkan or glTF code from scratch.
+description: Use when working on Vulkan issues in the N-Ray repository, especially compute shader experiments, Vulkan hello-world/window bring-up, VulkanCore wrapper usage, synchronization barriers, descriptor sets, shader compilation, glTF asset import/conversion/skinning/animation reference examples, Vulkan PBR pipelines (material push constants, IBL pre-computation, irradiance/BRDF-LUT/prefiltered-cube descriptor layouts, textured PBR with tangent vertex attributes), hardware ray tracing (VK_KHR_ray_tracing_pipeline, BLAS/TLAS build, SBT layout, raygen/miss/closesthit/anyhit/intersection/callable shader groups, frame accumulation, glTF ray tracing with descriptor indexing, recursive secondary rays for shadows and reflections via multiple miss shaders/ray payloads/iterate-in-raygen bounce loops), or porting CPU path tracing concepts toward Vulkan compute or HW ray tracing. Always check the local ogldev tutorial tree under /home/thadeu/projects/N-Ray/tutorials/ogldev/Vulkan, the vendored glTF loaders under /home/thadeu/projects/N-Ray/tutorials/saschawillems/gltf, and the upstream Sascha Willems gltfskinning and ray tracing example guides before designing Vulkan or glTF code from scratch. Scope is Vulkan-first: only touch CPU path-tracer internals when explicitly requested by the user.
 ---
 
 # N-Ray Vulkan Tutorials
 
 Use this skill for Vulkan-related work in `/home/thadeu/projects/N-Ray`.
+
+## Scope policy
+
+Vulkan work is the default and highest-priority path for this repository. Do not
+edit `PathTracer` internals, CPU accumulation logic, or `AsyncRenderWorker` hot
+paths unless the user explicitly commands CPU path-tracer work.
 
 ## Reference First
 
@@ -91,6 +97,25 @@ skin tutorial as the reference model:
   scene root transforms, but skinned meshes can appear 90 degrees wrong if the
   skeleton palette does not include the equivalent root/global correction.
 
+## Vulkan Compute Preview Manifest
+
+The Vulkan preview model list now persists in
+`PathTracingRenderer/project_settings.json` instead of being hardcoded. Use
+this manifest when testing import flows that cross engine/runtime seams:
+
+- On startup, `vulkan_compute_preview.cpp` loads `project_settings.json` via
+  `loadModelEntriesFromSettings()`, resolving each listed folder relative to the
+  working directory and its parent (`PathTracingRenderer/` and repo-root `..`).
+- The import path (`VulkanComputePreview::importModelFromFolder`) takes a folder,
+  resolves it, finds the first `scene.gltf`/`.glb` inside, appends a model entry,
+  and saves the updated list with `saveModelEntriesToSettings()`, rewriting folder
+  paths to canonical form.
+- The UI should treat these entries as the authoritative model list; missing
+  folders are skipped and logged, duplicates are deduplicated by normalized path.
+- A non-selected model keeps preview usable via fallback textures (`selectedModel
+  = -1`), and the model-preview shader is enabled only when a model is actively
+  loaded and `loadModelSceneResources` has built the GPU buffers.
+
 ## Compute Shader Smoke Test
 
 For the Tutorial28 compute window:
@@ -130,7 +155,10 @@ Recommended first pass:
 - Use explicit `vec4`/`uvec4`-style GPU structs to avoid `std430`/`glm::vec3` alignment mistakes.
 - Keep compact intersection data separate from shading/material data, mirroring the CPU `TriIntersect` optimization.
 - Reuse `CompactBVH` semantics in the shader: leaf when `triCount > 0`, first child at `current + 1`, second child by index, fixed local traversal stack.
-- Port `rayAABB`, `RayIntersectsTriangle`, and `traverseFlatBVH` before adding bounces or full PBR.
+- `vulkan_gltf_flat.comp` is already the transport baseline: it runs full BVH traversal plus
+  multi-bounce `rayLogic`-style shading (diffuse/specular/transmission), optional
+  shadowing modes, and Russian roulette. Use this as the parity target while extending
+  performance and runtime breadth.
 - Treat the current `VulkanComputePreview` host-visible pixel-buffer readback as a bridge only. The target renderer should write an accumulation storage image/buffer and eventually avoid CPU readback.
 
 ## Hardware Ray Tracing (VK_KHR_ray_tracing_pipeline)

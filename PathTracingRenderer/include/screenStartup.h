@@ -20,11 +20,15 @@ struct Screen {
 		screenSizeX(screenSizeX), screenSizeY(screenSizeY) {
 	}
 
-	void initScreen(int& res, std::vector<RenderPixel>& framebuffer, std::vector<glm::vec3>& accumBuffer) {
-		initScreen(res, 0.0f, 0.0f, float(GetScreenWidth()), float(GetScreenHeight()), framebuffer, accumBuffer);
-	}
-
-	void initScreen(int& res, float displayX, float displayY, float displayWidth, float displayHeight, std::vector<RenderPixel>& framebuffer, std::vector<glm::vec3>& accumBuffer) {
+	void initScreen(
+		int& res,
+		float displayX,
+		float displayY,
+		float displayWidth,
+		float displayHeight,
+		std::vector<RenderPixel>& framebuffer,
+		std::vector<glm::vec3>& accumBuffer
+	) {
 		viewportX = displayX;
 		viewportY = displayY;
 		screenSizeX = displayWidth > 1.0f ? displayWidth : 1.0f;
@@ -37,6 +41,22 @@ struct Screen {
 
 		framebuffer.resize(resX * resY);
 		accumBuffer.resize(resX * resY);
+	}
+
+	void initScreen(
+		int& res,
+		std::vector<RenderPixel>& framebuffer,
+		std::vector<glm::vec3>& accumBuffer
+	) {
+		initScreen(
+			res,
+			0.0f,
+			0.0f,
+			float(GetScreenWidth()),
+			float(GetScreenHeight()),
+			framebuffer,
+			accumBuffer
+		);
 	}
 
 };

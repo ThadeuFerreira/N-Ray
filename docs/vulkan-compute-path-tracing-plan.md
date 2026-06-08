@@ -25,8 +25,9 @@ The current Vulkan milestone is `VulkanComputePreview`:
 - `PathTracingRenderer/shaders/vulkan_gltf_flat.comp` is the first scene-buffer
   preview mode: TinyGLTF loads the local Nissan S15 validation asset, the CPU
   flattens it into `TriIntersect`, triangle shading, material, and compact BVH
-  storage buffers, and the shader performs primary-ray BVH traversal with simple
-  one-hit lighting.
+  storage buffers, and the shader performs full path-tracing transport: per-pixel
+  primary-ray BVH traversal, multi-bounce BSDF/event selection, transmission,
+  Russian roulette, and optional shadow-modes.
 - The CPU copies that RGBA buffer into the existing raylib `Texture2D`, so the
   app can keep its raylib/rlImGui window while Vulkan compute is proven inside
   the real runtime.
@@ -62,26 +63,42 @@ raylib vertex buffers directly to compute shaders.
 Prefer explicit `vec4`-style layouts over raw `vec3` structs. GLSL `std430`
 alignment is easy to get wrong when C++ structs contain `glm::vec3`.
 
-Initial descriptor set proposal:
+Current descriptor set contract (host-visible bridge path):
 
 ```glsl
-layout(std430, set = 0, binding = 0) readonly buffer TriIntersectBuffer {
+layout(std430, set = 0, binding = 0) buffer PixelBuffer {
+    uint pixels[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer TriIntersectBuffer {
     GpuTriIntersect triIsect[];
 };
 
-layout(std430, set = 0, binding = 1) readonly buffer TriShadingBuffer {
+layout(std430, set = 0, binding = 2) readonly buffer TriShadingBuffer {
     GpuTriShading tris[];
 };
 
-layout(std430, set = 0, binding = 2) readonly buffer MaterialBuffer {
+layout(std430, set = 0, binding = 3) readonly buffer MaterialBuffer {
     GpuMaterial materials[];
 };
 
-layout(std430, set = 0, binding = 3) readonly buffer BvhBuffer {
+layout(std430, set = 0, binding = 4) readonly buffer BvhBuffer {
     GpuBvhNode bvhNodes[];
 };
 
-layout(set = 0, binding = 4, rgba32f) uniform image2D accumulationImage;
+layout(std430, set = 0, binding = 5) buffer AccumBuffer {
+    vec4 accum[];
+};
+
+layout(std430, set = 0, binding = 6) readonly buffer SettingsBuffer {
+    GpuSettings cfg;
+};
+
+layout(binding = 7) uniform sampler2D sceneTextures[256];
+
+layout(std430, set = 0, binding = 8) buffer ShadowMapBuffer {
+    uint shadowMap[];
+};
 ```
 
 Use push constants or a small uniform buffer for camera, frame index, resolution,
@@ -204,13 +221,15 @@ Progressive path tracing needs separate accumulation state:
    for one validation asset. Next, populate the same contract from `Data`,
    `data.triIsect`, `data.materials`, and `globalCompactBVH`, then move mostly
    static scene data to VMA-backed device-local buffers.
-2. **Closest-hit debug shader:** the glTF preview now renders flat one-hit
-   lighting through BVH traversal. Add debug modes for normal, material id, and
-   traversal heat visualization before bounces.
-3. **One-bounce material shader:** port diffuse/specular/refraction pieces from
-   `rayLogic` after the closest-hit path is stable.
-4. **Progressive accumulation:** add sample index, RNG, accumulation image, and
-   reset rules.
+2. **Transport-path shader:** the glTF preview now runs full multi-bounce
+   transport through the BVH + `rayLogic` parity loop (diffuse/specular/transmission,
+   optional shadow modes, and Russian roulette).
+3. **Feature parity/debug:** compare shader debug modes (normal, material id,
+   traversal heat, stack overflow), then tighten direct-feature parity against CPU
+   behavior before broader renderer re-architecture.
+4. **Progressive accumulation target:** host-visible accumulation is in place.
+   Next steps move accumulation storage to VMA-backed, device-local resources and a
+   dedicated Vulkan display path.
 5. **CPU readback removal:** replace the current host-visible pixel readback with
    a Vulkan-native display path or a deliberate graphics interop layer.
 6. **Asset expansion:** only after the buffer contract is stable, add glTF/Assimp

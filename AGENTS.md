@@ -4,7 +4,23 @@ This file provides guidance to coding agents working in this repository. It mirr
 
 ## Overview
 
-N-Ray is a CPU path tracing renderer (educational project). It uses **raylib** for windowing/input/texture display, **Dear ImGui** (via rlImGui) for the UI, **glm** for math, and **OpenMP** for multithreading. Rendering is progressive and runs on a **background worker thread**: samples accumulate until the camera moves or a render setting changes. The long-term goal is a Vulkan GPU port — the CPU path has been optimized as far as it reasonably goes (see **Performance** below).
+N-Ray's current primary engineering direction is Vulkan GPU rendering and optimization.
+The long-term target is a full Vulkan compute/HW-accelerated path-tracing path, with
+the existing CPU path tracer retained as a known-good reference/fallback. The renderer
+uses **raylib** for windowing/input/texture display, **Dear ImGui** (via rlImGui) for
+the UI, **glm** for math, and **OpenMP** for CPU multithreading. Rendering is
+progressive and runs on a **background worker thread**: samples accumulate until the
+camera moves or a render setting changes.
+
+## Scope policy
+
+- Vulkan-first development is the default for all optimization and new feature work.
+- Do **not** modify `PathTracer`/CPU traversal/shading internals, `AsyncRenderWorker`,
+  or other CPU path-tracer hot paths unless the user explicitly asks for CPU path-tracer
+  work.
+- If a task can be done entirely in the Vulkan stack (preview, denoising,
+  glTF upload/shading, synchronization, descriptor layout, GPU debug/profiling), keep CPU
+  code unchanged.
 
 ## Skills
 
@@ -12,6 +28,7 @@ Project skills live in `.claude/skills/` as one folder per skill, each with a `S
 
 - `.claude/skills/nray-vulkan-tutorials/SKILL.md` - use for Vulkan issues, compute shader experiments, Tutorial28/VulkanCore references, vendored glTF import reference examples (`tutorials/saschawillems/gltf/`), upstream glTF skinning guidance, descriptor/synchronization/debugging work, Vulkan PBR pipelines (material push constants, IBL pre-computation via BRDF LUT/irradiance cube/prefiltered cube, textured PBR with tangent vertex attributes), hardware ray tracing (VK_KHR_ray_tracing_pipeline, BLAS/TLAS build, SBT layout, raygen/miss/closesthit/anyhit/intersection/callable shader groups, frame accumulation, glTF ray tracing with descriptor indexing, recursive secondary rays for shadows and reflections — multiple miss shaders, ray payloads, iterate-in-raygen bounce loops), and porting the CPU path tracer toward Vulkan compute or HW ray tracing.
 - `.claude/skills/cpp-smart-pointers/SKILL.md` - use for C++ ownership/lifetime changes, asset/resource registry design, buffer/texture/mesh lifetime reviews, or audits for hidden allocations and smart-pointer traffic in hot render paths.
+- `.claude/skills/task-completion-gates/SKILL.md` - use for mandatory completion checks: never finish work until relevant build/link targets succeed.
 
 When a skill applies, read its `SKILL.md` before designing or changing code.
 
@@ -31,6 +48,11 @@ make clean             # rm -rf build bin obj (keeps the raylib lib)
 make distclean         # also clean the vendored raylib objects/lib
 ```
 
+### Completion gate
+
+- Before ending a task, run the relevant build target(s) for the modified code path and ensure they complete without compile or link errors.
+- If any build/link failure appears, fix the error(s) and rerun until the command is green.
+
 `premake5.lua` defines three configurations: **Debug**, **Release**, **Performance**. The root `Makefile` is a hand-written wrapper. `premake5.lua` sets `location "build"`, so `premake5 gmake2` generates the workspace makefiles **under `build/`** (not the repo root — don't remove `location` or premake will clobber the wrapper `Makefile`). The compiled binary lands at `bin/<Config>/PathTracingRenderer`. On Windows, open `PathTracingRenderer.sln` in VS2022 (x64). `premake5.lua` is the source of truth for project config (sources, include dirs, per-platform links/flags) — edit it, not the generated files.
 
 **raylib on Linux is built from the vendored source** at `vendor/raylib/` (there is no system raylib and the headers under `PathTracingRenderer/external/raylib/` ship without a compiled library). The wrapper `make` builds `vendor/raylib/src/libraylib.a` via raylib's own Makefile; `premake5.lua` adds `vendor/raylib/src` to `includedirs` (ahead of the bundled headers, so versions match) and `libdirs`. **`vendor/raylib/src/config.h` must have `SUPPORT_FILEFORMAT_HDR 1`** — raylib disables HDR loading by default, and the renderer wants to load `textures/HDRI.hdr`. If the lib is built without it, `LoadImage` returns an empty image; the renderer falls back to the procedural sky (`hdriLogic`/`makeRenderEnvironment` guard against an invalid image) instead of crashing, but the HDRI won't appear.
@@ -38,6 +60,8 @@ make distclean         # also clean the vendored raylib objects/lib
 **Run from a directory containing `models/` and `textures/`** (use `make run`, or `cd PathTracingRenderer`). Asset paths are relative to the working directory (CWD), not the binary, and these assets live under `PathTracingRenderer/`. The scene is composed in `loadSceneLayer()` as a series of `ObjImporter{...}` declarations; a missing OBJ prints "Could not open file" and is skipped rather than aborting (e.g. `models/dragon.obj`, referenced but not present). Note `SetTraceLogLevel(LOG_NONE)` suppresses raylib's own warnings, so asset-load failures are otherwise silent.
 
 **Top-level `assets/` is the validation corpus for glTF/Vulkan importer work.** Use local `assets/*/scene.gltf` or `.glb` bundles as the first source of validation models before downloading external samples. Keep each bundle's scene file, binary buffers, textures, and license/source files co-located. These validation assets are separate from the current `PathTracingRenderer/models/` OBJ runtime scene and should be used when checking future glTF parsing, PBR material conversion, texture color-space handling, and Vulkan upload paths.
+
+**Vulkan compute preview model list lives in `PathTracingRenderer/project_settings.json`, not in code.** The "Vulkan Mode" model dropdown is populated from that manifest (`{"models":[{"name","folder"}, …]}`). There are **no hardcoded models** — `vulkan_compute_preview.cpp` reads the manifest once via `activeModelEntries()`/`loadModelEntriesFromSettings()` (folders resolve relative to CWD and its parent, so repo-root `assets/<dir>` entries work when run from `PathTracingRenderer/`). The "Import Model Folder" / Browse / Paste UI calls `VulkanComputePreview::importModelFromFolder`, which finds the folder's `scene.gltf`/`.glb`, appends a `ModelEntry`, and **persists the updated list back to `project_settings.json`** (rewriting folders to canonical paths) so imports survive across runs. Missing folders are logged and skipped, not fatal. No model is loaded into GPU buffers at startup (`selectedModel` starts at `-1`): the preview always comes up for the shader-only modes, and selecting/importing a model lazily uploads its buffers and switches to the model-preview shader. Touching the model list from more than the main thread would need synchronization — today it is main-thread only.
 
 There are **no automated tests** — verification is manual (run the renderer, move the camera, use the debug ray / stats panel). For a quick headless throughput check, `src/renderer.cpp` can be compiled against a tiny standalone harness with no window (leave `RenderEnvironment` invalid to use the procedural sky). See README.md for controls (WASD + RMB camera, LMB debug ray / model select / click-DoF).
 
@@ -54,7 +78,7 @@ There are **no automated tests** — verification is manual (run the renderer, m
 
 **Central data flow** revolves around two structs in `include/globalParams.h`:
 - `Data` — `tris` (the fat `Tri`), `triIsect` (compact intersection mirror), `materials` (`PBRMaterial`), `models` (`PTModel`), the `frameBuffer` (8-bit RGBA shown on screen) and `accumBuffer` (float HDR accumulation).
-- `Params` — all tunable render settings (`res`, `maxBounces`, `maxSamples`, `raysPerPixel`, sky/sun, exposure, contrast, `russianRoulette`/`rrMinBounces`, `renderWorkerThreads`, `renderPublishHz`) and the frame-gate flags. **`shouldSample`** gates accumulation; **`renderInvalidated`** forces a worker restart (camera/scene/setting change); **`displayInvalidated`** recomposes the existing accumulation buffer without re-tracing (exposure/contrast tweaks). `currentSample` counts accumulated samples toward `maxSamples`.
+- `Params` — all tunable render settings (`res`, `maxBounces`, `maxSamples`, `raysPerPixel`, sky/sun, exposure, contrast, `russianRoulette`/`rrMinBounces`, `renderWorkerThreads`, `renderPublishHz`) and the frame-gate flags. **`shouldSample`** gates accumulation; **`renderInvalidated`** forces a worker restart (camera/scene/setting change); **`displayInvalidated`** recomposes the existing accumulation buffer without re-tracing (exposure/contrast tweaks). `currentSample` counts accumulated samples toward `maxSamples`. **`maxSamples` is clamped to `[kMinSamples, kMaxSamples]` (= `[1, 1000]`, default `10`)** — these `inline constexpr` constants in `globalParams.h` are the single source of truth shared by the UI slider (`ui_render_settings.cpp`), the Vulkan-preview driver (`makeVulkanPreviewSettings`), and the per-frame clamp in `updatePathTraceRender`; the GPU dispatch only guards positivity. Don’t re-introduce literal min/max values — change `kMinSamples`/`kMaxSamples` if needed.
 
 **Geometry & materials (`include/tri.h`, `include/pbr_model.h`).** Materials are **not** baked into triangles anymore: `PBRMaterial` (albedo, IOR, roughness, metalness, refraction, absorption, volume, emission, etc.) lives in `data.materials`, and each `Tri` stores a `materialIdx` (plus `modelIdx`). `Tri` is still "fat" — it precomputes geometry (verts, vertex normals, edges `eA`/`eB`, face normal, AABB min/max, center). `TriIntersect` is a compact 44-byte parallel record (`a, eA, eB, idx, doubleSided`) that BVH traversal reads **instead of** the ~160-byte `Tri`; the fat `Tri` is only touched on the final hit (normals) and during shading (material lookup). `PTModel` owns triangle indices and a `materialIdx`; the UI edits `data.materials[...]` and calls `PTModel::updateTris` (`src/pbr_model.cpp`), which pushes `doubleSided` down to its triangles. `ObjImporter` (`include/objImporter.h`) is a constructor-as-loader: instantiating it appends one `PBRMaterial`, one `PTModel`, and the parsed triangles — so **scene composition is hardcoded in `loadSceneLayer`**.
 

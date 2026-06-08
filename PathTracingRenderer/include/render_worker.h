@@ -67,18 +67,43 @@ struct AsyncRenderWorker {
 	void discardFrame();
 	void start(const Params& sourceParams, const Data& sourceData, const PTCam& sourceCamera, const Screen& sourceScreen, const RenderEnvironment& sourceEnvironment, const std::vector<CompactBVH>& sourceFlatBVH);
 	void updateDisplaySettings(const Params& sourceParams, bool requestRefresh);
-	bool consumeFrame(std::vector<RenderPixel>& frameOut, std::vector<glm::vec3>& accumOut, int& sampleOut, int& raysPerPixelOut, int& resXOut, int& resYOut);
+	bool consumeFrame(
+		std::vector<RenderPixel>& frameOut,
+		std::vector<glm::vec3>& accumOut,
+		int& sampleOut,
+		int& raysPerPixelOut,
+		int& resXOut,
+		int& resYOut
+	);
 	RenderStatsSnapshot stats() const;
 
 private:
 	int chooseWorkerThreadCount(const Params& workerParams) const;
 	bool shouldPublishFrame(const Params& workerParams, std::chrono::steady_clock::time_point now, std::chrono::steady_clock::time_point lastPublish);
-	void composeFrame(PathTracer& tracer, const Params& workerParams, Data& workerData, int threadCount);
-	void publishFrame(Data& workerData, const Params& workerParams, const Screen& workerScreen);
+	void composeFrame(
+		PathTracer& tracer,
+		const Params& workerParams,
+		Data& workerData,
+		int threadCount
+	);
+	void publishFrame(
+		Data& workerData,
+		const Params& workerParams,
+		const Screen& workerScreen
+	);
 	void run(RenderWorkload workload);
 };
 
-void composeRenderFrame(PathTracer& tracer, float exposure, float contrast, int sample, int raysPerPixel, const std::vector<glm::vec3>& accumBuffer, std::vector<RenderPixel>& frameBuffer, int threadCount = 1);
+void composeRenderFrame(
+	PathTracer& tracer,
+	float exposure,
+	float contrast,
+	int sample,
+	int raysPerPixel,
+	const std::vector<glm::vec3>& accumBuffer,
+	std::vector<RenderPixel>& frameBuffer,
+	int threadCount = 1
+);
 void resetRenderStats(Params& params);
 void applyRenderStats(Params& params, const RenderStatsSnapshot& stats);
 void drawRenderTexture(Texture2D& render, const Screen& screen);

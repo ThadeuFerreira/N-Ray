@@ -50,4 +50,5 @@ void UI::drawPostSettings(Params& params, const LayoutSizes& sizes) {
 	if (sliderHelper("Contrast", "Controls image contrast", sizes.slider, params.contrast, 0.0f, 2.0f, LogSlider)) {
 		markDisplayDirty(params);
 	}
+
 }

@@ -208,7 +208,15 @@ void rebuildRenderTarget(RuntimeResources& runtime, const Rectangle& viewport) {
 	runtime.renderWorker.shutdown();
 	runtime.renderWorker.discardFrame();
 	resetRenderStats(params);
-	screen.initScreen(params.res, viewport.x, viewport.y, viewport.width, viewport.height, data.frameBuffer, data.accumBuffer);
+	screen.initScreen(
+		params.res,
+		viewport.x,
+		viewport.y,
+		viewport.width,
+		viewport.height,
+		data.frameBuffer,
+		data.accumBuffer
+	);
 	runtime.asyncFrame.clear();
 	runtime.asyncAccum.clear();
 	runtime.vulkanFrame.clear();
@@ -421,7 +429,8 @@ bool updateVulkanComputePreview(RuntimeResources& runtime) {
 
 bool updatePathTraceRender(RuntimeResources& runtime) {
 	params.maxSamples = std::clamp(params.maxSamples, kMinSamples, kMaxSamples);
-	if (updateVulkanComputePreview(runtime)) {
+	bool shouldUseVulkanPreview = params.useVulkanPreview && !params.render && runtime.vulkanPreview.isAvailable();
+	if (shouldUseVulkanPreview && updateVulkanComputePreview(runtime)) {
 		return true;
 	}
 

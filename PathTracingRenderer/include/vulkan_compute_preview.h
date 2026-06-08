@@ -24,6 +24,53 @@ enum class VulkanPreviewShadowMode : uint32_t {
 	ShadowMap = 2
 };
 
+enum class VulkanDenoiserMode : uint32_t {
+	Off = 0,
+	SpatialAtrous = 1,
+	SvgfLite = 2
+};
+
+enum class VulkanDenoiserDebugView : uint32_t {
+	Final = 0,
+	RawAccumulation = 1,
+	DenoisedPreview = 2,
+	Normal = 3,
+	Albedo = 4,
+	Depth = 5,
+	MaterialId = 6,
+	InstanceId = 7
+};
+
+struct VulkanDenoiserSettings {
+	VulkanDenoiserMode mode = VulkanDenoiserMode::SpatialAtrous;
+	VulkanDenoiserDebugView debugView = VulkanDenoiserDebugView::Final;
+	uint32_t maxAtrousPasses = 4;
+	uint32_t fadeOutStartSample = 16;
+	uint32_t fadeOutEndSample = 128;
+	float depthSigma = 60.0f;
+	float normalSigma = 64.0f;
+	float lumaSigma = 4.0f;
+	bool fireflyClamp = true;
+	bool verboseLogging = false;
+};
+
+struct VulkanDenoiserStats {
+	bool enabled = false;
+	bool active = false;
+	VulkanDenoiserMode mode = VulkanDenoiserMode::Off;
+	VulkanDenoiserDebugView debugView = VulkanDenoiserDebugView::Final;
+	float strength = 0.0f;
+	uint32_t passCount = 0;
+	uint32_t resetCount = 0;
+	uint64_t targetResourceBytes = 0;
+	double prepareMs = 0.0;
+	double atrousMs = 0.0;
+	double compositeMs = 0.0;
+	double totalMs = 0.0;
+	std::string skipReason;
+	std::string status;
+};
+
 // Per-dispatch render/sky settings for the progressive model path tracer. The
 // driver fills this from the global render params each frame; resetAccumulation
 // restarts the sample accumulation (set on any camera/model/setting change).
@@ -42,6 +89,7 @@ struct VulkanPreviewSettings {
 	glm::vec3 sunColor = glm::vec3(1.0f, 1.0f, 0.95f);
 	float sunIntensity = 100.0f;
 	VulkanPreviewShadowMode shadowMode = VulkanPreviewShadowMode::RayTraced;
+	VulkanDenoiserSettings denoiser;
 	bool resetAccumulation = false;
 };
 
@@ -89,6 +137,7 @@ struct GpuStats {
 	bool timestampAvailable = false;
 	uint32_t samplesAccumulated = 0;
 	uint32_t maxSamples = 1;
+	VulkanDenoiserStats denoiser;
 };
 
 class VulkanComputePreview {

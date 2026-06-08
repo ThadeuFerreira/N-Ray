@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -268,6 +269,67 @@ void logModelImport(const std::string& message) {
 	std::cerr << "[VulkanModelImport] " << message << '\n';
 }
 
+void logDenoiser(const std::string& message) {
+	std::cerr << "[VulkanDenoiser] " << message << '\n';
+}
+
+const char* denoiserModeName(VulkanDenoiserMode mode) {
+	switch (mode) {
+	case VulkanDenoiserMode::Off: return "Off";
+	case VulkanDenoiserMode::SpatialAtrous: return "SpatialAtrous";
+	case VulkanDenoiserMode::SvgfLite: return "SvgfLite";
+	default: return "Unknown";
+	}
+}
+
+const char* denoiserDebugViewName(VulkanDenoiserDebugView view) {
+	switch (view) {
+	case VulkanDenoiserDebugView::Final: return "Final";
+	case VulkanDenoiserDebugView::RawAccumulation: return "RawAccumulation";
+	case VulkanDenoiserDebugView::DenoisedPreview: return "DenoisedPreview";
+	case VulkanDenoiserDebugView::Normal: return "Normal";
+	case VulkanDenoiserDebugView::Albedo: return "Albedo";
+	case VulkanDenoiserDebugView::Depth: return "Depth";
+	case VulkanDenoiserDebugView::MaterialId: return "MaterialId";
+	case VulkanDenoiserDebugView::InstanceId: return "InstanceId";
+	default: return "Unknown";
+	}
+}
+
+bool denoiserVerboseLoggingEnabled(const VulkanDenoiserSettings& settings) {
+	static const bool envEnabled = std::getenv("NRAY_VULKAN_DENOISER_LOG") != nullptr;
+	return settings.verboseLogging || envEnabled;
+}
+
+float computeDenoiseStrength(uint32_t sampleCount, const VulkanDenoiserSettings& settings) {
+	if (settings.mode == VulkanDenoiserMode::Off) {
+		return 0.0f;
+	}
+	if (settings.fadeOutEndSample <= settings.fadeOutStartSample) {
+		return sampleCount < settings.fadeOutEndSample ? 1.0f : 0.0f;
+	}
+	if (sampleCount < settings.fadeOutStartSample) {
+		return 1.0f;
+	}
+	if (sampleCount >= settings.fadeOutEndSample) {
+		return 0.0f;
+	}
+	float span = static_cast<float>(settings.fadeOutEndSample - settings.fadeOutStartSample);
+	return 1.0f - static_cast<float>(sampleCount - settings.fadeOutStartSample) / span;
+}
+
+uint32_t chooseAtrousPassCount(uint32_t sampleCount, const VulkanDenoiserSettings& settings) {
+	if (settings.mode != VulkanDenoiserMode::SpatialAtrous) {
+		return 0;
+	}
+
+	const uint32_t passCount = sampleCount < 8   ? 4u
+	                         : sampleCount < 32  ? 3u
+	                         : sampleCount < 128 ? 2u
+	                         : 0u;
+	return std::min(passCount, settings.maxAtrousPasses);
+}
+
 std::string toLowerAscii(std::string value) {
 	for (char& c : value) {
 		c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -288,6 +350,218 @@ std::filesystem::path absoluteLexicallyNormal(std::filesystem::path path) {
 	}
 	return path.lexically_normal();
 }
+
+class VulkanDenoiser {
+public:
+	struct Image {
+		VkImage image = VK_NULL_HANDLE;
+		VkImageView view = VK_NULL_HANDLE;
+		VkFormat format = VK_FORMAT_UNDEFINED;
+	};
+
+	struct FeatureImages {
+		Image normalRoughness;
+		Image albedoMetallic;
+		Image linearDepth;
+		Image materialId;
+		Image instanceId;
+	};
+
+	bool create(VkDevice device, VkPhysicalDevice physicalDevice, VkExtent2D extent) {
+		m_device = device;
+		m_physicalDevice = physicalDevice;
+		m_extent = extent;
+		m_created = true;
+		m_formatsSupported = validateTargetFormats();
+		m_stats.targetResourceBytes = estimateTargetResourceBytes(extent);
+		m_stats.status = m_formatsSupported
+			? "scaffold ready; denoise images and pipelines not allocated yet"
+			: "disabled: one or more target storage-image formats are unsupported";
+		logResourceState("create");
+		return true;
+	}
+
+	void destroy() {
+		if (!m_created) {
+			return;
+		}
+		logDenoiser("destroy");
+		m_created = false;
+		m_device = VK_NULL_HANDLE;
+		m_physicalDevice = VK_NULL_HANDLE;
+		m_extent = {};
+		m_formatsSupported = false;
+		m_lastSkipReason.clear();
+		m_stats = VulkanDenoiserStats{};
+	}
+
+	void resize(VkExtent2D extent) {
+		if (!m_created) {
+			return;
+		}
+		if (m_extent.width == extent.width && m_extent.height == extent.height) {
+			return;
+		}
+		m_extent = extent;
+		m_stats.targetResourceBytes = estimateTargetResourceBytes(extent);
+		logResourceState("resize");
+		resetHistory("resize");
+	}
+
+	void resetHistory(const char* reason) {
+		if (!m_created) {
+			return;
+		}
+		m_stats.resetCount++;
+		std::ostringstream out;
+		out << "reset history reason=" << (reason != nullptr ? reason : "unspecified")
+			<< " resetCount=" << m_stats.resetCount;
+		logDenoiser(out.str());
+	}
+
+	VkImageView record(
+		VkCommandBuffer,
+		const Image& resolvedRadiance,
+		const FeatureImages& features,
+		uint32_t sampleCount,
+		const VulkanDenoiserSettings& settings
+	) {
+		bool hasFeatures =
+			resolvedRadiance.view != VK_NULL_HANDLE &&
+			features.normalRoughness.view != VK_NULL_HANDLE &&
+			features.albedoMetallic.view != VK_NULL_HANDLE &&
+			features.linearDepth.view != VK_NULL_HANDLE &&
+			features.materialId.view != VK_NULL_HANDLE &&
+			features.instanceId.view != VK_NULL_HANDLE;
+		beginFrame(true, hasFeatures, sampleCount, settings);
+		return VK_NULL_HANDLE;
+	}
+
+	void beginFrame(
+		bool modelPreview,
+		bool featureResourcesReady,
+		uint32_t sampleCount,
+		const VulkanDenoiserSettings& settings
+	) {
+		bool verbose = denoiserVerboseLoggingEnabled(settings);
+		m_stats = VulkanDenoiserStats{};
+		m_stats.enabled = settings.mode != VulkanDenoiserMode::Off;
+		m_stats.mode = settings.mode;
+		m_stats.debugView = settings.debugView;
+
+		if (!m_stats.enabled) {
+			skip("mode off", sampleCount, settings, verbose);
+			return;
+		}
+		if (!m_created) {
+			skip("denoiser not created", sampleCount, settings, verbose);
+			return;
+		}
+		if (!m_formatsSupported) {
+			skip("unsupported storage-image format", sampleCount, settings, verbose);
+			return;
+		}
+		if (!modelPreview) {
+			skip("non-model shader", sampleCount, settings, verbose);
+			return;
+		}
+		if (!featureResourcesReady) {
+			skip("first-hit feature resources pending", sampleCount, settings, verbose);
+			return;
+		}
+
+		m_stats.strength = computeDenoiseStrength(sampleCount, settings);
+		m_stats.passCount = chooseAtrousPassCount(sampleCount, settings);
+		if (m_stats.strength <= 0.0f || m_stats.passCount == 0) {
+			skip("sample count past denoise fade-out", sampleCount, settings, verbose);
+			return;
+		}
+
+		skip("denoise passes not implemented yet", sampleCount, settings, verbose);
+	}
+
+	const VulkanDenoiserStats& stats() const {
+		return m_stats;
+	}
+
+private:
+	bool validateTargetFormats() const {
+		if (m_physicalDevice == VK_NULL_HANDLE) {
+			return false;
+		}
+
+		bool supported = true;
+		supported &= checkStorageFormat(VK_FORMAT_R32G32B32A32_SFLOAT, "accumulated/resolved rgba32f");
+		supported &= checkStorageFormat(VK_FORMAT_R16G16B16A16_SFLOAT, "denoise/features rgba16f");
+		supported &= checkStorageFormat(VK_FORMAT_R32_SFLOAT, "linearDepth r32f");
+		supported &= checkStorageFormat(VK_FORMAT_R32_UINT, "material/instance r32ui");
+		return supported;
+	}
+
+	bool checkStorageFormat(VkFormat format, const char* label) const {
+		VkFormatProperties properties{};
+		vkGetPhysicalDeviceFormatProperties(m_physicalDevice, format, &properties);
+		bool supported = (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
+		if (!supported) {
+			std::ostringstream out;
+			out << "target format unsupported label=\"" << label << "\" format=" << static_cast<int>(format);
+			logDenoiser(out.str());
+		}
+		return supported;
+	}
+
+	static uint64_t estimateTargetResourceBytes(VkExtent2D extent) {
+		uint64_t pixels = static_cast<uint64_t>(extent.width) * static_cast<uint64_t>(extent.height);
+		const uint64_t rgba16fBytes = 8;
+		const uint64_t r32Bytes = 4;
+		const uint64_t plannedBytesPerPixel =
+			rgba16fBytes * 5 + // resolved/normalRoughness/albedoMetallic/ping/pong/output minus one shared source
+			r32Bytes * 4;      // linearDepth/materialId/instanceId/variance
+		return pixels * plannedBytesPerPixel;
+	}
+
+	void logResourceState(const char* action) const {
+		std::ostringstream out;
+		out << action
+			<< " extent=" << m_extent.width << "x" << m_extent.height
+			<< " targetBytes=" << m_stats.targetResourceBytes
+			<< " formatsSupported=" << (m_formatsSupported ? "true" : "false")
+			<< " status=\"" << m_stats.status << "\"";
+		logDenoiser(out.str());
+	}
+
+	void skip(
+		const char* reason,
+		uint32_t sampleCount,
+		const VulkanDenoiserSettings& settings,
+		bool verbose
+	) {
+		m_stats.active = false;
+		m_stats.skipReason = reason != nullptr ? reason : "unknown";
+		m_stats.status = "skipped: " + m_stats.skipReason;
+		if (!verbose && m_stats.skipReason == m_lastSkipReason) {
+			return;
+		}
+		m_lastSkipReason = m_stats.skipReason;
+		std::ostringstream out;
+		out << "skip reason=\"" << m_stats.skipReason << "\""
+			<< " mode=" << denoiserModeName(settings.mode)
+			<< " debugView=" << denoiserDebugViewName(settings.debugView)
+			<< " sampleCount=" << sampleCount
+			<< " strength=" << m_stats.strength
+			<< " passCount=" << m_stats.passCount
+			<< " fireflyClamp=" << (settings.fireflyClamp ? "true" : "false");
+		logDenoiser(out.str());
+	}
+
+	VkDevice m_device = VK_NULL_HANDLE;
+	VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
+	VkExtent2D m_extent{};
+	bool m_created = false;
+	bool m_formatsSupported = false;
+	std::string m_lastSkipReason;
+	VulkanDenoiserStats m_stats;
+};
 
 std::filesystem::path canonicalOrAbsolute(std::filesystem::path path) {
 	std::error_code ec;
@@ -635,6 +909,7 @@ struct VulkanComputePreview::Impl {
 	uint64_t localHeapUsed = 0;
 	double lastGpuMs = 0.0;
 	uint32_t frameCount = 0;
+	VulkanDenoiser denoiser;
 
 	int selectedShader = 0;
 	int selectedModel = -1;
@@ -677,6 +952,7 @@ struct VulkanComputePreview::Impl {
 			!createAccumBuffer() ||
 			!createSettingsBuffer() ||
 			!createShadowMapBuffer() ||
+			!denoiser.create(device, physicalDevice, VkExtent2D{static_cast<uint32_t>(renderWidth), static_cast<uint32_t>(renderHeight)}) ||
 			!createDescriptorSetLayout() ||
 			!createDescriptorPoolAndSet() ||
 			!createPipeline()) {
@@ -728,6 +1004,7 @@ struct VulkanComputePreview::Impl {
 			return false;
 		}
 
+		denoiser.resize(VkExtent2D{static_cast<uint32_t>(renderWidth), static_cast<uint32_t>(renderHeight)});
 		setActiveStatus();
 		return true;
 	}
@@ -751,8 +1028,14 @@ struct VulkanComputePreview::Impl {
 		// and UI; here we only guard against a non-positive dispatch count.
 		maxSamplesCached = static_cast<uint32_t>(std::max(1, settings.maxSamples));
 		if (settings.resetAccumulation) {
-			resetAccumState();
+			resetAccumState("preview driver reset");
 		}
+		denoiser.beginFrame(
+			selectedEntry.requiresModel,
+			false,
+			currentSample + 1u,
+			settings.denoiser
+		);
 
 		// Upload the per-dispatch render/sky settings (binding 6).
 		GpuSettings gpuSettings{};
@@ -1213,9 +1496,10 @@ struct VulkanComputePreview::Impl {
 		allocationSize = 0;
 	}
 
-	void resetAccumState() {
+	void resetAccumState(const char* reason = "accumulation reset") {
 		currentSample = 0;
 		accumNeedsClear = true;
+		denoiser.resetHistory(reason);
 	}
 
 	// Re-upload the host material mirror into the (host-visible) SCENE_MATERIAL
@@ -1254,7 +1538,7 @@ struct VulkanComputePreview::Impl {
 		if (!updateMaterialBuffer()) {
 			return false;
 		}
-		resetAccumState();
+		resetAccumState("material edit");
 		return true;
 	}
 
@@ -1264,7 +1548,7 @@ struct VulkanComputePreview::Impl {
 		}
 		materialsCurrent = materialsOriginal;
 		if (updateMaterialBuffer()) {
-			resetAccumState();
+			resetAccumState("material reset");
 		}
 	}
 
@@ -3061,5 +3345,6 @@ GpuStats VulkanComputePreview::gpuStats() const {
 	s.timestampAvailable = m_impl->timestampSupported;
 	s.samplesAccumulated = m_impl->currentSample;
 	s.maxSamples = m_impl->maxSamplesCached;
+	s.denoiser = m_impl->denoiser.stats();
 	return s;
 }

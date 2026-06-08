@@ -4,7 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-N-Ray is a CPU path tracing renderer (educational project). It uses **raylib** for windowing/input/texture display, **Dear ImGui** (via rlImGui) for the UI, **glm** for math, and **OpenMP** for multithreading. Rendering is progressive and runs on a **background worker thread**: samples accumulate until the camera moves or a render setting changes. The long-term goal is a Vulkan GPU port — the CPU path has been optimized as far as it reasonably goes (see **Performance** below).
+N-Ray's current primary engineering direction is Vulkan GPU rendering and optimization.
+The long-term target is a full Vulkan compute/HW-accelerated path-tracing path, with
+the existing CPU path tracer retained as a known-good reference/fallback. The renderer
+uses **raylib** for windowing/input/texture display, **Dear ImGui** (via rlImGui) for
+the UI, **glm** for math, and **OpenMP** for CPU multithreading. Rendering is
+progressive and runs on a **background worker thread**: samples accumulate until the
+camera moves or a render setting changes.
+
+## Scope policy
+
+- Vulkan-first development is the default for all optimization and new feature work.
+- Do **not** modify `PathTracer`/CPU traversal/shading internals, `AsyncRenderWorker`,
+  or other CPU path-tracer hot paths unless the user explicitly asks for CPU path-tracer
+  work.
+- If a task can be done entirely in the Vulkan stack (preview, denoising,
+  glTF upload/shading, synchronization, descriptor layout, GPU debug/profiling), keep CPU
+  code unchanged.
 
 ## Skills
 
@@ -12,6 +28,7 @@ Project skills live in `.claude/skills/` as one folder per skill, each with a `S
 
 - `.claude/skills/nray-vulkan-tutorials/SKILL.md` - use for Vulkan issues, compute shader experiments, Tutorial28/VulkanCore references, vendored glTF import reference examples (`tutorials/saschawillems/gltf/`), upstream glTF skinning guidance, descriptor/synchronization/debugging work, Vulkan PBR pipelines (material push constants, IBL pre-computation via BRDF LUT/irradiance cube/prefiltered cube, textured PBR with tangent vertex attributes), hardware ray tracing (VK_KHR_ray_tracing_pipeline, BLAS/TLAS build, SBT layout, raygen/miss/closesthit/anyhit/intersection/callable shader groups, frame accumulation, glTF ray tracing with descriptor indexing, recursive secondary rays for shadows and reflections — multiple miss shaders, ray payloads, iterate-in-raygen bounce loops), and porting the CPU path tracer toward Vulkan compute or HW ray tracing.
 - `.claude/skills/cpp-smart-pointers/SKILL.md` - use for C++ ownership/lifetime changes, asset/resource registry design, buffer/texture/mesh lifetime reviews, or audits for hidden allocations and smart-pointer traffic in hot render paths.
+- `.claude/skills/task-completion-gates/SKILL.md` - use for mandatory completion checks that prevent ending work with compile/link failures.
 
 When a skill applies, read its `SKILL.md` before designing or changing code.
 
@@ -30,6 +47,11 @@ make generate          # regenerate build/ project files only
 make clean             # rm -rf build bin obj (keeps the raylib lib)
 make distclean         # also clean the vendored raylib objects/lib
 ```
+
+### Completion gate
+
+- Before ending a task, run the relevant build target(s) for the modified code path and ensure they complete without compile or link errors.
+- If any build/link failure appears, fix the error(s) and rerun until the command is green.
 
 `premake5.lua` defines three configurations: **Debug**, **Release**, **Performance**. The root `Makefile` is a hand-written wrapper. `premake5.lua` sets `location "build"`, so `premake5 gmake2` generates the workspace makefiles **under `build/`** (not the repo root — don't remove `location` or premake will clobber the wrapper `Makefile`). The compiled binary lands at `bin/<Config>/PathTracingRenderer`. On Windows, open `PathTracingRenderer.sln` in VS2022 (x64). `premake5.lua` is the source of truth for project config (sources, include dirs, per-platform links/flags) — edit it, not the generated files.
 

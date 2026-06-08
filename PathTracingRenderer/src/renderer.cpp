@@ -539,7 +539,6 @@ glm::vec3 hdriLogic(PathRay& ray, Params& params, const RenderEnvironment& envir
 //}
 
 void PathTracer::rayLogic(PathRay& ray, PathRayState& rayState, const std::vector<Tri>& tris, const std::vector<TriIntersect>& triIsect, const std::vector<PBRMaterial>& materials, const std::vector<CompactBVH>& flatBVH, Params& params, const RenderEnvironment& environment, RenderRng& rng, std::vector<DebugRay>* debugOut) {
-
 	for (int bounce = 0; bounce <= params.maxBounces; bounce++) {
 		if (!rayState.active) {
 			break;
