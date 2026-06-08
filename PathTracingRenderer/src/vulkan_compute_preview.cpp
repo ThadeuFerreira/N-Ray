@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <glm/glm.hpp>
+#include <initializer_list>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -29,6 +30,9 @@
 #include "tut28_flux_core_comp_spv.h"
 #include "vulkan_gltf_flat_comp_spv.h"
 #include "vulkan_gltf_shadowmap_comp_spv.h"
+#include "vulkan_denoise_prepare_comp_spv.h"
+#include "vulkan_denoise_atrous_comp_spv.h"
+#include "vulkan_denoise_composite_comp_spv.h"
 
 namespace {
 struct PushConstants {
@@ -42,12 +46,16 @@ struct PushConstants {
 	glm::vec4 cameraUp = glm::vec4(0.0f);
 	glm::vec4 cameraParams = glm::vec4(0.0f);
 	glm::uvec4 sceneCounts = glm::uvec4(0u);
+	glm::uvec4 denoisePass = glm::uvec4(0u);
 };
 
-static_assert(sizeof(PushConstants) == 112, "Push constants must match Vulkan preview shaders.");
+static_assert(sizeof(PushConstants) == 128, "Push constants must match Vulkan preview shaders.");
 static_assert(nray_vulkan_triangle_comp_spv_len % 4 == 0, "SPIR-V bytecode size must be a multiple of 4.");
 static_assert(nray_vulkan_gltf_flat_comp_spv_len % 4 == 0, "SPIR-V bytecode size must be a multiple of 4.");
 static_assert(nray_vulkan_gltf_shadowmap_comp_spv_len % 4 == 0, "SPIR-V bytecode size must be a multiple of 4.");
+static_assert(nray_vulkan_denoise_prepare_comp_spv_len % 4 == 0, "SPIR-V bytecode size must be a multiple of 4.");
+static_assert(nray_vulkan_denoise_atrous_comp_spv_len % 4 == 0, "SPIR-V bytecode size must be a multiple of 4.");
+static_assert(nray_vulkan_denoise_composite_comp_spv_len % 4 == 0, "SPIR-V bytecode size must be a multiple of 4.");
 
 struct GpuTriIntersect {
 	glm::vec4 a;
@@ -96,13 +104,15 @@ struct GpuSettings {
 	glm::vec4 shadowBasisZ;  // xyz direction to sun
 	glm::vec4 shadowBounds;  // x=minLightX, y=minLightY, z=invExtentX, w=invExtentY
 	glm::vec4 shadowDepth;   // x=maxLightZ, y=invDepthRange, z=depthBias, w=normalBias
+	glm::vec4 denoiseParams; // x=strength, y=depthSigma, z=normalSigma, w=lumaSigma
+	glm::uvec4 denoiseFlags; // x=mode, y=debugView, z=fireflyClamp, w=atrousPassCount
 };
 
 static_assert(sizeof(GpuTriIntersect) == 64, "GpuTriIntersect must match std430 shader layout.");
 static_assert(sizeof(GpuTriShading) == 144, "GpuTriShading must match std430 shader layout.");
 static_assert(sizeof(GpuMaterial) == 96, "GpuMaterial must match std430 shader layout.");
 static_assert(sizeof(GpuBvhNode) == 48, "GpuBvhNode must match std430 shader layout.");
-static_assert(sizeof(GpuSettings) == 160, "GpuSettings must match std430 shader layout.");
+static_assert(sizeof(GpuSettings) == 192, "GpuSettings must match std430 shader layout.");
 
 const char* vkResultName(VkResult result) {
 	switch (result) {
@@ -248,9 +258,10 @@ static const int kShaderCount = static_cast<int>(sizeof(kShaders) / sizeof(kShad
 
 static constexpr uint32_t kMaxPreviewTextures = 256;
 // Total descriptor set bindings: 0=pixels, 1-4=scene SSBOs, 5=accum, 6=settings,
-// 7=textures, 8=shadow map.
-static constexpr uint32_t kTotalBindings = 9;
-static constexpr uint32_t kStorageDescriptorCount = 8;
+// 7=textures, 8=shadow map, 9-16=denoiser storage images.
+static constexpr uint32_t kTotalBindings = 17;
+static constexpr uint32_t kStorageBufferDescriptorCount = 8;
+static constexpr uint32_t kStorageImageDescriptorCount = 8;
 // Scene SSBO bindings start at index 1 (binding 0 is the pixel buffer).
 static constexpr uint32_t kFirstSceneBinding = 1;
 // Named binding slots — update if the layout in vulkan_gltf_flat.comp changes.
@@ -259,6 +270,14 @@ static constexpr uint32_t kBindingAccum    = 5;
 static constexpr uint32_t kBindingSettings = 6;
 static constexpr uint32_t kBindingTextures = 7;
 static constexpr uint32_t kBindingShadowMap = 8;
+static constexpr uint32_t kBindingDenoiseResolvedHdr = 9;
+static constexpr uint32_t kBindingDenoiseNormalRoughness = 10;
+static constexpr uint32_t kBindingDenoiseAlbedoMetallic = 11;
+static constexpr uint32_t kBindingDenoiseDepth = 12;
+static constexpr uint32_t kBindingDenoiseMaterialId = 13;
+static constexpr uint32_t kBindingDenoiseInstanceId = 14;
+static constexpr uint32_t kBindingDenoisePing = 15;
+static constexpr uint32_t kBindingDenoisePong = 16;
 
 // Imported models are persisted here (relative to the working directory, which
 // is the PathTracingRenderer/ folder where the app is run) so they reappear on
@@ -355,30 +374,95 @@ class VulkanDenoiser {
 public:
 	struct Image {
 		VkImage image = VK_NULL_HANDLE;
+		VkDeviceMemory memory = VK_NULL_HANDLE;
 		VkImageView view = VK_NULL_HANDLE;
 		VkFormat format = VK_FORMAT_UNDEFINED;
+		VkDescriptorImageInfo descriptor{};
+		VkDeviceSize allocationSize = 0;
 	};
 
 	struct FeatureImages {
-		Image normalRoughness;
-		Image albedoMetallic;
-		Image linearDepth;
-		Image materialId;
-		Image instanceId;
+		const Image* normalRoughness = nullptr;
+		const Image* albedoMetallic = nullptr;
+		const Image* linearDepth = nullptr;
+		const Image* materialId = nullptr;
+		const Image* instanceId = nullptr;
 	};
 
 	bool create(VkDevice device, VkPhysicalDevice physicalDevice, VkExtent2D extent) {
 		m_device = device;
 		m_physicalDevice = physicalDevice;
 		m_extent = extent;
-		m_created = true;
+		vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &m_memoryProps);
 		m_formatsSupported = validateTargetFormats();
+		if (!m_formatsSupported) {
+			m_stats.status = "disabled: one or more target storage-image formats are unsupported";
+			logResourceState("create");
+			return false;
+		}
+		if (!createImages()) {
+			return false;
+		}
+		m_created = true;
 		m_stats.targetResourceBytes = estimateTargetResourceBytes(extent);
-		m_stats.status = m_formatsSupported
-			? "scaffold ready; denoise images and pipelines not allocated yet"
-			: "disabled: one or more target storage-image formats are unsupported";
+		m_stats.status = "ready";
 		logResourceState("create");
 		return true;
+	}
+
+	bool createPipelines(VkPipelineLayout pipelineLayout) {
+		destroyPipelines();
+		if (!m_created || pipelineLayout == VK_NULL_HANDLE) {
+			return false;
+		}
+		return createShaderModule(
+				nray_vulkan_denoise_prepare_comp_spv,
+				nray_vulkan_denoise_prepare_comp_spv_len,
+				m_prepareShaderModule,
+				"denoise prepare"
+			) &&
+			createShaderModule(
+				nray_vulkan_denoise_atrous_comp_spv,
+				nray_vulkan_denoise_atrous_comp_spv_len,
+				m_atrousShaderModule,
+				"denoise atrous"
+			) &&
+			createShaderModule(
+				nray_vulkan_denoise_composite_comp_spv,
+				nray_vulkan_denoise_composite_comp_spv_len,
+				m_compositeShaderModule,
+				"denoise composite"
+			) &&
+			createComputePipeline(m_prepareShaderModule, pipelineLayout, m_preparePipeline, "denoise prepare") &&
+			createComputePipeline(m_atrousShaderModule, pipelineLayout, m_atrousPipeline, "denoise atrous") &&
+			createComputePipeline(m_compositeShaderModule, pipelineLayout, m_compositePipeline, "denoise composite");
+	}
+
+	void destroyPipelines() {
+		if (m_preparePipeline != VK_NULL_HANDLE) {
+			vkDestroyPipeline(m_device, m_preparePipeline, nullptr);
+			m_preparePipeline = VK_NULL_HANDLE;
+		}
+		if (m_atrousPipeline != VK_NULL_HANDLE) {
+			vkDestroyPipeline(m_device, m_atrousPipeline, nullptr);
+			m_atrousPipeline = VK_NULL_HANDLE;
+		}
+		if (m_compositePipeline != VK_NULL_HANDLE) {
+			vkDestroyPipeline(m_device, m_compositePipeline, nullptr);
+			m_compositePipeline = VK_NULL_HANDLE;
+		}
+		if (m_prepareShaderModule != VK_NULL_HANDLE) {
+			vkDestroyShaderModule(m_device, m_prepareShaderModule, nullptr);
+			m_prepareShaderModule = VK_NULL_HANDLE;
+		}
+		if (m_atrousShaderModule != VK_NULL_HANDLE) {
+			vkDestroyShaderModule(m_device, m_atrousShaderModule, nullptr);
+			m_atrousShaderModule = VK_NULL_HANDLE;
+		}
+		if (m_compositeShaderModule != VK_NULL_HANDLE) {
+			vkDestroyShaderModule(m_device, m_compositeShaderModule, nullptr);
+			m_compositeShaderModule = VK_NULL_HANDLE;
+		}
 	}
 
 	void destroy() {
@@ -386,58 +470,161 @@ public:
 			return;
 		}
 		logDenoiser("destroy");
+		destroyPipelines();
+		destroyImages();
 		m_created = false;
 		m_device = VK_NULL_HANDLE;
 		m_physicalDevice = VK_NULL_HANDLE;
 		m_extent = {};
 		m_formatsSupported = false;
 		m_lastSkipReason.clear();
+		m_resetCount = 0;
 		m_stats = VulkanDenoiserStats{};
 	}
 
-	void resize(VkExtent2D extent) {
+	bool resize(VkExtent2D extent) {
 		if (!m_created) {
-			return;
+			return false;
 		}
 		if (m_extent.width == extent.width && m_extent.height == extent.height) {
-			return;
+			return true;
 		}
+		destroyImages();
 		m_extent = extent;
+		if (!createImages()) {
+			return false;
+		}
 		m_stats.targetResourceBytes = estimateTargetResourceBytes(extent);
 		logResourceState("resize");
 		resetHistory("resize");
+		return true;
 	}
 
 	void resetHistory(const char* reason) {
 		if (!m_created) {
 			return;
 		}
-		m_stats.resetCount++;
+		m_resetCount++;
+		m_stats.resetCount = m_resetCount;
 		std::ostringstream out;
 		out << "reset history reason=" << (reason != nullptr ? reason : "unspecified")
-			<< " resetCount=" << m_stats.resetCount;
+			<< " resetCount=" << m_resetCount;
 		logDenoiser(out.str());
 	}
 
-	VkImageView record(
-		VkCommandBuffer,
-		const Image& resolvedRadiance,
+	void prepareForModelDispatch(VkCommandBuffer commandBuffer) {
+		recordInitialLayoutTransitions(commandBuffer);
+	}
+
+	bool record(
+		VkCommandBuffer commandBuffer,
+		VkPipelineLayout pipelineLayout,
+		VkDescriptorSet descriptorSet,
+		const PushConstants& basePushConstants,
+		bool modelPreview,
+		bool postprocessOnly,
 		const FeatureImages& features,
 		uint32_t sampleCount,
 		const VulkanDenoiserSettings& settings
 	) {
 		bool hasFeatures =
-			resolvedRadiance.view != VK_NULL_HANDLE &&
-			features.normalRoughness.view != VK_NULL_HANDLE &&
-			features.albedoMetallic.view != VK_NULL_HANDLE &&
-			features.linearDepth.view != VK_NULL_HANDLE &&
-			features.materialId.view != VK_NULL_HANDLE &&
-			features.instanceId.view != VK_NULL_HANDLE;
-		beginFrame(true, hasFeatures, sampleCount, settings);
-		return VK_NULL_HANDLE;
+			m_images[ResolvedHdr].view != VK_NULL_HANDLE &&
+			features.normalRoughness != nullptr && features.normalRoughness->view != VK_NULL_HANDLE &&
+			features.albedoMetallic != nullptr && features.albedoMetallic->view != VK_NULL_HANDLE &&
+			features.linearDepth != nullptr && features.linearDepth->view != VK_NULL_HANDLE &&
+			features.materialId != nullptr && features.materialId->view != VK_NULL_HANDLE &&
+			features.instanceId != nullptr && features.instanceId->view != VK_NULL_HANDLE;
+
+		bool active = beginFrame(modelPreview, hasFeatures, sampleCount, settings);
+		if (!modelPreview || !hasFeatures) {
+			return false;
+		}
+
+		recordInitialLayoutTransitions(commandBuffer);
+
+		bool compositeOnly = postprocessOnly && !active;
+		if (!active && !compositeOnly) {
+			return false;
+		}
+		if (m_compositePipeline == VK_NULL_HANDLE ||
+			(active && (m_preparePipeline == VK_NULL_HANDLE || m_atrousPipeline == VK_NULL_HANDLE))) {
+			skip("denoise pipelines missing", sampleCount, settings, denoiserVerboseLoggingEnabled(settings));
+			return false;
+		}
+
+		barrierImages(
+			commandBuffer,
+			{ ResolvedHdr, NormalRoughness, AlbedoMetallic, LinearDepth, MaterialId, InstanceId },
+			VK_ACCESS_SHADER_WRITE_BIT,
+			VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+		);
+
+		uint32_t passCount = active ? m_stats.passCount : 0u;
+		if (active) {
+			PushConstants prepareConstants = basePushConstants;
+			prepareConstants.denoisePass = glm::uvec4(0u, 1u, static_cast<uint32_t>(settings.debugView), 0u);
+			vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_preparePipeline);
+			vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+			vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &prepareConstants);
+			vkCmdDispatch(commandBuffer, ceilDiv(m_extent.width, 16), ceilDiv(m_extent.height, 16), 1);
+			barrierImages(commandBuffer, { Ping }, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+
+			for (uint32_t pass = 0; pass < passCount; ++pass) {
+				uint32_t stride = 1u << pass;
+				PushConstants atrousConstants = basePushConstants;
+				atrousConstants.denoisePass = glm::uvec4(pass, stride, static_cast<uint32_t>(settings.debugView), 0u);
+				vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousPipeline);
+				vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+				vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &atrousConstants);
+				vkCmdDispatch(commandBuffer, ceilDiv(m_extent.width, 16), ceilDiv(m_extent.height, 16), 1);
+				barrierImages(
+					commandBuffer,
+					{ (pass & 1u) == 0u ? Pong : Ping },
+					VK_ACCESS_SHADER_WRITE_BIT,
+					VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+				);
+			}
+		}
+
+		PushConstants compositeConstants = basePushConstants;
+		compositeConstants.denoisePass = glm::uvec4(passCount, 0u, static_cast<uint32_t>(settings.debugView), 0u);
+		vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_compositePipeline);
+		vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+		vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &compositeConstants);
+		vkCmdDispatch(commandBuffer, ceilDiv(m_extent.width, 16), ceilDiv(m_extent.height, 16), 1);
+
+		if (active) {
+			std::ostringstream out;
+			out << "active mode=" << denoiserModeName(settings.mode)
+				<< " debugView=" << denoiserDebugViewName(settings.debugView)
+				<< " sampleCount=" << sampleCount
+				<< " strength=" << m_stats.strength
+				<< " passCount=" << m_stats.passCount;
+			m_stats.status = out.str();
+			if (denoiserVerboseLoggingEnabled(settings)) {
+				logDenoiser(out.str());
+			}
+		}
+		return true;
 	}
 
-	void beginFrame(
+	const VkDescriptorImageInfo& descriptorForBinding(uint32_t binding) const {
+		static VkDescriptorImageInfo empty{};
+		if (binding < kBindingDenoiseResolvedHdr || binding > kBindingDenoisePong) {
+			return empty;
+		}
+		return m_images[binding - kBindingDenoiseResolvedHdr].descriptor;
+	}
+
+	const Image& imageForBinding(uint32_t binding) const {
+		static Image empty{};
+		if (binding < kBindingDenoiseResolvedHdr || binding > kBindingDenoisePong) {
+			return empty;
+		}
+		return m_images[binding - kBindingDenoiseResolvedHdr];
+	}
+
+	bool beginFrame(
 		bool modelPreview,
 		bool featureResourcesReady,
 		uint32_t sampleCount,
@@ -448,36 +635,44 @@ public:
 		m_stats.enabled = settings.mode != VulkanDenoiserMode::Off;
 		m_stats.mode = settings.mode;
 		m_stats.debugView = settings.debugView;
+		m_stats.resetCount = m_resetCount;
+		m_stats.targetResourceBytes = estimateTargetResourceBytes(m_extent);
 
 		if (!m_stats.enabled) {
 			skip("mode off", sampleCount, settings, verbose);
-			return;
+			return false;
 		}
 		if (!m_created) {
 			skip("denoiser not created", sampleCount, settings, verbose);
-			return;
+			return false;
 		}
 		if (!m_formatsSupported) {
 			skip("unsupported storage-image format", sampleCount, settings, verbose);
-			return;
+			return false;
 		}
 		if (!modelPreview) {
 			skip("non-model shader", sampleCount, settings, verbose);
-			return;
+			return false;
 		}
 		if (!featureResourcesReady) {
 			skip("first-hit feature resources pending", sampleCount, settings, verbose);
-			return;
+			return false;
+		}
+		if (settings.mode == VulkanDenoiserMode::SvgfLite) {
+			skip("SvgfLite not implemented yet", sampleCount, settings, verbose);
+			return false;
 		}
 
 		m_stats.strength = computeDenoiseStrength(sampleCount, settings);
 		m_stats.passCount = chooseAtrousPassCount(sampleCount, settings);
 		if (m_stats.strength <= 0.0f || m_stats.passCount == 0) {
 			skip("sample count past denoise fade-out", sampleCount, settings, verbose);
-			return;
+			return false;
 		}
 
-		skip("denoise passes not implemented yet", sampleCount, settings, verbose);
+		m_stats.active = true;
+		m_stats.targetResourceBytes = estimateTargetResourceBytes(m_extent);
+		return true;
 	}
 
 	const VulkanDenoiserStats& stats() const {
@@ -485,6 +680,18 @@ public:
 	}
 
 private:
+	enum ImageSlot : uint32_t {
+		ResolvedHdr = 0,
+		NormalRoughness,
+		AlbedoMetallic,
+		LinearDepth,
+		MaterialId,
+		InstanceId,
+		Ping,
+		Pong,
+		ImageCount
+	};
+
 	bool validateTargetFormats() const {
 		if (m_physicalDevice == VK_NULL_HANDLE) {
 			return false;
@@ -512,12 +719,262 @@ private:
 
 	static uint64_t estimateTargetResourceBytes(VkExtent2D extent) {
 		uint64_t pixels = static_cast<uint64_t>(extent.width) * static_cast<uint64_t>(extent.height);
+		const uint64_t rgba32fBytes = 16;
 		const uint64_t rgba16fBytes = 8;
 		const uint64_t r32Bytes = 4;
 		const uint64_t plannedBytesPerPixel =
-			rgba16fBytes * 5 + // resolved/normalRoughness/albedoMetallic/ping/pong/output minus one shared source
-			r32Bytes * 4;      // linearDepth/materialId/instanceId/variance
+			rgba32fBytes +     // resolved HDR
+			rgba16fBytes * 4 + // normalRoughness/albedoMetallic/ping/pong
+			r32Bytes * 3;      // linearDepth/materialId/instanceId
 		return pixels * plannedBytesPerPixel;
+	}
+
+	bool findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags preferredFlags, uint32_t& memoryTypeIndex) const {
+		for (uint32_t i = 0; i < m_memoryProps.memoryTypeCount; i++) {
+			bool typeSupported = (typeBits & (1u << i)) != 0;
+			bool flagsSupported = (m_memoryProps.memoryTypes[i].propertyFlags & preferredFlags) == preferredFlags;
+			if (typeSupported && flagsSupported) {
+				memoryTypeIndex = i;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool createImage(ImageSlot slot, VkFormat format, const char* label) {
+		Image& image = m_images[slot];
+		image.format = format;
+
+		VkImageCreateInfo imageInfo{};
+		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.imageType = VK_IMAGE_TYPE_2D;
+		imageInfo.format = format;
+		imageInfo.extent = { m_extent.width, m_extent.height, 1 };
+		imageInfo.mipLevels = 1;
+		imageInfo.arrayLayers = 1;
+		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+		imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+		VkResult result = vkCreateImage(m_device, &imageInfo, nullptr, &image.image);
+		if (result != VK_SUCCESS) {
+			logDenoiser(vkErrorMessage((std::string("vkCreateImage ") + label).c_str(), result));
+			return false;
+		}
+
+		VkMemoryRequirements memoryReqs{};
+		vkGetImageMemoryRequirements(m_device, image.image, &memoryReqs);
+		uint32_t memoryTypeIndex = 0;
+		if (!findMemoryType(memoryReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memoryTypeIndex)) {
+			logDenoiser(std::string("No device-local memory type for Vulkan denoise image ") + label);
+			return false;
+		}
+
+		VkMemoryAllocateInfo allocateInfo{};
+		allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocateInfo.allocationSize = memoryReqs.size;
+		allocateInfo.memoryTypeIndex = memoryTypeIndex;
+		result = vkAllocateMemory(m_device, &allocateInfo, nullptr, &image.memory);
+		if (result != VK_SUCCESS) {
+			logDenoiser(vkErrorMessage((std::string("vkAllocateMemory ") + label).c_str(), result));
+			return false;
+		}
+		image.allocationSize = memoryReqs.size;
+
+		result = vkBindImageMemory(m_device, image.image, image.memory, 0);
+		if (result != VK_SUCCESS) {
+			logDenoiser(vkErrorMessage((std::string("vkBindImageMemory ") + label).c_str(), result));
+			return false;
+		}
+
+		VkImageViewCreateInfo viewInfo{};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = image.image;
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = format;
+		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		viewInfo.subresourceRange.baseMipLevel = 0;
+		viewInfo.subresourceRange.levelCount = 1;
+		viewInfo.subresourceRange.baseArrayLayer = 0;
+		viewInfo.subresourceRange.layerCount = 1;
+		result = vkCreateImageView(m_device, &viewInfo, nullptr, &image.view);
+		if (result != VK_SUCCESS) {
+			logDenoiser(vkErrorMessage((std::string("vkCreateImageView ") + label).c_str(), result));
+			return false;
+		}
+
+		image.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+		image.descriptor.imageView = image.view;
+		image.descriptor.sampler = VK_NULL_HANDLE;
+		return true;
+	}
+
+	bool createImages() {
+		if (m_extent.width == 0 || m_extent.height == 0) {
+			logDenoiser("cannot create denoise images for empty extent");
+			return false;
+		}
+
+		bool ok =
+			createImage(ResolvedHdr, VK_FORMAT_R32G32B32A32_SFLOAT, "resolved HDR") &&
+			createImage(NormalRoughness, VK_FORMAT_R16G16B16A16_SFLOAT, "normal roughness") &&
+			createImage(AlbedoMetallic, VK_FORMAT_R16G16B16A16_SFLOAT, "albedo metallic") &&
+			createImage(LinearDepth, VK_FORMAT_R32_SFLOAT, "linear depth") &&
+			createImage(MaterialId, VK_FORMAT_R32_UINT, "material id") &&
+			createImage(InstanceId, VK_FORMAT_R32_UINT, "instance id") &&
+			createImage(Ping, VK_FORMAT_R16G16B16A16_SFLOAT, "denoise ping") &&
+			createImage(Pong, VK_FORMAT_R16G16B16A16_SFLOAT, "denoise pong");
+		if (!ok) {
+			destroyImages();
+			return false;
+		}
+
+		m_needsLayoutTransition = true;
+		return true;
+	}
+
+	void destroyImage(Image& image) {
+		if (image.view != VK_NULL_HANDLE) {
+			vkDestroyImageView(m_device, image.view, nullptr);
+			image.view = VK_NULL_HANDLE;
+		}
+		if (image.image != VK_NULL_HANDLE) {
+			vkDestroyImage(m_device, image.image, nullptr);
+			image.image = VK_NULL_HANDLE;
+		}
+		if (image.memory != VK_NULL_HANDLE) {
+			vkFreeMemory(m_device, image.memory, nullptr);
+			image.memory = VK_NULL_HANDLE;
+		}
+		image.descriptor = {};
+		image.format = VK_FORMAT_UNDEFINED;
+		image.allocationSize = 0;
+	}
+
+	void destroyImages() {
+		for (Image& image : m_images) {
+			destroyImage(image);
+		}
+		m_needsLayoutTransition = false;
+	}
+
+	static VkImageSubresourceRange colorRange() {
+		VkImageSubresourceRange range{};
+		range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		range.baseMipLevel = 0;
+		range.levelCount = 1;
+		range.baseArrayLayer = 0;
+		range.layerCount = 1;
+		return range;
+	}
+
+	void recordInitialLayoutTransitions(VkCommandBuffer commandBuffer) {
+		if (!m_needsLayoutTransition) {
+			return;
+		}
+
+		std::array<VkImageMemoryBarrier, ImageCount> barriers{};
+		for (uint32_t i = 0; i < ImageCount; ++i) {
+			barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			barriers[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			barriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+			barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barriers[i].image = m_images[i].image;
+			barriers[i].subresourceRange = colorRange();
+			barriers[i].srcAccessMask = 0;
+			barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		}
+		vkCmdPipelineBarrier(
+			commandBuffer,
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			0,
+			0,
+			nullptr,
+			0,
+			nullptr,
+			static_cast<uint32_t>(barriers.size()),
+			barriers.data()
+		);
+		m_needsLayoutTransition = false;
+	}
+
+	void barrierImages(
+		VkCommandBuffer commandBuffer,
+		std::initializer_list<ImageSlot> slots,
+		VkAccessFlags srcAccessMask,
+		VkAccessFlags dstAccessMask
+	) const {
+		std::array<VkImageMemoryBarrier, ImageCount> barriers{};
+		uint32_t count = 0;
+		for (ImageSlot slot : slots) {
+			const Image& image = m_images[slot];
+			if (image.image == VK_NULL_HANDLE) {
+				continue;
+			}
+			barriers[count].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			barriers[count].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+			barriers[count].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+			barriers[count].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barriers[count].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barriers[count].image = image.image;
+			barriers[count].subresourceRange = colorRange();
+			barriers[count].srcAccessMask = srcAccessMask;
+			barriers[count].dstAccessMask = dstAccessMask;
+			count++;
+		}
+		if (count == 0) {
+			return;
+		}
+		vkCmdPipelineBarrier(
+			commandBuffer,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			0,
+			0,
+			nullptr,
+			0,
+			nullptr,
+			count,
+			barriers.data()
+		);
+	}
+
+	bool createShaderModule(const unsigned char* spv, unsigned int len, VkShaderModule& outModule, const char* tag) {
+		VkShaderModuleCreateInfo shaderInfo{};
+		shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+		shaderInfo.codeSize = len;
+		shaderInfo.pCode = reinterpret_cast<const uint32_t*>(spv);
+
+		VkResult result = vkCreateShaderModule(m_device, &shaderInfo, nullptr, &outModule);
+		if (result != VK_SUCCESS) {
+			logDenoiser(vkErrorMessage((std::string("vkCreateShaderModule ") + tag).c_str(), result));
+			return false;
+		}
+		return true;
+	}
+
+	bool createComputePipeline(VkShaderModule module, VkPipelineLayout layout, VkPipeline& outPipeline, const char* tag) {
+		VkPipelineShaderStageCreateInfo stageInfo{};
+		stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+		stageInfo.module = module;
+		stageInfo.pName = "main";
+
+		VkComputePipelineCreateInfo pipelineInfo{};
+		pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+		pipelineInfo.stage = stageInfo;
+		pipelineInfo.layout = layout;
+
+		VkResult result = vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &outPipeline);
+		if (result != VK_SUCCESS) {
+			logDenoiser(vkErrorMessage((std::string("vkCreateComputePipelines ") + tag).c_str(), result));
+			return false;
+		}
+		return true;
 	}
 
 	void logResourceState(const char* action) const {
@@ -556,11 +1013,21 @@ private:
 
 	VkDevice m_device = VK_NULL_HANDLE;
 	VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
+	VkPhysicalDeviceMemoryProperties m_memoryProps{};
 	VkExtent2D m_extent{};
 	bool m_created = false;
 	bool m_formatsSupported = false;
+	bool m_needsLayoutTransition = false;
+	uint32_t m_resetCount = 0;
 	std::string m_lastSkipReason;
 	VulkanDenoiserStats m_stats;
+	std::array<Image, ImageCount> m_images{};
+	VkShaderModule m_prepareShaderModule = VK_NULL_HANDLE;
+	VkShaderModule m_atrousShaderModule = VK_NULL_HANDLE;
+	VkShaderModule m_compositeShaderModule = VK_NULL_HANDLE;
+	VkPipeline m_preparePipeline = VK_NULL_HANDLE;
+	VkPipeline m_atrousPipeline = VK_NULL_HANDLE;
+	VkPipeline m_compositePipeline = VK_NULL_HANDLE;
 };
 
 std::filesystem::path canonicalOrAbsolute(std::filesystem::path path) {
@@ -956,6 +1423,9 @@ struct VulkanComputePreview::Impl {
 			!createDescriptorSetLayout() ||
 			!createDescriptorPoolAndSet() ||
 			!createPipeline()) {
+			if (status == "Vulkan preview not initialized") {
+				status = "Vulkan preview initialization failed";
+			}
 			if (instanceCleanupUnsafe) {
 				abandonUnsafePartialInstance();
 			}
@@ -996,7 +1466,10 @@ struct VulkanComputePreview::Impl {
 
 		renderWidth = width;
 		renderHeight = height;
-		if (!createPixelBuffer() || !createAccumBuffer() || !createDescriptorPoolAndSet()) {
+		if (!createPixelBuffer() ||
+			!createAccumBuffer() ||
+			!denoiser.resize(VkExtent2D{static_cast<uint32_t>(renderWidth), static_cast<uint32_t>(renderHeight)}) ||
+			!createDescriptorPoolAndSet()) {
 			destroyDescriptorPool();
 			destroyPixelBuffer();
 			destroyAccumBuffer();
@@ -1004,7 +1477,6 @@ struct VulkanComputePreview::Impl {
 			return false;
 		}
 
-		denoiser.resize(VkExtent2D{static_cast<uint32_t>(renderWidth), static_cast<uint32_t>(renderHeight)});
 		setActiveStatus();
 		return true;
 	}
@@ -1030,12 +1502,14 @@ struct VulkanComputePreview::Impl {
 		if (settings.resetAccumulation) {
 			resetAccumState("preview driver reset");
 		}
-		denoiser.beginFrame(
-			selectedEntry.requiresModel,
-			false,
-			currentSample + 1u,
-			settings.denoiser
-		);
+		bool postprocessOnly =
+			settings.postprocessOnly &&
+			selectedEntry.requiresModel &&
+			modelBuffersReady &&
+			currentSample > 0 &&
+			!settings.resetAccumulation;
+		bool traceSample = !postprocessOnly;
+		uint32_t denoiseSampleCount = traceSample ? currentSample + 1u : currentSample;
 
 		// Upload the per-dispatch render/sky settings (binding 6).
 		GpuSettings gpuSettings{};
@@ -1057,6 +1531,24 @@ struct VulkanComputePreview::Impl {
 			gpuSettings,
 			settings,
 			selectedEntry.requiresModel && modelBuffersReady ? &modelScene : nullptr
+		);
+		float denoiseStrength = computeDenoiseStrength(denoiseSampleCount, settings.denoiser);
+		uint32_t denoisePassCount = chooseAtrousPassCount(denoiseSampleCount, settings.denoiser);
+		if (settings.denoiser.mode != VulkanDenoiserMode::SpatialAtrous) {
+			denoiseStrength = 0.0f;
+			denoisePassCount = 0u;
+		}
+		gpuSettings.denoiseParams = glm::vec4(
+			denoiseStrength,
+			std::max(settings.denoiser.depthSigma, 0.0f),
+			std::max(settings.denoiser.normalSigma, 0.0f),
+			std::max(settings.denoiser.lumaSigma, 0.0f)
+		);
+		gpuSettings.denoiseFlags = glm::uvec4(
+			static_cast<uint32_t>(settings.denoiser.mode),
+			static_cast<uint32_t>(settings.denoiser.debugView),
+			settings.denoiser.fireflyClamp ? 1u : 0u,
+			denoisePassCount
 		);
 		std::memcpy(mappedSettings, &gpuSettings, sizeof(GpuSettings));
 		if (!flushMappedRange(settingsMemory, settingsMemoryCoherent, "vkFlushMappedMemoryRanges settings")) {
@@ -1084,55 +1576,57 @@ struct VulkanComputePreview::Impl {
 			return false;
 		}
 
-		if (accumNeedsClear) {
-			vkCmdFillBuffer(commandBuffer, accumBuffer, 0, VK_WHOLE_SIZE, 0);
+		if (traceSample) {
+			if (accumNeedsClear) {
+				vkCmdFillBuffer(commandBuffer, accumBuffer, 0, VK_WHOLE_SIZE, 0);
 
-			VkBufferMemoryBarrier clearBarrier{};
-			clearBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-			clearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-			clearBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-			clearBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			clearBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			clearBarrier.buffer = accumBuffer;
-			clearBarrier.offset = 0;
-			clearBarrier.size = VK_WHOLE_SIZE;
-			vkCmdPipelineBarrier(
-				commandBuffer,
-				VK_PIPELINE_STAGE_TRANSFER_BIT,
-				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				0,
-				0,
-				nullptr,
-				1,
-				&clearBarrier,
-				0,
-				nullptr
-			);
+				VkBufferMemoryBarrier clearBarrier{};
+				clearBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+				clearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+				clearBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+				clearBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				clearBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				clearBarrier.buffer = accumBuffer;
+				clearBarrier.offset = 0;
+				clearBarrier.size = VK_WHOLE_SIZE;
+				vkCmdPipelineBarrier(
+					commandBuffer,
+					VK_PIPELINE_STAGE_TRANSFER_BIT,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					0,
+					0,
+					nullptr,
+					1,
+					&clearBarrier,
+					0,
+					nullptr
+				);
 
-			accumNeedsClear = false;
-		}
-		else {
-			VkBufferMemoryBarrier sampleBarrier{};
-			sampleBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-			sampleBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-			sampleBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-			sampleBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			sampleBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			sampleBarrier.buffer = accumBuffer;
-			sampleBarrier.offset = 0;
-			sampleBarrier.size = VK_WHOLE_SIZE;
-			vkCmdPipelineBarrier(
-				commandBuffer,
-				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				0,
-				0,
-				nullptr,
-				1,
-				&sampleBarrier,
-				0,
-				nullptr
-			);
+				accumNeedsClear = false;
+			}
+			else {
+				VkBufferMemoryBarrier sampleBarrier{};
+				sampleBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+				sampleBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+				sampleBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+				sampleBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				sampleBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				sampleBarrier.buffer = accumBuffer;
+				sampleBarrier.offset = 0;
+				sampleBarrier.size = VK_WHOLE_SIZE;
+				vkCmdPipelineBarrier(
+					commandBuffer,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					0,
+					0,
+					nullptr,
+					1,
+					&sampleBarrier,
+					0,
+					nullptr
+				);
+			}
 		}
 
 		float modelRayBias = selectedEntry.requiresModel && modelBuffersReady
@@ -1149,10 +1643,12 @@ struct VulkanComputePreview::Impl {
 			glm::vec4(camera.right, 0.0f),
 			glm::vec4(camera.up, 0.0f),
 			glm::vec4(camera.verticalScale, camera.aspect, modelRayBias, 0.0f),
-			sceneCounts
+			sceneCounts,
+			glm::uvec4(0u)
 		};
 
 		bool runShadowMapPrepass =
+			traceSample &&
 			selectedEntry.requiresModel &&
 			modelBuffersReady &&
 			settings.shadowMode == VulkanPreviewShadowMode::ShadowMap &&
@@ -1163,6 +1659,10 @@ struct VulkanComputePreview::Impl {
 		if (timestampSupported && timestampPool != VK_NULL_HANDLE) {
 			vkCmdResetQueryPool(commandBuffer, timestampPool, 0, 2);
 			vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampPool, 0);
+		}
+
+		if (traceSample && selectedEntry.requiresModel && modelBuffersReady) {
+			denoiser.prepareForModelDispatch(commandBuffer);
 		}
 
 		if (runShadowMapPrepass) {
@@ -1218,10 +1718,36 @@ struct VulkanComputePreview::Impl {
 			);
 		}
 
-		vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-		vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
-		vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pushConstants);
-		vkCmdDispatch(commandBuffer, ceilDiv(static_cast<uint32_t>(renderWidth), 16), ceilDiv(static_cast<uint32_t>(renderHeight), 16), 1);
+		if (traceSample) {
+			vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+			vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+			vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pushConstants);
+			vkCmdDispatch(commandBuffer, ceilDiv(static_cast<uint32_t>(renderWidth), 16), ceilDiv(static_cast<uint32_t>(renderHeight), 16), 1);
+		}
+
+		if (selectedEntry.requiresModel && modelBuffersReady) {
+			VulkanDenoiser::FeatureImages features{
+				&denoiser.imageForBinding(kBindingDenoiseNormalRoughness),
+				&denoiser.imageForBinding(kBindingDenoiseAlbedoMetallic),
+				&denoiser.imageForBinding(kBindingDenoiseDepth),
+				&denoiser.imageForBinding(kBindingDenoiseMaterialId),
+				&denoiser.imageForBinding(kBindingDenoiseInstanceId)
+			};
+			denoiser.record(
+				commandBuffer,
+				pipelineLayout,
+				descriptorSet,
+				pushConstants,
+				true,
+				postprocessOnly,
+				features,
+				denoiseSampleCount,
+				settings.denoiser
+			);
+		}
+		else {
+			denoiser.beginFrame(false, false, denoiseSampleCount, settings.denoiser);
+		}
 
 		if (timestampSupported && timestampPool != VK_NULL_HANDLE) {
 			vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestampPool, 1);
@@ -1314,7 +1840,9 @@ struct VulkanComputePreview::Impl {
 		}
 
 		frameCount++;
-		currentSample++;
+		if (traceSample) {
+			currentSample++;
+		}
 		pixels.resize(static_cast<size_t>(renderWidth) * static_cast<size_t>(renderHeight));
 		std::memcpy(pixels.data(), mappedPixels, pixelBufferSize);
 		return true;
@@ -1345,6 +1873,7 @@ struct VulkanComputePreview::Impl {
 		}
 		destroyPipelineResources();
 		destroyDescriptorPool();
+		denoiser.destroy();
 		if (descriptorSetLayout != VK_NULL_HANDLE) {
 			vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
 			descriptorSetLayout = VK_NULL_HANDLE;
@@ -2665,9 +3194,15 @@ struct VulkanComputePreview::Impl {
 			bindings[binding].binding = binding;
 			bindings[binding].descriptorCount = 1;
 			bindings[binding].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-			bindings[binding].descriptorType = binding == kBindingTextures
-				? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-				: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			if (binding == kBindingTextures) {
+				bindings[binding].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+			}
+			else if (binding >= kBindingDenoiseResolvedHdr && binding <= kBindingDenoisePong) {
+				bindings[binding].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+			}
+			else {
+				bindings[binding].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			}
 		}
 		bindings[kBindingTextures].descriptorCount = kMaxPreviewTextures;
 
@@ -2690,11 +3225,13 @@ struct VulkanComputePreview::Impl {
 			return fail("Vulkan descriptor set layout missing");
 		}
 
-		std::array<VkDescriptorPoolSize, 2> poolSizes{};
+		std::array<VkDescriptorPoolSize, 3> poolSizes{};
 		poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-		poolSizes[0].descriptorCount = kStorageDescriptorCount;
+		poolSizes[0].descriptorCount = kStorageBufferDescriptorCount;
 		poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 		poolSizes[1].descriptorCount = kMaxPreviewTextures;
+		poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+		poolSizes[2].descriptorCount = kStorageImageDescriptorCount;
 
 		VkDescriptorPoolCreateInfo poolInfo{};
 		poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -2719,6 +3256,7 @@ struct VulkanComputePreview::Impl {
 		}
 
 		std::array<VkDescriptorBufferInfo, kTotalBindings> bufferInfos{};
+		std::array<VkDescriptorImageInfo, kTotalBindings> imageInfos{};
 		std::array<VkWriteDescriptorSet, kTotalBindings> writes{};
 		for (uint32_t binding = 0; binding < writes.size(); ++binding) {
 			if (binding == kBindingTextures) {
@@ -2736,6 +3274,20 @@ struct VulkanComputePreview::Impl {
 				writes[binding].descriptorCount = kMaxPreviewTextures;
 				writes[binding].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 				writes[binding].pImageInfo = textureDescriptorInfos.data();
+				continue;
+			}
+
+			if (binding >= kBindingDenoiseResolvedHdr && binding <= kBindingDenoisePong) {
+				imageInfos[binding] = denoiser.descriptorForBinding(binding);
+				if (imageInfos[binding].imageView == VK_NULL_HANDLE) {
+					return fail("Vulkan denoiser image descriptors are not ready");
+				}
+				writes[binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+				writes[binding].dstSet = descriptorSet;
+				writes[binding].dstBinding = binding;
+				writes[binding].descriptorCount = 1;
+				writes[binding].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+				writes[binding].pImageInfo = &imageInfos[binding];
 				continue;
 			}
 
@@ -2871,7 +3423,8 @@ struct VulkanComputePreview::Impl {
 				shadowMapShaderModule,
 				"glTF shadow map"
 			) ||
-			!createComputePipeline(shadowMapShaderModule, nullptr, shadowMapPipeline, "glTF shadow map")) {
+			!createComputePipeline(shadowMapShaderModule, nullptr, shadowMapPipeline, "glTF shadow map") ||
+			!denoiser.createPipelines(pipelineLayout)) {
 			return false;
 		}
 
@@ -2879,6 +3432,7 @@ struct VulkanComputePreview::Impl {
 	}
 
 	void destroyPipelineResources() {
+		denoiser.destroyPipelines();
 		if (shadowMapPipeline != VK_NULL_HANDLE) {
 			vkDestroyPipeline(device, shadowMapPipeline, nullptr);
 			shadowMapPipeline = VK_NULL_HANDLE;

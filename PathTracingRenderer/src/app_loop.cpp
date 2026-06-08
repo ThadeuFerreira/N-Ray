@@ -16,6 +16,7 @@ namespace {
 void frameVulkanPreviewModel(RuntimeResources& runtime);
 
 VulkanPreviewShadowMode gVulkanPreviewShadowMode = VulkanPreviewShadowMode::RayTraced;
+VulkanDenoiserSettings gVulkanDenoiserSettings{};
 char gModelFolderPath[512] = {};
 std::string gModelFolderImportStatus;
 
@@ -23,6 +24,35 @@ bool vulkanMaterialPanelVisible(const RuntimeResources& runtime) {
 	return runtime.vulkanPreview.isAvailable() &&
 		VulkanComputePreview::isModelPreviewIndex(runtime.vulkanPreview.shaderIndex()) &&
 		runtime.vulkanPreview.materialCount() > 0;
+}
+
+const char* denoiserModeLabel(VulkanDenoiserMode mode) {
+	switch (mode) {
+	case VulkanDenoiserMode::Off: return "Off";
+	case VulkanDenoiserMode::SpatialAtrous: return "Spatial Atrous";
+	case VulkanDenoiserMode::SvgfLite: return "SVGF Lite";
+	default: return "Unknown";
+	}
+}
+
+const char* denoiserDebugViewLabel(VulkanDenoiserDebugView view) {
+	switch (view) {
+	case VulkanDenoiserDebugView::Final: return "Final";
+	case VulkanDenoiserDebugView::RawAccumulation: return "Raw Accumulation";
+	case VulkanDenoiserDebugView::DenoisedPreview: return "Denoised Preview";
+	case VulkanDenoiserDebugView::Normal: return "Normal";
+	case VulkanDenoiserDebugView::Albedo: return "Albedo";
+	case VulkanDenoiserDebugView::Depth: return "Depth";
+	case VulkanDenoiserDebugView::MaterialId: return "Material Id";
+	case VulkanDenoiserDebugView::InstanceId: return "Instance Id";
+	default: return "Unknown";
+	}
+}
+
+void invalidateVulkanPostprocess(RuntimeResources& runtime) {
+	runtime.vulkanFrameValid = false;
+	runtime.vulkanFrameDispatched = false;
+	params.displayInvalidated = true;
 }
 
 UiLayout makeUiLayout(const RuntimeResources& runtime) {
@@ -305,6 +335,7 @@ VulkanPreviewSettings makeVulkanPreviewSettings() {
 	settings.sunColor = params.sunColor;
 	settings.sunIntensity = params.sunIntensity;
 	settings.shadowMode = gVulkanPreviewShadowMode;
+	settings.denoiser = gVulkanDenoiserSettings;
 	return settings;
 }
 
@@ -380,15 +411,23 @@ bool updateVulkanComputePreview(RuntimeResources& runtime) {
 	size_t pixelCount = static_cast<size_t>(screen.resX) * static_cast<size_t>(screen.resY);
 	bool modelPreview = VulkanComputePreview::isModelPreviewIndex(runtime.vulkanPreview.shaderIndex());
 	bool resetAccumulation = params.renderInvalidated || runtime.vulkanFrame.size() != pixelCount;
+	bool displayOnlyRedraw =
+		modelPreview &&
+		params.displayInvalidated &&
+		!resetAccumulation &&
+		runtime.vulkanFrame.size() == pixelCount &&
+		runtime.vulkanPreview.samplesAccumulated() > 0;
 	bool convergedModelFrame =
 		modelPreview &&
 		runtime.vulkanFrameValid &&
 		runtime.vulkanFrame.size() == pixelCount &&
-		!resetAccumulation;
+		!resetAccumulation &&
+		!displayOnlyRedraw;
 
 	if (!convergedModelFrame) {
 		VulkanPreviewSettings settings = makeVulkanPreviewSettings();
 		settings.resetAccumulation = resetAccumulation;
+		settings.postprocessOnly = displayOnlyRedraw;
 		if (!runtime.vulkanPreview.render(static_cast<float>(GetTime()), makeVulkanPreviewCamera(), settings, runtime.vulkanFrame)) {
 			runtime.vulkanFrameValid = false;
 			runtime.vulkanFrameDispatched = false;
@@ -399,6 +438,7 @@ bool updateVulkanComputePreview(RuntimeResources& runtime) {
 		runtime.vulkanFrameValid = modelPreview && runtime.vulkanPreview.converged();
 		runtime.vulkanFrameDispatched = true;
 		params.renderInvalidated = false;
+		params.displayInvalidated = false;
 	}
 	else {
 		runtime.vulkanFrameDispatched = false;
@@ -605,6 +645,85 @@ void drawVulkanMainMenuBar(RuntimeResources& runtime) {
 			}
 			ImGui::EndMenu();
 		}
+		if (ImGui::BeginMenu("Denoiser")) {
+			bool changed = false;
+			if (ImGui::BeginMenu("Mode")) {
+				bool offSelected = gVulkanDenoiserSettings.mode == VulkanDenoiserMode::Off;
+				if (ImGui::MenuItem("Off", nullptr, offSelected)) {
+					gVulkanDenoiserSettings.mode = VulkanDenoiserMode::Off;
+					changed = true;
+				}
+				bool spatialSelected = gVulkanDenoiserSettings.mode == VulkanDenoiserMode::SpatialAtrous;
+				if (ImGui::MenuItem("Spatial Atrous", nullptr, spatialSelected)) {
+					gVulkanDenoiserSettings.mode = VulkanDenoiserMode::SpatialAtrous;
+					changed = true;
+				}
+				ImGui::MenuItem("SVGF Lite", "not implemented", false, false);
+				ImGui::EndMenu();
+			}
+			if (ImGui::BeginMenu("Debug View")) {
+				for (uint32_t i = 0; i <= static_cast<uint32_t>(VulkanDenoiserDebugView::InstanceId); ++i) {
+					VulkanDenoiserDebugView view = static_cast<VulkanDenoiserDebugView>(i);
+					bool selected = gVulkanDenoiserSettings.debugView == view;
+					if (ImGui::MenuItem(denoiserDebugViewLabel(view), nullptr, selected)) {
+						gVulkanDenoiserSettings.debugView = view;
+						changed = true;
+					}
+				}
+				ImGui::EndMenu();
+			}
+
+			int passCap = static_cast<int>(gVulkanDenoiserSettings.maxAtrousPasses);
+			ImGui::SetNextItemWidth(180.0f);
+			if (ImGui::SliderInt("Pass cap", &passCap, 0, 6)) {
+				gVulkanDenoiserSettings.maxAtrousPasses = static_cast<uint32_t>(std::clamp(passCap, 0, 6));
+				changed = true;
+			}
+			int fadeStart = static_cast<int>(gVulkanDenoiserSettings.fadeOutStartSample);
+			int fadeEnd = static_cast<int>(gVulkanDenoiserSettings.fadeOutEndSample);
+			ImGui::SetNextItemWidth(180.0f);
+			if (ImGui::SliderInt("Fade start", &fadeStart, kMinSamples, kMaxSamples)) {
+				fadeStart = std::clamp(fadeStart, kMinSamples, kMaxSamples);
+				gVulkanDenoiserSettings.fadeOutStartSample = static_cast<uint32_t>(fadeStart);
+				if (fadeEnd < fadeStart) {
+					gVulkanDenoiserSettings.fadeOutEndSample = static_cast<uint32_t>(fadeStart);
+				}
+				changed = true;
+			}
+			fadeEnd = static_cast<int>(gVulkanDenoiserSettings.fadeOutEndSample);
+			ImGui::SetNextItemWidth(180.0f);
+			if (ImGui::SliderInt("Fade end", &fadeEnd, kMinSamples, kMaxSamples)) {
+				fadeEnd = std::clamp(fadeEnd, kMinSamples, kMaxSamples);
+				if (fadeEnd < static_cast<int>(gVulkanDenoiserSettings.fadeOutStartSample)) {
+					fadeEnd = static_cast<int>(gVulkanDenoiserSettings.fadeOutStartSample);
+				}
+				gVulkanDenoiserSettings.fadeOutEndSample = static_cast<uint32_t>(fadeEnd);
+				changed = true;
+			}
+			ImGui::SetNextItemWidth(180.0f);
+			changed |= ImGui::SliderFloat("Depth sigma", &gVulkanDenoiserSettings.depthSigma, 0.0f, 200.0f);
+			ImGui::SetNextItemWidth(180.0f);
+			changed |= ImGui::SliderFloat("Normal sigma", &gVulkanDenoiserSettings.normalSigma, 0.0f, 128.0f);
+			ImGui::SetNextItemWidth(180.0f);
+			changed |= ImGui::SliderFloat("Luma sigma", &gVulkanDenoiserSettings.lumaSigma, 0.0f, 16.0f);
+			changed |= ImGui::Checkbox("Firefly clamp", &gVulkanDenoiserSettings.fireflyClamp);
+			bool verboseChanged = ImGui::Checkbox("Verbose logging", &gVulkanDenoiserSettings.verboseLogging);
+			changed |= verboseChanged;
+
+			GpuStats gpuStats = runtime.vulkanPreview.gpuStats();
+			ImGui::Separator();
+			ImGui::Text("Mode: %s", denoiserModeLabel(gpuStats.denoiser.mode));
+			ImGui::Text("View: %s", denoiserDebugViewLabel(gpuStats.denoiser.debugView));
+			ImGui::Text("Strength: %.2f", gpuStats.denoiser.strength);
+			ImGui::Text("Passes: %u", gpuStats.denoiser.passCount);
+			if (!gpuStats.denoiser.status.empty()) {
+				ImGui::TextWrapped("Status: %s", gpuStats.denoiser.status.c_str());
+			}
+			if (changed) {
+				invalidateVulkanPostprocess(runtime);
+			}
+			ImGui::EndMenu();
+		}
 		if (ImGui::MenuItem("Frame Active Scene")) {
 			frameVulkanPreviewModel(runtime);
 		}
@@ -671,6 +790,9 @@ void drawVulkanMaterialPanel(RuntimeResources& runtime, const UiLayout& layout) 
 		}
 		if (ImGui::Button("Reset materials")) {
 			runtime.vulkanPreview.resetMaterialStates();
+			runtime.vulkanFrameValid = false;
+			runtime.vulkanFrameDispatched = false;
+			params.renderInvalidated = true;
 		}
 
 		bool changed = false;
@@ -719,7 +841,11 @@ void drawVulkanMaterialPanel(RuntimeResources& runtime, const UiLayout& layout) 
 		}
 
 		if (changed) {
-			runtime.vulkanPreview.setMaterialState(selectedMaterial, matState);
+			if (runtime.vulkanPreview.setMaterialState(selectedMaterial, matState)) {
+				runtime.vulkanFrameValid = false;
+				runtime.vulkanFrameDispatched = false;
+				params.renderInvalidated = true;
+			}
 		}
 
 		ImGui::EndTable();

@@ -1,0 +1,120 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+struct GpuSettings {
+	vec4 renderParams;
+	vec4 skyParams;
+	vec4 sunDir;
+	vec4 sunColor;
+	vec4 shadowParams;
+	vec4 shadowBasisX;
+	vec4 shadowBasisY;
+	vec4 shadowBasisZ;
+	vec4 shadowBounds;
+	vec4 shadowDepth;
+	vec4 denoiseParams;
+	uvec4 denoiseFlags;
+};
+
+layout(std430, binding = 6) readonly buffer SettingsBuffer {
+	GpuSettings cfg;
+};
+
+layout(rgba16f, binding = 10) uniform image2D normalRoughnessImage;
+layout(r32f, binding = 12) uniform image2D depthImage;
+layout(r32ui, binding = 13) uniform uimage2D materialIdImage;
+layout(rgba16f, binding = 15) uniform image2D denoisePingImage;
+layout(rgba16f, binding = 16) uniform image2D denoisePongImage;
+
+layout(push_constant) uniform PushConstants {
+	int width;
+	int height;
+	float time;
+	uint sampleIndex;
+	vec4 cameraPos;
+	vec4 cameraForward;
+	vec4 cameraRight;
+	vec4 cameraUp;
+	vec4 cameraParams;
+	uvec4 sceneCounts;
+	uvec4 denoisePass;
+} pc;
+
+const uint INVALID_ID = 0xffffffffu;
+
+float luminance(vec3 color) {
+	return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+ivec2 clampPixel(ivec2 pixel) {
+	return clamp(pixel, ivec2(0), ivec2(pc.width - 1, pc.height - 1));
+}
+
+vec3 loadSource(ivec2 pixel) {
+	if ((pc.denoisePass.x & 1u) == 0u) {
+		return imageLoad(denoisePingImage, pixel).rgb;
+	}
+	return imageLoad(denoisePongImage, pixel).rgb;
+}
+
+void storeDest(ivec2 pixel, vec3 color) {
+	if ((pc.denoisePass.x & 1u) == 0u) {
+		imageStore(denoisePongImage, pixel, vec4(color, 1.0));
+	}
+	else {
+		imageStore(denoisePingImage, pixel, vec4(color, 1.0));
+	}
+}
+
+float guideWeight(ivec2 centerPixel, ivec2 samplePixel, vec3 centerColor, vec3 sampleColor) {
+	vec4 centerGuide = imageLoad(normalRoughnessImage, centerPixel);
+	vec4 sampleGuide = imageLoad(normalRoughnessImage, samplePixel);
+	float centerDepth = imageLoad(depthImage, centerPixel).r;
+	float sampleDepth = imageLoad(depthImage, samplePixel).r;
+	uint centerMaterial = imageLoad(materialIdImage, centerPixel).r;
+	uint sampleMaterial = imageLoad(materialIdImage, samplePixel).r;
+
+	if (centerMaterial != sampleMaterial) {
+		return 0.0;
+	}
+
+	float normalWeight = 1.0;
+	if (centerMaterial != INVALID_ID) {
+		vec3 centerNormal = normalize(centerGuide.xyz);
+		vec3 sampleNormal = normalize(sampleGuide.xyz);
+		float normalAffinity = clamp(dot(centerNormal, sampleNormal), 0.0, 1.0);
+		normalWeight = pow(normalAffinity, max(cfg.denoiseParams.z, 0.0));
+	}
+
+	float depthScale = max(abs(centerDepth), 1.0);
+	float depthWeight = exp(-abs(centerDepth - sampleDepth) * max(cfg.denoiseParams.y, 0.0) / depthScale);
+	float lumaWeight = exp(-abs(luminance(centerColor) - luminance(sampleColor)) * max(cfg.denoiseParams.w, 0.0));
+	return normalWeight * depthWeight * lumaWeight;
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	if (pixel.x >= pc.width || pixel.y >= pc.height) {
+		return;
+	}
+
+	int stride = max(1, int(pc.denoisePass.y));
+	const float kernel[5] = float[5](0.0625, 0.25, 0.375, 0.25, 0.0625);
+	vec3 centerColor = max(loadSource(pixel), vec3(0.0));
+	vec3 sum = vec3(0.0);
+	float weightSum = 0.0;
+
+	for (int y = -2; y <= 2; ++y) {
+		for (int x = -2; x <= 2; ++x) {
+			ivec2 samplePixel = clampPixel(pixel + ivec2(x * stride, y * stride));
+			vec3 sampleColor = max(loadSource(samplePixel), vec3(0.0));
+			float weight = kernel[x + 2] * kernel[y + 2] * guideWeight(pixel, samplePixel, centerColor, sampleColor);
+			sum += sampleColor * weight;
+			weightSum += weight;
+		}
+	}
+
+	vec3 filtered = weightSum > 0.000001 ? sum / weightSum : centerColor;
+	storeDest(pixel, max(filtered, vec3(0.0)));
+}

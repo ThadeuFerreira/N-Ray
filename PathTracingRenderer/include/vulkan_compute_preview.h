@@ -91,6 +91,7 @@ struct VulkanPreviewSettings {
 	VulkanPreviewShadowMode shadowMode = VulkanPreviewShadowMode::RayTraced;
 	VulkanDenoiserSettings denoiser;
 	bool resetAccumulation = false;
+	bool postprocessOnly = false;
 };
 
 // Live, per-material overrides for the glTF model preview. These values are the

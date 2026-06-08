@@ -42,6 +42,8 @@ struct GpuSettings {
 	vec4 shadowBasisZ;
 	vec4 shadowBounds;
 	vec4 shadowDepth;
+	vec4 denoiseParams;
+	uvec4 denoiseFlags;
 };
 
 layout(std430, binding = 1) readonly buffer TriIntersectBuffer {
@@ -77,6 +79,7 @@ layout(push_constant) uniform PushConstants {
 	vec4 cameraUp;
 	vec4 cameraParams;
 	uvec4 sceneCounts;
+	uvec4 denoisePass;
 } pc;
 
 const uint INVALID_TEXTURE = 0xffffffffu;

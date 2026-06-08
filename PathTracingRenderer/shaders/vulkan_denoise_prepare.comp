@@ -1,0 +1,80 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+struct GpuSettings {
+	vec4 renderParams;
+	vec4 skyParams;
+	vec4 sunDir;
+	vec4 sunColor;
+	vec4 shadowParams;
+	vec4 shadowBasisX;
+	vec4 shadowBasisY;
+	vec4 shadowBasisZ;
+	vec4 shadowBounds;
+	vec4 shadowDepth;
+	vec4 denoiseParams;
+	uvec4 denoiseFlags;
+};
+
+layout(std430, binding = 6) readonly buffer SettingsBuffer {
+	GpuSettings cfg;
+};
+
+layout(rgba32f, binding = 9) uniform image2D resolvedHdrImage;
+layout(rgba16f, binding = 15) uniform image2D denoisePingImage;
+
+layout(push_constant) uniform PushConstants {
+	int width;
+	int height;
+	float time;
+	uint sampleIndex;
+	vec4 cameraPos;
+	vec4 cameraForward;
+	vec4 cameraRight;
+	vec4 cameraUp;
+	vec4 cameraParams;
+	uvec4 sceneCounts;
+	uvec4 denoisePass;
+} pc;
+
+float luminance(vec3 color) {
+	return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+ivec2 clampPixel(ivec2 pixel) {
+	return clamp(pixel, ivec2(0), ivec2(pc.width - 1, pc.height - 1));
+}
+
+vec3 clampFirefly(ivec2 pixel, vec3 color) {
+	if (cfg.denoiseFlags.z == 0u) {
+		return color;
+	}
+
+	float centerLuma = luminance(color);
+	float meanLuma = 0.0;
+	for (int y = -1; y <= 1; ++y) {
+		for (int x = -1; x <= 1; ++x) {
+			vec3 sampleColor = imageLoad(resolvedHdrImage, clampPixel(pixel + ivec2(x, y))).rgb;
+			meanLuma += luminance(max(sampleColor, vec3(0.0)));
+		}
+	}
+	meanLuma *= 1.0 / 9.0;
+
+	float limit = max(meanLuma * 8.0, meanLuma + 1.0);
+	if (centerLuma > limit && centerLuma > 0.000001) {
+		color *= limit / centerLuma;
+	}
+	return color;
+}
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	if (pixel.x >= pc.width || pixel.y >= pc.height) {
+		return;
+	}
+
+	vec3 color = max(imageLoad(resolvedHdrImage, pixel).rgb, vec3(0.0));
+	color = clampFirefly(pixel, color);
+	imageStore(denoisePingImage, pixel, vec4(color, 1.0));
+}
