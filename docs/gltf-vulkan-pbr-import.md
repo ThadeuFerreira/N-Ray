@@ -30,17 +30,32 @@ buffer contract is stable. The first compute path should still upload the
 renderer-owned data that already exists today: `data.triIsect`, triangle shading
 data derived from `data.tris`, `data.materials`, and `globalCompactBVH`.
 
-The current preview importer is a validation bridge: it parses one local glTF
-asset with TinyGLTF, flattens it into `Tri`/`TriIntersect`/`PBRMaterial`/compact
-BVH data, uploads explicit storage-buffer structs, and renders through the
-progressive Vulkan compute preview. It does not replace the CPU runtime scene or
-implement full PBR texture sampling yet.
+The current preview importer is a validation bridge: it parses local glTF assets
+with TinyGLTF, flattens them into `Tri`/`TriIntersect`/`PBRMaterial`/compact BVH
+data, uploads explicit storage-buffer structs, and renders through the
+progressive Vulkan compute preview. It does not replace the CPU runtime scene,
+but it now evaluates textured glTF material inputs in the compute path.
 
 For robust validation visibility, the compute preview also applies small
 scene-scale ray/BVH tolerances and uploads imported triangles as two-sided. This
 is a preview-path simplification for thin panels, wheels, mirrors, and similar
 assets; future strict glTF raster/PBR paths should honor material `doubleSided`
 state and backface-culling rules directly.
+
+Transparency/refraction status is deliberately split:
+
+- `alphaMode` is treated as coverage/cutout data, not physical transmission.
+- `KHR_materials_transmission`, transmission textures, and `KHR_materials_ior`
+  are imported into the Vulkan material SSBO and used by the compute bounce loop.
+- Thin transmission is currently the reliable glass path and visibly affects the
+  image without macroscopic bending.
+- Volume transmission is wired with Snell refraction, single-medium tracking,
+  Beer's-law attenuation, UI controls, and a preview fallback that assigns small
+  scene-scaled thickness to transmissive materials when `KHR_materials_volume` is
+  absent. It still needs visual tuning and validation before being considered
+  finished.
+- Ray-traced shadows attenuate through transmissive materials; shadow-map mode
+  remains an approximation for transparent/volumetric casters.
 
 After that contract is proven in the renderer path, a glTF importer should
 replace the hardcoded `ObjImporter` scene frontend by flattening glTF meshes and
@@ -98,9 +113,9 @@ This also explains the staged implementation:
   it must evaluate material shading inside the compute shader after traversal
   finds the closest hit.
 - The current glTF compute shader is still a validation step for scene
-  flattening, material indexing, BVH traversal, analytic material factors, and
-  progressive accumulation before texture sampling and full glTF material
-  coverage are added.
+  flattening, material indexing, BVH traversal, texture sampling, progressive
+  accumulation, shadows, denoising guide buffers, and transmission before full
+  glTF material coverage and tuned volume refraction are complete.
 
 ## Local Validation Corpus
 

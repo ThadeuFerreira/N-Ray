@@ -4,7 +4,7 @@
 
 inline constexpr float kUiSettingsPanelWidth = 200.0f;
 inline constexpr float kUiStatsPanelWidth = 280.0f;
-inline constexpr float kUiMaterialPanelHeight = 260.0f;
+inline constexpr float kUiMaterialPanelHeight = 340.0f;
 
 inline constexpr ImGuiWindowFlags kLockedPanelFlags =
 	ImGuiWindowFlags_NoMove |

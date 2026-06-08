@@ -82,7 +82,9 @@ struct GpuMaterial {
 	glm::vec4 emissionIor;    // rgb emissiveFactor, a IOR
 	glm::uvec4 textureIndices; // baseColor, metallicRoughness, normal, emissive
 	glm::uvec4 textureInfo;    // occlusion, normalizedAlphaMode, transmission, materialKind
-	glm::vec4 textureParams;   // alphaCutoff, normalScale, occlusionStrength, unused
+	glm::vec4 textureParams;   // alphaCutoff, normalScale, occlusionStrength, volumeThickness
+	glm::vec4 attenuation;     // rgb attenuationColor, a attenuationDistance
+	glm::uvec4 volumeTextureInfo; // thicknessTexture, unused
 };
 
 struct GpuBvhNode {
@@ -110,7 +112,7 @@ struct GpuSettings {
 
 static_assert(sizeof(GpuTriIntersect) == 64, "GpuTriIntersect must match std430 shader layout.");
 static_assert(sizeof(GpuTriShading) == 144, "GpuTriShading must match std430 shader layout.");
-static_assert(sizeof(GpuMaterial) == 96, "GpuMaterial must match std430 shader layout.");
+static_assert(sizeof(GpuMaterial) == 128, "GpuMaterial must match std430 shader layout.");
 static_assert(sizeof(GpuBvhNode) == 48, "GpuBvhNode must match std430 shader layout.");
 static_assert(sizeof(GpuSettings) == 192, "GpuSettings must match std430 shader layout.");
 
@@ -130,6 +132,43 @@ const char* vkResultName(VkResult result) {
 	case VK_ERROR_INCOMPATIBLE_DRIVER: return "VK_ERROR_INCOMPATIBLE_DRIVER";
 	default: return "VK_ERROR_UNKNOWN";
 	}
+}
+
+VulkanPreviewOpticalMode opticalModeFromMaterialKind(uint32_t materialKind) {
+	switch (materialKind) {
+	case GLTF_PREVIEW_MATERIAL_THIN_TRANSMISSION:
+		return VulkanPreviewOpticalMode::ThinTransmission;
+	case GLTF_PREVIEW_MATERIAL_VOLUME_TRANSMISSION:
+		return VulkanPreviewOpticalMode::VolumeTransmission;
+	default:
+		return VulkanPreviewOpticalMode::Coverage;
+	}
+}
+
+uint32_t materialKindFromOpticalMode(VulkanPreviewOpticalMode mode, uint32_t currentKind, uint32_t alphaMode, float metalness) {
+	switch (mode) {
+	case VulkanPreviewOpticalMode::ThinTransmission:
+		return GLTF_PREVIEW_MATERIAL_THIN_TRANSMISSION;
+	case VulkanPreviewOpticalMode::VolumeTransmission:
+		return GLTF_PREVIEW_MATERIAL_VOLUME_TRANSMISSION;
+	default:
+		break;
+	}
+
+	if (currentKind != GLTF_PREVIEW_MATERIAL_THIN_TRANSMISSION &&
+		currentKind != GLTF_PREVIEW_MATERIAL_VOLUME_TRANSMISSION) {
+		return currentKind;
+	}
+
+	if (alphaMode == GLTF_PREVIEW_ALPHA_MASK) {
+		return GLTF_PREVIEW_MATERIAL_ALPHA_MASK;
+	}
+	if (alphaMode == GLTF_PREVIEW_ALPHA_BLEND) {
+		return GLTF_PREVIEW_MATERIAL_ALPHA_BLEND_COVERAGE;
+	}
+	return metalness > 0.5f
+		? GLTF_PREVIEW_MATERIAL_OPAQUE_METAL
+		: GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC;
 }
 
 std::string vkErrorMessage(const char* op, VkResult result) {
@@ -2063,7 +2102,18 @@ struct VulkanComputePreview::Impl {
 		material.params.w       = std::clamp(state.transmission, 0.0f, 1.0f);
 		material.emissionIor    = glm::vec4(glm::max(state.emissiveFactor, glm::vec3(0.0f)),
 		                                    std::max(state.ior, 1.001f));
+		material.textureInfo.w  = materialKindFromOpticalMode(
+			state.opticalMode,
+			material.textureInfo.w,
+			material.textureInfo.y,
+			material.params.y
+		);
 		material.textureParams.y = std::clamp(state.normalScale, 0.0f, 4.0f);
+		material.textureParams.w = std::max(state.volumeThickness, 0.0f);
+		material.attenuation     = glm::vec4(
+			glm::clamp(state.attenuationColor, glm::vec3(0.0f), glm::vec3(1.0f)),
+			std::max(state.attenuationDistance, 0.0f)
+		);
 		if (!updateMaterialBuffer()) {
 			return false;
 		}
@@ -3058,9 +3108,13 @@ struct VulkanComputePreview::Impl {
 			uint32_t emissiveTexture = meta ? gpuTextureIndex(meta->emissiveTexture) : GLTF_PREVIEW_INVALID_TEXTURE;
 			uint32_t occlusionTexture = meta ? gpuTextureIndex(meta->occlusionTexture) : GLTF_PREVIEW_INVALID_TEXTURE;
 			uint32_t transmissionTexture = meta ? gpuTextureIndex(meta->transmissionTexture) : GLTF_PREVIEW_INVALID_TEXTURE;
+			uint32_t thicknessTexture = meta ? gpuTextureIndex(meta->thicknessTexture) : GLTF_PREVIEW_INVALID_TEXTURE;
 			float alphaCutoff = meta ? meta->alphaCutoff : 0.5f;
 			float normalScale = meta ? meta->normalScale : 1.0f;
 			float occlusionStrength = meta ? meta->occlusionStrength : 1.0f;
+			float volumeThickness = meta ? meta->volumeThickness : material.volume;
+			glm::vec3 attenuationColor = meta ? meta->attenuationColor : material.absorptionCol;
+			float attenuationDistance = meta ? meta->attenuationDistance : (material.absorption > 0.0f ? 1.0f / material.absorption : 0.0f);
 			uint32_t alphaMode = meta ? meta->normalizedAlphaMode : GLTF_PREVIEW_ALPHA_OPAQUE;
 			uint32_t materialKind = meta ? meta->materialKind : GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC;
 			gpuMaterials.push_back({
@@ -3069,7 +3123,9 @@ struct VulkanComputePreview::Impl {
 				glm::vec4(emission, ior),
 				glm::uvec4(baseColorTexture, metallicRoughnessTexture, normalTexture, emissiveTexture),
 				glm::uvec4(occlusionTexture, alphaMode, transmissionTexture, materialKind),
-				glm::vec4(alphaCutoff, normalScale, occlusionStrength, 0.0f)
+				glm::vec4(alphaCutoff, normalScale, occlusionStrength, volumeThickness),
+				glm::vec4(glm::clamp(attenuationColor, glm::vec3(0.0f), glm::vec3(1.0f)), std::max(attenuationDistance, 0.0f)),
+				glm::uvec4(thicknessTexture, 0u, 0u, 0u)
 			});
 		}
 
@@ -3842,15 +3898,20 @@ bool VulkanComputePreview::materialState(int index, VulkanPreviewMaterialState& 
 	out.transmission      = material.params.w;
 	out.emissiveFactor    = glm::vec3(material.emissionIor);
 	out.ior               = material.emissionIor.a;
+	out.opticalMode       = opticalModeFromMaterialKind(material.textureInfo.w);
+	out.volumeThickness   = material.textureParams.w;
+	out.attenuationColor  = glm::vec3(material.attenuation);
+	out.attenuationDistance = material.attenuation.a;
 	out.normalScale       = material.textureParams.y;
 	out.hasBaseColorTexture         = material.textureIndices.x != GLTF_PREVIEW_INVALID_TEXTURE;
 	out.hasMetallicRoughnessTexture = material.textureIndices.y != GLTF_PREVIEW_INVALID_TEXTURE;
 	out.hasNormalTexture            = material.textureIndices.z != GLTF_PREVIEW_INVALID_TEXTURE;
 	out.hasEmissiveTexture          = material.textureIndices.w != GLTF_PREVIEW_INVALID_TEXTURE;
 	out.hasOcclusionTexture         = material.textureInfo.x   != GLTF_PREVIEW_INVALID_TEXTURE;
+	out.hasTransmissionTexture      = material.textureInfo.z   != GLTF_PREVIEW_INVALID_TEXTURE;
+	out.hasThicknessTexture         = material.volumeTextureInfo.x != GLTF_PREVIEW_INVALID_TEXTURE;
 	out.materialKind    = material.textureInfo.w;
-	out.isTransmission  = (material.textureInfo.w == GLTF_PREVIEW_MATERIAL_THIN_TRANSMISSION
-	                    || material.textureInfo.w == GLTF_PREVIEW_MATERIAL_VOLUME_TRANSMISSION);
+	out.isTransmission  = out.opticalMode != VulkanPreviewOpticalMode::Coverage;
 	const auto sz = static_cast<int>(m_impl->modelScene.materialMeta.size());
 	if (index < sz) {
 		const GltfPreviewMaterialMeta& meta = m_impl->modelScene.materialMeta[static_cast<size_t>(index)];

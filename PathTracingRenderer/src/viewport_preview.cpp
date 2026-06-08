@@ -37,13 +37,20 @@ void drawRasterPreview() {
 				pos = tri.c;
 			}
 
-			float light = std::fabs(glm::dot(lightDir, normal));
-			float intensity = (light < 0.9f) ? (light * 0.9f) : (light * light);
-			glm::vec3 col = glm::clamp(material.albedo * intensity, 0.0f, 1.0f);
+			if (params.debugMaterialColors) {
+				float hue = fmodf(tri.materialIdx * 137.5f, 360.0f);
+				Color col = ColorFromHSV(hue, 0.8f, 1.0f);
+				rlColor4ub(col.r, col.g, col.b, col.a);
+			}
+			else {
+				float light = std::fabs(glm::dot(lightDir, normal));
+				float intensity = (light < 0.9f) ? (light * 0.9f) : (light * light);
+				glm::vec3 col = glm::clamp(material.albedo * intensity, 0.0f, 1.0f);
 
-			RenderPixel pixel = vec3ToRenderPixel(col);
+				RenderPixel pixel = vec3ToRenderPixel(col);
 
-			rlColor4ub(pixel.r, pixel.g, pixel.b, pixel.a);
+				rlColor4ub(pixel.r, pixel.g, pixel.b, pixel.a);
+			}
 			rlVertex3f(pos.x, pos.y, pos.z);
 		}
 	}

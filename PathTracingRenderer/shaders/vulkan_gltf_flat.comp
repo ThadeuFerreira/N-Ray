@@ -36,6 +36,8 @@ struct GpuMaterial {
 	uvec4 textureIndices;
 	uvec4 textureInfo;
 	vec4 textureParams;
+	vec4 attenuation;
+	uvec4 volumeTextureInfo;
 };
 
 struct GpuBvhNode {
@@ -327,6 +329,32 @@ bool materialIsThinTransmission(GpuMaterial material) {
 	return material.textureInfo.w == MATERIAL_THIN_TRANSMISSION;
 }
 
+bool materialIsVolumeTransmission(GpuMaterial material) {
+	return material.textureInfo.w == MATERIAL_VOLUME_TRANSMISSION;
+}
+
+float materialVolumeThickness(GpuMaterial material, vec2 uv) {
+	if (!materialIsVolumeTransmission(material)) {
+		return 0.0;
+	}
+
+	float thickness = max(material.textureParams.w, 0.0);
+	if (validTexture(material.volumeTextureInfo.x)) {
+		thickness *= clamp(sampleSceneTexture(material.volumeTextureInfo.x, uv, vec4(1.0)).g, 0.0, 1.0);
+	}
+	return thickness;
+}
+
+vec3 materialBeerAttenuation(vec3 attenuationColor, float attenuationDistance, float distance, float transmissionStrength) {
+	if (!(attenuationDistance > EPSILON) || !(distance > EPSILON) || transmissionStrength <= 0.001) {
+		return vec3(1.0);
+	}
+
+	vec3 color = clamp(attenuationColor, vec3(0.0), vec3(1.0));
+	vec3 absorption = exp(-(vec3(1.0) - color) * (distance / attenuationDistance));
+	return mix(vec3(1.0), absorption, clamp(transmissionStrength, 0.0, 1.0));
+}
+
 bool materialIsUnlit(GpuMaterial material) {
 	return material.textureInfo.w == MATERIAL_UNLIT;
 }
@@ -553,11 +581,11 @@ bool traverseBvh(
 	return hit && hitTriIdx < triCount;
 }
 
-float rayTracedShadowVisibility(vec3 hitPos, vec3 normal, vec3 lightDir) {
+vec3 rayTracedShadowVisibility(vec3 hitPos, vec3 normal, vec3 lightDir) {
 	float bias = rayBias();
 	vec3 shadowOrigin = hitPos + normal * bias;
 	vec3 invLightDir = 1.0 / lightDir;
-	float visibility = 1.0;
+	vec3 visibility = vec3(1.0);
 
 	for (int i = 0; i < 8; ++i) {
 		uint hitTriIdx;
@@ -573,18 +601,23 @@ float rayTracedShadowVisibility(vec3 hitPos, vec3 normal, vec3 lightDir) {
 		GpuTriShading shading = triShading[hitTriIdx];
 		uint materialIndex = shading.ids.x;
 		if (materialIndex >= pc.sceneCounts.z) {
-			return 0.0;
+			return vec3(0.0);
 		}
 
 		vec2 hitUv = interpolateUv(shading, hitU, hitV);
-		float transmission = materialTransmissionStrength(materials[materialIndex], hitUv);
+		GpuMaterial material = materials[materialIndex];
+		float transmission = materialTransmissionStrength(material, hitUv);
 		if (transmission <= 0.001) {
-			return 0.0;
+			return vec3(0.0);
 		}
 
-		visibility *= transmission;
-		if (visibility <= 0.01) {
-			return 0.0;
+		visibility *= vec3(transmission);
+		float thickness = materialVolumeThickness(material, hitUv);
+		if (thickness > 0.001) {
+			visibility *= materialBeerAttenuation(material.attenuation.rgb, material.attenuation.a, thickness, transmission);
+		}
+		if (maxComponent(visibility) <= 0.01) {
+			return vec3(0.0);
 		}
 
 		shadowOrigin += lightDir * (closestT + bias);
@@ -612,13 +645,13 @@ float unpackShadowDepth(uint packedDepth) {
 	return float(packedDepth) * (1.0 / 4294967294.0);
 }
 
-float shadowMapVisibility(vec3 hitPos, vec3 normal, vec3 lightDir) {
+vec3 shadowMapVisibility(vec3 hitPos, vec3 normal, vec3 lightDir) {
 	uint mapSize = max(1u, uint(cfg.shadowParams.y + 0.5));
 	vec2 uv;
 	float receiverDepth;
 	vec3 samplePos = hitPos + normal * cfg.shadowDepth.w;
 	if (!projectShadowMap(samplePos, uv, receiverDepth)) {
-		return 1.0;
+		return vec3(1.0);
 	}
 
 	ivec2 baseTexel = ivec2(floor(uv * float(mapSize)));
@@ -647,10 +680,10 @@ float shadowMapVisibility(vec3 hitPos, vec3 normal, vec3 lightDir) {
 		}
 	}
 
-	return sampleCount > 0.0 ? visibility / sampleCount : 1.0;
+	return vec3(sampleCount > 0.0 ? visibility / sampleCount : 1.0);
 }
 
-float directSunVisibility(vec3 hitPos, vec3 normal, vec3 lightDir) {
+vec3 directSunVisibility(vec3 hitPos, vec3 normal, vec3 lightDir) {
 	uint shadowMode = uint(cfg.shadowParams.x + 0.5);
 	if (shadowMode == SHADOW_MODE_RAY_TRACED) {
 		return rayTracedShadowVisibility(hitPos, normal, lightDir);
@@ -658,7 +691,7 @@ float directSunVisibility(vec3 hitPos, vec3 normal, vec3 lightDir) {
 	if (shadowMode == SHADOW_MODE_SHADOW_MAP) {
 		return shadowMapVisibility(hitPos, normal, lightDir);
 	}
-	return 1.0;
+	return vec3(1.0);
 }
 
 vec3 directSunLighting(vec3 hitPos, vec3 normal, vec3 albedo, float metalness) {
@@ -668,7 +701,7 @@ vec3 directSunLighting(vec3 hitPos, vec3 normal, vec3 albedo, float metalness) {
 		return vec3(0.0);
 	}
 
-	float visibility = directSunVisibility(hitPos, normal, lightDir);
+	vec3 visibility = directSunVisibility(hitPos, normal, lightDir);
 	float sunAngularRadius = radians(max(cfg.sunDir.w, 0.01));
 	float sunSolidAngle = 2.0 * PI * (1.0 - cos(sunAngularRadius));
 	vec3 diffuseAlbedo = albedo * (1.0 - clamp(metalness, 0.0, 1.0));
@@ -711,6 +744,13 @@ void main() {
 	int maxBounces = max(0, int(cfg.renderParams.x + 0.5));
 	int rrMinBounces = max(0, int(cfg.renderParams.y + 0.5));
 	bool useRussianRoulette = cfg.renderParams.z > 0.5;
+	bool insideVolumeMedium = false;
+	float mediumIor = 1.0;
+	vec3 mediumAttenuationColor = vec3(1.0);
+	float mediumAttenuationDistance = 0.0;
+	float mediumTransmission = 0.0;
+	float mediumFallbackThickness = 0.0;
+	uint mediumMaterialId = INVALID_ID;
 
 	for (int bounce = 0; bounce <= maxBounces; ++bounce) {
 		uint hitTriIdx;
@@ -721,11 +761,27 @@ void main() {
 		bool hit = traverseBvh(origin, dir, invDir, hitTriIdx, closestT, hitU, hitV, stackOverflow);
 
 		if (stackOverflow) {
+			if (insideVolumeMedium) {
+				throughput *= materialBeerAttenuation(
+					mediumAttenuationColor,
+					mediumAttenuationDistance,
+					max(mediumFallbackThickness, 0.0),
+					mediumTransmission
+				);
+			}
 			radiance += throughput * sky(dir);
 			break;
 		}
 
 		if (!hit) {
+			if (insideVolumeMedium) {
+				throughput *= materialBeerAttenuation(
+					mediumAttenuationColor,
+					mediumAttenuationDistance,
+					max(mediumFallbackThickness, 0.0),
+					mediumTransmission
+				);
+			}
 			radiance += throughput * sky(dir);
 			break;
 		}
@@ -733,11 +789,9 @@ void main() {
 		GpuTriIntersect hitTri = triIsect[hitTriIdx];
 		GpuTriShading shading = triShading[hitTriIdx];
 		float hitW = 1.0 - hitU - hitV;
-		vec3 faceNormal = safeNormalize(cross(hitTri.eA.xyz, hitTri.eB.xyz), -dir);
-		bool enteringMedium = dot(dir, faceNormal) < 0.0;
-		if (!enteringMedium) {
-			faceNormal = -faceNormal;
-		}
+		vec3 geometricNormal = safeNormalize(cross(hitTri.eA.xyz, hitTri.eB.xyz), -dir);
+		bool frontFace = dot(dir, geometricNormal) < 0.0;
+		vec3 faceNormal = frontFace ? geometricNormal : -geometricNormal;
 		vec3 normal = safeNormalize(shading.aN.xyz * hitW + shading.bN.xyz * hitU + shading.cN.xyz * hitV, faceNormal);
 		if (dot(normal, -dir) < 0.0) {
 			normal = -normal;
@@ -752,7 +806,11 @@ void main() {
 		vec3 emissionColor = vec3(0.0);
 		float ior = 1.5;
 		float transmissionStrength = 0.0;
+		float volumeThickness = 0.0;
+		vec3 attenuationColor = vec3(1.0);
+		float attenuationDistance = 0.0;
 		bool thinTransmission = false;
+		bool volumeTransmission = false;
 		bool unlitMaterial = false;
 		if (materialIndex < pc.sceneCounts.z) {
 			GpuMaterial material = materials[materialIndex];
@@ -779,6 +837,13 @@ void main() {
 			ior = max(material.emissionIor.a, 1.001);
 			transmissionStrength = materialTransmissionStrength(material, hitUv);
 			thinTransmission = materialIsThinTransmission(material);
+			volumeThickness = materialVolumeThickness(material, hitUv);
+			volumeTransmission = materialIsVolumeTransmission(material) && volumeThickness > 0.001;
+			if (materialIsVolumeTransmission(material) && !volumeTransmission) {
+				thinTransmission = true;
+			}
+			attenuationColor = material.attenuation.rgb;
+			attenuationDistance = material.attenuation.a;
 			unlitMaterial = materialIsUnlit(material);
 
 			if (validTexture(material.textureIndices.z)) {
@@ -803,6 +868,18 @@ void main() {
 		}
 
 		vec3 hitPos = origin + dir * closestT;
+		if (insideVolumeMedium) {
+			throughput *= materialBeerAttenuation(
+				mediumAttenuationColor,
+				mediumAttenuationDistance,
+				closestT,
+				mediumTransmission
+			);
+			if (invalidVec3(throughput) || maxComponent(throughput) <= 0.000001) {
+				break;
+			}
+		}
+
 		if (!firstHitRecorded) {
 			firstHitRecorded = true;
 			firstHitNormal = normal;
@@ -830,7 +907,13 @@ void main() {
 		}
 
 		vec3 microfacetNormal = sampleGGX(normal, roughness, rngFloat(rng), rngFloat(rng));
-		float r0Dielectric = (1.0 - ior) / (1.0 + ior);
+		float etaIncident = insideVolumeMedium ? mediumIor : 1.0;
+		float etaTransmitted = ior;
+		if (volumeTransmission) {
+			etaIncident = insideVolumeMedium ? mediumIor : (frontFace ? 1.0 : ior);
+			etaTransmitted = frontFace ? ior : 1.0;
+		}
+		float r0Dielectric = (etaIncident - etaTransmitted) / (etaIncident + etaTransmitted);
 		r0Dielectric *= r0Dielectric;
 		float r0 = mix(r0Dielectric, 1.0, metalness);
 		float cosThetaI = clamp(-dot(dir, microfacetNormal), 0.0, 1.0);
@@ -854,7 +937,9 @@ void main() {
 				isTransmission = true;
 			}
 			else {
-				float eta = enteringMedium ? (1.0 / ior) : ior;
+				float eta1 = insideVolumeMedium ? mediumIor : (frontFace ? 1.0 : ior);
+				float eta2 = frontFace ? ior : 1.0;
+				float eta = eta1 / max(eta2, 1.0);
 				vec3 refractedDir = refract(dir, normal, eta);
 				if (!invalidVec3(refractedDir) && dot(refractedDir, refractedDir) > EPSILON) {
 					nextDir = safeNormalize(refractedDir, dir);
@@ -872,6 +957,26 @@ void main() {
 		}
 		else if (isTransmission) {
 			throughput *= mix(vec3(1.0), albedo, 1.0 - metalness);
+			if (volumeTransmission) {
+				if (frontFace) {
+					insideVolumeMedium = true;
+					mediumIor = ior;
+					mediumAttenuationColor = attenuationColor;
+					mediumAttenuationDistance = attenuationDistance;
+					mediumTransmission = transmissionStrength;
+					mediumFallbackThickness = volumeThickness;
+					mediumMaterialId = materialIndex;
+				}
+				else if (insideVolumeMedium) {
+					insideVolumeMedium = false;
+					mediumIor = 1.0;
+					mediumAttenuationColor = vec3(1.0);
+					mediumAttenuationDistance = 0.0;
+					mediumTransmission = 0.0;
+					mediumFallbackThickness = 0.0;
+					mediumMaterialId = INVALID_ID;
+				}
+			}
 		}
 		else {
 			throughput *= albedo;

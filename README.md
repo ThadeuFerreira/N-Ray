@@ -1,6 +1,6 @@
 # N-Ray
 
-N-Ray is a learning-focused CPU path tracing renderer by Narcis Calin. This fork keeps the current renderer on the CPU while preparing the dependency surface for a future Vulkan path. The app uses raylib for windowing/input/texture display, Dear ImGui through rlImGui for tools, GLM for math, and OpenMP for CPU parallelism.
+N-Ray is a learning-focused path tracing renderer by Narcis Calin. This fork is actively moving the renderer toward a Vulkan compute path tracer while retaining the CPU path tracer as a reference/fallback. The app uses raylib for windowing/input/texture display, Dear ImGui through rlImGui for tools, GLM for math, and OpenMP for CPU parallelism.
 
 <img width="1907" height="1049" alt="nraygit1" src="https://github.com/user-attachments/assets/47c8204e-2707-4daa-8590-5df1636e7441" />
 
@@ -79,11 +79,21 @@ separate transport algorithm that traces rays and bounces through the scene.
 N-Ray is combining them because the Vulkan target is a compute path tracer: once
 the shader finds a surface hit, it still needs physically plausible glTF material
 data to decide how light is absorbed, reflected, refracted, emitted, or scattered
-into the next ray. The current flat glTF Vulkan preview only validates scene
-flattening, material indexing, and BVH traversal; full PBR evaluation, texture
-sampling, bounces, and strict glTF backface-culling conformance come later. The
-preview currently treats imported triangles as two-sided so thin validation
-geometry stays visible while the compute path is being stabilized. See
+into the next ray. The current glTF Vulkan compute preview is now a progressive
+path-traced renderer: it flattens glTF geometry into SSBOs, traverses the BVH in
+compute, samples base-color/metallic-roughness/normal/emissive/transmission
+textures, supports direct sun shadows, denoising guide buffers, and accumulates
+multi-bounce diffuse/specular/transmission paths.
+
+Current transparency status: thin glass/transmission is wired and visibly affects
+the image. Volume refraction is present in the compute shader with front/back
+face IOR handling, Snell refraction, a single active medium, Beer's-law
+attenuation, material-panel controls, and a preview fallback that gives
+transmissive glTF materials a small scene-scaled thickness when
+`KHR_materials_volume` is absent. Volume still needs further visual tuning and
+validation before it should be treated as final. The preview also treats imported
+triangles as two-sided so thin validation geometry stays visible while the
+compute path is being stabilized. See
 [`docs/gltf-vulkan-pbr-import.md`](docs/gltf-vulkan-pbr-import.md#pbr-is-the-material-model-not-the-transport-algorithm)
 for the detailed comparison.
 
@@ -131,6 +141,7 @@ Open the generated Visual Studio solution under `build/`, select `x64`, then cho
 - Hold `Right Mouse Button`: rotate camera.
 - `Left Mouse Button`: debug ray, model selection, or click-to-focus when Pick DOF is enabled.
 - Settings panel: render resolution, bounces, samples, rays per pixel, Russian roulette, worker threads, publish rate, camera, sky/sun, tone mapping, and selected material properties.
+- Vulkan material panel: per-material albedo, alpha, metalness, roughness, emission, normal scale, and optics controls for coverage, thin transmission, and volume transmission.
 - Stats panel: UI timing, displayed samples, worker samples, rays/sec, samples/sec, publish cost, and render progress.
 
 There are no automated tests yet. Current verification is compile plus manual runtime inspection.

@@ -85,6 +85,7 @@ struct GltfPreviewMaterialMeta {
 	float normalizedAlphaCoverage = 1.0f;
 	float normalizedIor = 1.5f;
 	bool inferredTransmission = false;
+	bool inferredVolumeThickness = false;
 	bool repairedTransmissionTint = false;
 	bool repairedMetallicTransmission = false;
 	std::string normalizedSemantic;

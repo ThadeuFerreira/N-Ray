@@ -29,6 +29,8 @@ struct GpuMaterial {
 	uvec4 textureIndices;
 	uvec4 textureInfo;
 	vec4 textureParams;
+	vec4 attenuation;
+	uvec4 volumeTextureInfo;
 };
 
 struct GpuSettings {

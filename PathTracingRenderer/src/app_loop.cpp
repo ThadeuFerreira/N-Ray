@@ -49,6 +49,14 @@ const char* denoiserDebugViewLabel(VulkanDenoiserDebugView view) {
 	}
 }
 
+const char* opticalModeLabel(VulkanPreviewOpticalMode mode) {
+	switch (mode) {
+	case VulkanPreviewOpticalMode::ThinTransmission: return "Thin Transmission";
+	case VulkanPreviewOpticalMode::VolumeTransmission: return "Volume Transmission";
+	default: return "Coverage/Opaque";
+	}
+}
+
 void invalidateVulkanPostprocess(RuntimeResources& runtime) {
 	runtime.vulkanFrameValid = false;
 	runtime.vulkanFrameDispatched = false;
@@ -469,6 +477,15 @@ bool updateVulkanComputePreview(RuntimeResources& runtime) {
 
 bool updatePathTraceRender(RuntimeResources& runtime) {
 	params.maxSamples = std::clamp(params.maxSamples, kMinSamples, kMaxSamples);
+
+	if (params.debugMaterialColors) {
+		runtime.renderWorker.shutdown();
+		runtime.renderWorker.discardFrame();
+		resetRenderStats(params);
+		runtime.asyncAccum.clear();
+		return false;
+	}
+
 	bool shouldUseVulkanPreview = params.useVulkanPreview && !params.render && runtime.vulkanPreview.isAvailable();
 	if (shouldUseVulkanPreview && updateVulkanComputePreview(runtime)) {
 		return true;
@@ -550,7 +567,7 @@ void drawViewport(RuntimeResources& runtime, bool vulkanFrameDrawn) {
 	}
 
 	bool cpuActive = params.render || (params.useVulkanPreview && !runtime.vulkanPreview.isAvailable());
-	if (!cpuActive && !vulkanFrameDrawn) {
+	if (params.debugMaterialColors || (!cpuActive && !vulkanFrameDrawn)) {
 		drawRasterPreview();
 	}
 
@@ -829,11 +846,55 @@ void drawVulkanMaterialPanel(RuntimeResources& runtime, const UiLayout& layout) 
 		}
 		ImGui::SetNextItemWidth(-1.0f);
 		changed |= ImGui::SliderFloat("Intensity##vulkanMaterial", &matState.emissiveIntensity, 0.0f, 20.0f);
-		if (matState.isTransmission) {
+
+		ImGui::Separator();
+		VulkanPreviewOpticalMode previousOpticalMode = matState.opticalMode;
+		int opticalModeIndex = static_cast<int>(matState.opticalMode);
+		static const char* opticalModeLabels[] = {
+			"Coverage/Opaque",
+			"Thin Transmission",
+			"Volume Transmission"
+		};
+		ImGui::SetNextItemWidth(-1.0f);
+		if (ImGui::Combo("Mode##vulkanMaterialOptics", &opticalModeIndex, opticalModeLabels, 3)) {
+			opticalModeIndex = std::clamp(opticalModeIndex, 0, 2);
+			matState.opticalMode = static_cast<VulkanPreviewOpticalMode>(opticalModeIndex);
+			if (matState.opticalMode == VulkanPreviewOpticalMode::Coverage) {
+				matState.transmission = 0.0f;
+			}
+			else if (previousOpticalMode == VulkanPreviewOpticalMode::Coverage && matState.transmission <= 0.001f) {
+				matState.transmission = 1.0f;
+			}
+			if (matState.opticalMode == VulkanPreviewOpticalMode::VolumeTransmission && matState.volumeThickness <= 0.001f) {
+				matState.volumeThickness = 0.01f;
+			}
+			if (matState.opticalMode == VulkanPreviewOpticalMode::VolumeTransmission && matState.attenuationDistance <= 0.001f) {
+				matState.attenuationDistance = 1.0f;
+			}
+			changed = true;
+		}
+		ImGui::TextDisabled("%s", opticalModeLabel(matState.opticalMode));
+
+		ImGui::SetNextItemWidth(-1.0f);
+		changed |= ImGui::SliderFloat("Transmission##vulkanMaterial", &matState.transmission, 0.0f, 1.0f);
+		if (matState.hasTransmissionTexture) {
+			ImGui::SameLine();
+			ImGui::TextDisabled("(x tex)");
+		}
+		ImGui::SetNextItemWidth(-1.0f);
+		changed |= ImGui::SliderFloat("IOR##vulkanMaterial", &matState.ior, 1.0f, 2.5f);
+
+		if (matState.opticalMode == VulkanPreviewOpticalMode::VolumeTransmission) {
 			ImGui::SetNextItemWidth(-1.0f);
-			changed |= ImGui::SliderFloat("Transmission##vulkanMaterial", &matState.transmission, 0.0f, 1.0f);
+			changed |= ImGui::DragFloat("Thickness##vulkanMaterial", &matState.volumeThickness, 0.001f, 0.0f, 10.0f, "%.4f");
+			if (matState.hasThicknessTexture) {
+				ImGui::SameLine();
+				ImGui::TextDisabled("(x tex)");
+			}
 			ImGui::SetNextItemWidth(-1.0f);
-			changed |= ImGui::SliderFloat("IOR##vulkanMaterial", &matState.ior, 1.0f, 2.5f);
+			changed |= ImGui::ColorEdit3("Attenuation##vulkanMaterial", &matState.attenuationColor.x);
+			ImGui::SetNextItemWidth(-1.0f);
+			changed |= ImGui::DragFloat("Atten Distance##vulkanMaterial", &matState.attenuationDistance, 0.01f, 0.0f, 100.0f, "%.3f");
 		}
 		if (matState.hasNormalTexture) {
 			ImGui::SetNextItemWidth(-1.0f);

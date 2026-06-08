@@ -71,6 +71,7 @@ struct Params {
 
 	bool isMouseHoveringUI = false;
 	bool enableDebugRay = false;
+	bool debugMaterialColors = false;
 	bool enableSelection = true;
 	bool useVulkanPreview = true;
 	bool render = false;

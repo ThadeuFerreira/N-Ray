@@ -687,6 +687,13 @@ void logGltfPreviewMaterialImport(
 		<< " emissive=" << previewTextureLabel(meta.emissiveTexture, textures)
 		<< " transmissionTex=" << previewTextureLabel(meta.transmissionTexture, textures)
 		<< " transmissionFactor=" << meta.transmission
+		<< " thicknessTex=" << previewTextureLabel(meta.thicknessTexture, textures)
+		<< " thicknessFactor=" << meta.volumeThickness
+		<< " attenuationColor=("
+		<< meta.attenuationColor.r << ", "
+		<< meta.attenuationColor.g << ", "
+		<< meta.attenuationColor.b << ")"
+		<< " attenuationDistance=" << meta.attenuationDistance
 		<< " ior=" << meta.ior
 		<< " normalized kind=" << materialKindName(meta.materialKind)
 		<< " alphaMode=" << alphaModeName(meta.normalizedAlphaMode)
@@ -2072,6 +2079,45 @@ void buildSceneAcceleration(GltfPreviewScene& scene) {
 		scene.triIsect[i] = { tri.a, tri.eA, tri.eB, tri.idx, tri.doubleSided ? 1u : 0u };
 	}
 }
+
+void applyPreviewVolumeFallbacks(GltfPreviewScene& scene) {
+	glm::vec3 extent = scene.boundsMax - scene.boundsMin;
+	float sceneScale = glm::length(extent);
+	if (!std::isfinite(sceneScale) || sceneScale <= 0.0001f) {
+		sceneScale = 1.0f;
+	}
+
+	float inferredThickness = std::clamp(sceneScale * 0.03f, 0.002f, 0.25f);
+	for (size_t i = 0; i < scene.materialMeta.size() && i < scene.materials.size(); ++i) {
+		GltfPreviewMaterialMeta& meta = scene.materialMeta[i];
+		if (meta.materialKind != GLTF_PREVIEW_MATERIAL_THIN_TRANSMISSION ||
+			meta.normalizedTransmission <= 0.001f ||
+			meta.volumeThickness > 0.001f) {
+			continue;
+		}
+
+		meta.volumeThickness = inferredThickness;
+		meta.materialKind = GLTF_PREVIEW_MATERIAL_VOLUME_TRANSMISSION;
+		meta.inferredVolumeThickness = true;
+		if (meta.attenuationDistance <= 0.001f) {
+			meta.attenuationDistance = std::max(inferredThickness * 8.0f, 0.01f);
+		}
+		if (!meta.normalizedSemantic.empty()) {
+			meta.normalizedSemantic += ", ";
+		}
+		meta.normalizedSemantic += "preview volume glass";
+
+		PBRMaterial& material = scene.materials[i];
+		material.volume = meta.volumeThickness;
+		material.absorptionCol = meta.attenuationColor;
+		material.absorption = meta.attenuationDistance > 0.0f ? 1.0f / meta.attenuationDistance : 0.0f;
+		material.volumeCol = meta.attenuationColor;
+
+		std::cout << "  NORMALIZED material[" << i << "]: inferred preview volume thickness="
+			<< meta.volumeThickness << " attenuationDistance=" << meta.attenuationDistance
+			<< " for transmission without KHR_materials_volume\n";
+	}
+}
 }
 
 std::string defaultGltfPreviewPath() {
@@ -2181,6 +2227,7 @@ bool loadGltfPreviewScene(const std::string& requestedPath, GltfPreviewScene& sc
 		return false;
 	}
 
+	applyPreviewVolumeFallbacks(scene);
 	appendShadowValidationRig(scene, haveBounds);
 	buildSceneAcceleration(scene);
 	scene.loaded = true;

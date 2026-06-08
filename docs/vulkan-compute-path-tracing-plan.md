@@ -26,11 +26,20 @@ The current Vulkan milestone is `VulkanComputePreview`:
   preview mode: TinyGLTF loads the local Nissan S15 validation asset, the CPU
   flattens it into `TriIntersect`, triangle shading, material, and compact BVH
   storage buffers, and the shader performs full path-tracing transport: per-pixel
-  primary-ray BVH traversal, multi-bounce BSDF/event selection, transmission,
-  Russian roulette, and optional shadow-modes.
+  primary-ray BVH traversal, textured material evaluation, multi-bounce
+  BSDF/event selection, thin transmission, in-progress volume refraction,
+  Russian roulette, optional shadow-modes, and denoising guide output.
 - The CPU copies that RGBA buffer into the existing raylib `Texture2D`, so the
   app can keep its raylib/rlImGui window while Vulkan compute is proven inside
   the real runtime.
+
+Current refraction status: thin glass/transmission is working in the Vulkan
+compute path. Volume refraction is wired through the material upload and shader
+bounce loop (front/back face IOR, Snell refraction, single-medium state, and
+Beer's-law attenuation), and transmissive glTF materials without
+`KHR_materials_volume` get a small preview thickness so the path can be tuned on
+the existing car assets. Volume still needs visual refinement before it should be
+considered complete.
 
 This is intentionally a bridge. The next steps should move scene buffers from
 host-visible bring-up allocations toward staged device-local resources, expand

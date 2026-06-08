@@ -41,6 +41,12 @@ enum class VulkanDenoiserDebugView : uint32_t {
 	InstanceId = 7
 };
 
+enum class VulkanPreviewOpticalMode : uint32_t {
+	Coverage = 0,
+	ThinTransmission = 1,
+	VolumeTransmission = 2
+};
+
 struct VulkanDenoiserSettings {
 	VulkanDenoiserMode mode = VulkanDenoiserMode::SpatialAtrous;
 	VulkanDenoiserDebugView debugView = VulkanDenoiserDebugView::Final;
@@ -110,6 +116,10 @@ struct VulkanPreviewMaterialState {
 	float     emissiveIntensity = 1.0f;
 	float     transmission    = 0.0f;
 	float     ior             = 1.5f;
+	VulkanPreviewOpticalMode opticalMode = VulkanPreviewOpticalMode::Coverage;
+	float     volumeThickness = 0.0f;
+	glm::vec3 attenuationColor = glm::vec3(1.0f);
+	float     attenuationDistance = 0.0f;
 	float     normalScale     = 1.0f;
 
 	// Read-only texture-presence flags — used by the UI to show "(× tex)" hints
@@ -118,6 +128,8 @@ struct VulkanPreviewMaterialState {
 	bool hasNormalTexture             = false;
 	bool hasEmissiveTexture           = false;
 	bool hasOcclusionTexture          = false;
+	bool hasTransmissionTexture       = false;
+	bool hasThicknessTexture          = false;
 
 	// Read-only display info
 	std::string name;           // original glTF material name (may be empty)
