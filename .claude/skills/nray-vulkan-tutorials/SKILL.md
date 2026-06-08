@@ -1,6 +1,6 @@
 ---
 name: nray-vulkan-tutorials
-description: Use when working on Vulkan issues in the N-Ray repository, especially compute shader experiments, Vulkan hello-world/window bring-up, VulkanCore wrapper usage, synchronization barriers, descriptor sets, shader compilation, glTF asset import/conversion/skinning/animation reference examples, Vulkan PBR pipelines (material push constants, IBL pre-computation, irradiance/BRDF-LUT/prefiltered-cube descriptor layouts, textured PBR with tangent vertex attributes), hardware ray tracing (VK_KHR_ray_tracing_pipeline, BLAS/TLAS build, SBT layout, raygen/miss/closesthit/anyhit/intersection/callable shader groups, frame accumulation, glTF ray tracing with descriptor indexing, recursive secondary rays for shadows and reflections via multiple miss shaders/ray payloads/iterate-in-raygen bounce loops), or porting CPU path tracing concepts toward Vulkan compute or HW ray tracing. Always check the local ogldev tutorial tree under /home/thadeu/projects/N-Ray/tutorials/ogldev/Vulkan, the vendored glTF loaders under /home/thadeu/projects/N-Ray/tutorials/saschawillems/gltf, and the upstream Sascha Willems gltfskinning and ray tracing example guides before designing Vulkan or glTF code from scratch. Scope is Vulkan-first: only touch CPU path-tracer internals when explicitly requested by the user.
+description: Use when working on Vulkan issues in the N-Ray repository, especially compute shader experiments, Vulkan hello-world/window bring-up, VulkanCore wrapper usage, synchronization barriers, descriptor sets, shader compilation, RenderDoc frame capture/resource inspection, headless RenderDoc capture via NrayRenderDocHeadless (bin/Release/NrayRenderDocHeadless — no raylib, no ImGui, renderdoccmd capture, JSON output, setPersistSettings), glTF asset import/conversion/skinning/animation reference examples, Vulkan PBR pipelines (material push constants, IBL pre-computation, irradiance/BRDF-LUT/prefiltered-cube descriptor layouts, textured PBR with tangent vertex attributes), hardware ray tracing (VK_KHR_ray_tracing_pipeline, BLAS/TLAS build, SBT layout, raygen/miss/closesthit/anyhit/intersection/callable shader groups, frame accumulation, glTF ray tracing with descriptor indexing, recursive secondary rays for shadows and reflections via multiple miss shaders/ray payloads/iterate-in-raygen bounce loops), or porting CPU path tracing concepts toward Vulkan compute or HW ray tracing. Always check the local ogldev tutorial tree under /home/thadeu/projects/N-Ray/tutorials/ogldev/Vulkan, the vendored glTF loaders under /home/thadeu/projects/N-Ray/tutorials/saschawillems/gltf, and the upstream Sascha Willems gltfskinning and ray tracing example guides before designing Vulkan or glTF code from scratch. Scope is Vulkan-first: only touch CPU path-tracer internals when explicitly requested by the user.
 ---
 
 # N-Ray Vulkan Tutorials
@@ -29,6 +29,8 @@ High-value references:
 - `tutorials/ogldev/Vulkan/Tutorial29` and later - more advanced rendering/data-flow examples after compute.
 - `tutorials/saschawillems/gltf/` - canonical local glTF-loading references (vendored `SaschaWillems/Vulkan` `gltfloading` + `gltfscenerendering`): tinygltf accessor decode, node/TRS hierarchy traversal, uint8/16/32 index handling, `TANGENT`/TBN, and per-material handling. Reference-only/not built; see its `README.md` for the technique-to-`gltf_scene.cpp` map.
 - Upstream `SaschaWillems/Vulkan/examples/gltfskinning` - use this as the skinned-animation reference when adding real joint palettes: mutable TRS nodes, `JOINTS_0`/`WEIGHTS_0`, `Skin` inverse bind matrices, animation samplers/channels, per-frame joint-matrix SSBOs, `updateAnimation`, `updateJoints`, and shader-side weighted skin matrices. This sample is documented in `docs/gltf-vulkan-pbr-import.md`; it is not currently vendored in-tree.
+- `docs/renderdoc-vulkan-debugging.md` - N-Ray-specific RenderDoc launch/capture workflow for inspecting Vulkan compute dispatches, descriptors, SSBOs, storage images, glTF textures, denoiser resources, shadows, and refraction state.
+- `docs/headless-renderdoc-vulkan-plan.md` - planned headless RenderDoc agent workflow: separate console target, direct `VulkanComputePreview` drive, deterministic compute capture, Python replay/report, and transient model-folder handling.
 - `docs/vulkan-migration-guide.md` - N-Ray-specific Vulkan migration direction and dependency choices.
 - `docs/vulkan-compute-path-tracing-plan.md` - concrete compute-shader path tracing buffer contract, BVH upload strategy, and staged GPU migration plan.
 - Upstream `SaschaWillems/Vulkan/examples/raytracingbasic` — canonical HW RT bringup: extension + feature chain, function pointer loading, BLAS/TLAS build, storage image, SBT sizing, `vkCmdTraceRaysKHR`, and blit-to-swapchain. Use as the first reference before writing any `VK_KHR_ray_tracing_pipeline` code.
@@ -104,17 +106,20 @@ The Vulkan preview model list now persists in
 this manifest when testing import flows that cross engine/runtime seams:
 
 - On startup, `vulkan_compute_preview.cpp` loads `project_settings.json` via
-  `loadModelEntriesFromSettings()`, resolving each listed folder relative to the
-  working directory and its parent (`PathTracingRenderer/` and repo-root `..`).
+  `projectSettingsState()`/`loadProjectSettings()`, resolving each listed folder
+  relative to the working directory and its parent (`PathTracingRenderer/` and
+  repo-root `..`).
 - The import path (`VulkanComputePreview::importModelFromFolder`) takes a folder,
   resolves it, finds the first `scene.gltf`/`.glb` inside, appends a model entry,
   and saves the updated list with `saveModelEntriesToSettings()`, rewriting folder
   paths to canonical form.
-- The UI should treat these entries as the authoritative model list; missing
-  folders are skipped and logged, duplicates are deduplicated by normalized path.
-- A non-selected model keeps preview usable via fallback textures (`selectedModel
-  = -1`), and the model-preview shader is enabled only when a model is actively
-  loaded and `loadModelSceneResources` has built the GPU buffers.
+- The UI should treat these entries as the authoritative model list. Successful
+  scene selection writes `lastSelectedModelFolder`; startup loads that model
+  directly, while clearing selection removes the field and starts on the default
+  procedural scene.
+- Missing folders are skipped and logged, duplicates are deduplicated by
+  normalized path. A non-selected model (`selectedModel = -1`) uploads the
+  default procedural Vulkan scene: base, cube, and sphere.
 
 ## Compute Shader Smoke Test
 
@@ -136,6 +141,128 @@ rg -n "Using compute shader|Swap chain extent|Command buffers recorded|Error|err
 ```
 
 Exit `124` from `timeout` is expected when the GLFW window stays alive. Mesa device-select debug callback messages can be non-fatal if initialization continues.
+
+## RenderDoc Vulkan Debugging
+
+Use RenderDoc when a Vulkan preview issue needs GPU-resource evidence rather
+than terminal-only logs or screenshots. RenderDoc is most useful for questions
+like: which compute dispatch wrote this image, which descriptor was bound, what
+did a material/triangle/BVH SSBO contain, and did a resource become stale between
+passes?
+
+RenderDoc is capture/replay tooling. It wraps API calls, records the captured
+frame and referenced resources, then replays partial frame state as the user
+selects events. Treat captures as single-frame API/resource snapshots, not as a
+live debugger or a convergence test.
+
+For N-Ray captures, launch through RenderDoc's `File -> Launch Application`.
+Prefer absolute paths for the executable field:
+
+```text
+Executable:        /home/thadeu/projects/N-Ray/bin/Release/PathTracingRenderer
+Debug executable:  /home/thadeu/projects/N-Ray/bin/Debug/PathTracingRenderer
+Working directory: /home/thadeu/projects/N-Ray/PathTracingRenderer
+Capture key:       F12 or Print Screen
+```
+
+The working directory must match `make run` so `models/`, `textures/`, and
+`PathTracingRenderer/project_settings.json` resolve correctly. Use a 64-bit
+RenderDoc build for the normal 64-bit N-Ray binaries.
+
+RenderDoc captures Vulkan through its Vulkan layer. If the capture UI warns that
+the Vulkan layer is not registered, fix that first; on Linux the loader discovers
+implicit layers from `/usr/share/vulkan/implicit_layer.d`,
+`/etc/vulkan/implicit_layer.d`, or `$HOME/.local/share/vulkan/implicit_layer.d`.
+RenderDoc captures are normally replayed on the same or similar machine and
+assume the app creates and uses one `VkDevice`. Check the official RenderDoc
+Vulkan support page for version- or extension-specific caveats before treating a
+capture limitation as an N-Ray bug.
+
+Capture workflow:
+
+- Start the app from RenderDoc, switch to Vulkan Mode, and select/import the
+  target glTF validation model.
+- Let accumulation reach the frame state that shows the bug, then capture the
+  next frame.
+- In the Event Browser, prioritize compute dispatches over graphics draw calls.
+  The current glTF preview is compute/BVH-based, not a graphics-pipeline PBR
+  renderer.
+- Inspect Pipeline State, API Inspector, Texture Viewer, buffer viewers, and the
+  Timeline Bar for bound descriptors, storage-buffer contents, storage images,
+  glTF textures, copies, and resource writes/reads.
+
+N-Ray-specific targets:
+
+- Main glTF path tracing dispatch: `vulkan_gltf_flat.comp`.
+- Material/refraction data: transmission, IOR, optical mode, volume thickness,
+  attenuation color/distance, and texture indices.
+- Geometry/traversal data: BVH nodes, triangle records, material ids, model ids,
+  normal/tangent-sensitive attributes, and bounds-driven validation geometry.
+- Shadow state: ray-traced shadow visibility, shadow-map prepass resources, and
+  transparent/volumetric caster approximations.
+- Denoising resources: raw accumulation, normal, albedo, depth, material id,
+  ping-pong intermediates, and final denoised output.
+
+Use the Texture Viewer range controls for HDR or accumulation resources whose
+useful values are outside `[0, 1]`. If RenderDoc itself fails or captures
+incorrectly, reduce the reproduction and check the RenderDoc FAQ or issue
+tracker before treating it as an N-Ray rendering regression.
+
+RenderDoc limitation: this guidance applies to N-Ray's current compute/BVH
+preview. Future `VK_KHR_ray_tracing_pipeline` work is opaque in RenderDoc.
+Captures can replay ray-tracing pipeline results so later normal passes see
+correct resources, but RenderDoc cannot introspect ray-tracing bindings, shader
+tables, raygen/miss/hit shaders, payloads, or acceleration-structure traversal.
+On NVIDIA Vulkan drivers, do not expect RenderDoc to capture ray-tracing
+pipeline work; ray query work is the supported ray-tracing-adjacent path to
+expect in captures.
+
+## Headless RenderDoc Agent Workflow
+
+`NrayRenderDocHeadless` (`bin/Release/NrayRenderDocHeadless`) is fully
+implemented and tested. It drives `VulkanComputePreview` directly from the
+command line with no raylib window, captures a RenderDoc `.rdc` via
+`renderdoccmd`, and emits JSON + optional PPM. See
+`docs/renderdoc-vulkan-debugging.md#headless-agent-workflow` for the full
+reference, verified command examples, JSON schema, and known quirks.
+
+Quick reference:
+
+```bash
+# Run from PathTracingRenderer/ so project_settings.json and models/ resolve:
+cd /home/thadeu/projects/N-Ray/PathTracingRenderer
+
+# Smoke test (no capture):
+../bin/Release/NrayRenderDocHeadless --model-index 0 --samples 1 --json-out /tmp/run.json
+
+# Full capture:
+renderdoccmd capture --wait-for-exit \
+  --working-dir /home/thadeu/projects/N-Ray/PathTracingRenderer \
+  --capture-file /home/thadeu/projects/N-Ray/build/renderdoc/nray_headless \
+  /home/thadeu/projects/N-Ray/bin/Release/NrayRenderDocHeadless \
+    --model-index 0 --samples 1 --capture --json-out /tmp/capture.json
+
+# Offline report (requires renderdoc Python module from qrenderdoc or custom build):
+python3 tools/renderdoc_capture_report.py build/renderdoc/nray_headless_capture.rdc --verbose
+```
+
+Key behavior:
+
+- `setPersistSettings(false)` is called before initialization: neither
+  `setModel()` nor `importModelFromFolder()` touch `project_settings.json`.
+- `--model-folder` is always transient; if the folder is already registered it
+  reuses the existing manifest entry.
+- Startup may load the last-selected model from `project_settings.json` before
+  the CLI model selection replaces it — this is normal (~1 s on large models).
+- The `.rdc` file captures one compute dispatch. A 512×512 render of Nissan S15
+  (104369 triangles) produces ~33 MB.
+- The RenderDoc Python module (`renderdoc`) is not in the Arch Linux system
+  package; `renderdoc_capture_report.py` exits with clear guidance if missing.
+  The `.rdc` is always valid for manual `qrenderdoc` inspection.
+
+Source: `PathTracingRenderer/headless/main_headless.cpp`,
+`PathTracingRenderer/headless/stb_impl.cpp`,
+`tools/renderdoc_capture_report.py`. Build target: `make build-renderdoc-headless`.
 
 ## N-Ray Compute Migration Guardrails
 

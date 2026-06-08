@@ -21,6 +21,18 @@ Use this skill for any task where the user expects code changes to land in a pas
 3. Inspect output for warnings only; resolve errors before ending the task.
 4. Re-run if any compile/link failure appears.
 
+## RenderDoc and headless Vulkan work
+
+- For docs-only RenderDoc guidance, verify links and terminology; avoid
+  unnecessary builds if they would dirty vendored raylib state.
+- For future headless RenderDoc implementation work, `make build-renderdoc-headless`
+  and `bin/Release/NrayRenderDocHeadless --help` are the minimum gates.
+- When Vulkan, RenderDoc, and the Python replay module are available, run one
+  small capture plus report using the commands documented in
+  `docs/headless-renderdoc-vulkan-plan.md`.
+- If any of Vulkan, RenderDoc, or Python replay support is unavailable, record
+  the exact blocker output and still validate CLI parsing and build/link status.
+
 ## Examples
 
 - `make -C build config=performance_x64` after C++ changes in PathTracingRenderer.

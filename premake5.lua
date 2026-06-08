@@ -1,4 +1,6 @@
 workspace "NRay"
+    local vulkan_shader_debug = os.getenv("NRAY_VULKAN_SHADER_DEBUG") == "1"
+
     configurations { "Debug", "Release", "Performance" }
     platforms { "x64" }
     -- Generate makefiles/project files under build/ so they don't clobber the
@@ -8,6 +10,11 @@ workspace "NRay"
     filter "configurations:Debug"
         defines { "DEBUG" }
         symbols "On"
+
+    if vulkan_shader_debug then
+        filter "configurations:Debug"
+            defines { "NRAY_VULKAN_SHADER_DEBUG" }
+    end
 
     filter "configurations:Release"
         defines { "NDEBUG" }
@@ -86,3 +93,51 @@ project "PathTracingRenderer"
     filter { "system:macosx", "configurations:Performance" }
         buildoptions { "-O3", "-march=native", "-ffast-math", "-flto" }
         linkoptions { "-flto" }
+
+project "NrayRenderDocHeadless"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++20"
+    targetdir "bin/%{cfg.buildcfg}"
+    objdir "obj/%{cfg.buildcfg}"
+
+    files
+    {
+        "PathTracingRenderer/headless/main_headless.cpp",
+        "PathTracingRenderer/headless/stb_impl.cpp",
+        "PathTracingRenderer/src/vulkan_compute_preview.cpp",
+        "PathTracingRenderer/src/gltf_scene.cpp",
+        "PathTracingRenderer/src/tinygltf_impl.cpp",
+        "PathTracingRenderer/src/renderer.cpp",
+    }
+
+    includedirs
+    {
+        "PathTracingRenderer/include",
+        "PathTracingRenderer/external",
+        "PathTracingRenderer/external/glm",
+        "vendor/tinygltf",
+        "vendor/volk",
+        "PathTracingRenderer/src",
+        -- raylib headers needed transitively (globalParams.h, screenStartup.h);
+        -- vendor/raylib/src takes priority so versions match the main project.
+        "vendor/raylib/src",
+        "PathTracingRenderer/external/raylib/include",
+    }
+
+    defines { "_CRT_SECURE_NO_WARNINGS" }
+
+    filter "system:linux"
+        links { "m", "pthread", "dl", "rt" }
+        buildoptions { "-mavx2" }
+
+    filter { "system:linux", "configurations:Performance" }
+        buildoptions { "-O3", "-march=native", "-ffast-math", "-flto" }
+        linkoptions { "-flto" }
+
+    filter "system:windows"
+        buildoptions { "/arch:AVX2" }
+
+    filter { "system:windows", "configurations:Performance" }
+        buildoptions { "/O2", "/GL", "/fp:fast", "/arch:AVX2" }
+        linkoptions { "/LTCG" }

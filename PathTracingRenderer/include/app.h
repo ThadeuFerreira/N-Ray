@@ -45,6 +45,7 @@ void startupRuntimeLayer(RuntimeResources& runtime);
 void shutdownRuntimeLayer(RuntimeResources& runtime);
 
 void runMainLoop(RuntimeResources& runtime);
+void frameVulkanPreviewModel(RuntimeResources& runtime);
 
 void createFlatBVH();
 Texture2D createRenderTexture();

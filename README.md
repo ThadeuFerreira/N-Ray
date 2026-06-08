@@ -67,7 +67,7 @@ Current glTF entry points include:
 - `assets/luna_snow_-_sonic_trailblazer/scene.gltf`
 - `assets/wolverine_-_wolverine_-_x-2099_bundle/scene.gltf`
 
-These validation assets are separate from the current OBJ-based CPU runtime scene under `PathTracingRenderer/models/` and `PathTracingRenderer/textures/`. The Vulkan compute preview exposes these glTF scenes through the model selector, while the CPU path still uses the OBJ scene.
+These validation assets are separate from the current OBJ-based CPU runtime scene under `PathTracingRenderer/models/` and `PathTracingRenderer/textures/`. The Vulkan compute preview exposes these glTF scenes through the model selector, remembers the last selected model in `PathTracingRenderer/project_settings.json`, and starts on a default procedural base/cube/sphere scene when no model is selected. The CPU path still uses the OBJ scene.
 
 ## PBR And Vulkan Direction
 
@@ -102,6 +102,33 @@ compute preview. Use the repo-local Vulkan skill and Sascha Willems
 `raytracingbasic`, `raytracinggltf`, `raytracingtextures`, and
 `raytracingshadows` examples for BLAS/TLAS bring-up, glTF geometry/material
 descriptors, any-hit transparency, and two-miss shadow-ray pipelines.
+
+## RenderDoc Vulkan Debugging
+
+Use [`docs/renderdoc-vulkan-debugging.md`](docs/renderdoc-vulkan-debugging.md)
+when Vulkan preview issues need a single-frame GPU capture. Launch the
+executable from RenderDoc with an absolute path (repo-relative target
+`bin/Release/PathTracingRenderer` or `bin/Debug/PathTracingRenderer`) and set
+the working directory to the repo's `PathTracingRenderer/` folder; otherwise
+relative runtime assets and `project_settings.json` may not resolve the same way
+as `make run`.
+
+RenderDoc is the preferred manual tool for inspecting Vulkan compute dispatches,
+descriptor bindings, SSBO contents, glTF texture resources, denoiser buffers, and
+shadow/refraction frame state. It complements Vulkan validation layers and local
+build checks; it does not replace compile/link validation. For future
+`VK_KHR_ray_tracing_pipeline` work, treat RenderDoc ray-tracing pipeline events
+as opaque: captures can replay their results for later normal passes, but cannot
+introspect ray-tracing bindings, shaders, payloads, or acceleration-structure
+traversal. If Vulkan capture does not attach, check RenderDoc's Vulkan capture
+layer registration first; captures are normally replayed on the same or a
+sufficiently similar machine and assume one active `VkDevice`.
+
+For future agent-run GPU debugging, see
+[`docs/headless-renderdoc-vulkan-plan.md`](docs/headless-renderdoc-vulkan-plan.md).
+That plan keeps headless RenderDoc capture/report work in a separate console
+target that drives `VulkanComputePreview` directly and avoids mutating the
+persisted model manifest during transient captures.
 
 ## Build With Premake
 

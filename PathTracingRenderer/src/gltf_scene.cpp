@@ -20,9 +20,6 @@
 #include <sstream>
 
 namespace {
-constexpr const char* kDefaultGltfPath =
-	"assets/2018_garage_mak_nissan_s15_silvia_-_reggie_mah/scene.gltf";
-
 PBRMaterial makeDefaultMaterial() {
 	return PBRMaterial{
 		glm::vec3(0.8f),
@@ -1666,6 +1663,22 @@ void appendShadowValidationRig(GltfPreviewScene& scene, bool& haveBounds) {
 	appendProceduralSphere(scene, haveBounds, sphereCenter, propRadius, sphereMaterial);
 }
 
+void appendDefaultPreviewScene(GltfPreviewScene& scene) {
+	bool haveBounds = false;
+
+	uint32_t groundMaterial = appendShadowTestMaterial(scene, glm::vec3(0.58f, 0.60f, 0.56f), 0.9f);
+	uint32_t cubeMaterial = appendShadowTestMaterial(scene, glm::vec3(0.86f, 0.32f, 0.20f), 0.65f);
+	uint32_t sphereMaterial = appendShadowTestMaterial(scene, glm::vec3(0.22f, 0.42f, 0.86f), 0.55f);
+
+	glm::vec3 g0(-3.0f, -1.75f, 0.0f);
+	glm::vec3 g1( 3.0f, -1.75f, 0.0f);
+	glm::vec3 g2( 3.0f,  1.75f, 0.0f);
+	glm::vec3 g3(-3.0f,  1.75f, 0.0f);
+	appendProceduralQuad(scene, haveBounds, g0, g1, g2, g3, groundMaterial);
+	appendProceduralCube(scene, haveBounds, glm::vec3(-1.05f, 0.0f, 0.45f), 0.9f, cubeMaterial);
+	appendProceduralSphere(scene, haveBounds, glm::vec3(1.05f, 0.0f, 0.45f), 0.45f, sphereMaterial);
+}
+
 glm::mat4 weightedSkinMatrix(
 	const std::vector<glm::mat4>& skinMatrices,
 	const glm::uvec4& joints,
@@ -2120,8 +2133,27 @@ void applyPreviewVolumeFallbacks(GltfPreviewScene& scene) {
 }
 }
 
-std::string defaultGltfPreviewPath() {
-	return kDefaultGltfPath;
+bool createDefaultGltfPreviewScene(GltfPreviewScene& scene) {
+	scene = GltfPreviewScene{};
+	scene.sourcePath = "N-Ray default Vulkan preview scene";
+
+	appendDefaultPreviewScene(scene);
+	if (scene.tris.empty()) {
+		scene.status = "Default Vulkan preview scene has no renderable triangles";
+		return false;
+	}
+
+	scene.stats.nodeCount = 0;
+	scene.stats.meshCount = 2;
+	scene.stats.primitiveCount = 3;
+	scene.stats.materialCount = static_cast<uint32_t>(scene.materials.size());
+	scene.stats.textureCount = 0;
+	scene.stats.imageCount = 0;
+
+	buildSceneAcceleration(scene);
+	scene.loaded = true;
+	scene.status = "Default Vulkan preview scene ready: base, cube, sphere";
+	return true;
 }
 
 bool loadGltfPreviewScene(const std::string& requestedPath, GltfPreviewScene& scene) {

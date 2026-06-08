@@ -20,15 +20,16 @@ The current Vulkan milestone is `VulkanComputePreview`:
 
 - `PathTracingRenderer/src/vulkan_compute_preview.cpp` initializes Vulkan through
   header-only `volk`.
-- `PathTracingRenderer/shaders/vulkan_triangle.comp` writes a triangle into a
-  manually allocated, host-visible storage buffer.
 - `PathTracingRenderer/shaders/vulkan_gltf_flat.comp` is the first scene-buffer
-  preview mode: TinyGLTF loads the local Nissan S15 validation asset, the CPU
-  flattens it into `TriIntersect`, triangle shading, material, and compact BVH
-  storage buffers, and the shader performs full path-tracing transport: per-pixel
-  primary-ray BVH traversal, textured material evaluation, multi-bounce
-  BSDF/event selection, thin transmission, in-progress volume refraction,
-  Russian roulette, optional shadow-modes, and denoising guide output.
+  preview mode and the startup default. `project_settings.json` stores the model
+  list plus `lastSelectedModelFolder`; startup loads that model directly when it
+  is present, otherwise it uploads the default procedural base/cube/sphere scene.
+  The CPU flattens the active scene into `TriIntersect`, triangle shading,
+  material, and compact BVH storage buffers, and the shader performs full
+  path-tracing transport: per-pixel primary-ray BVH traversal, textured material
+  evaluation, multi-bounce BSDF/event selection, thin transmission, in-progress
+  volume refraction, Russian roulette, optional shadow-modes, and denoising guide
+  output.
 - The CPU copies that RGBA buffer into the existing raylib `Texture2D`, so the
   app can keep its raylib/rlImGui window while Vulkan compute is proven inside
   the real runtime.

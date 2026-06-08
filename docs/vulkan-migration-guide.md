@@ -89,7 +89,7 @@ Vulkan drivers do not perform hand-holding. To safely validate render loops, uti
 
 ### Tools:
 *   **Vulkan Validation Layers:** Bundled inside the official LunarG Vulkan SDK. Essential for tracking buffer allocation hazards and memory state synchronization issues in real-time.
-*   **[RenderDoc](https://renderdoc.org/):** The industry standard for deep frame debugging. Allows inspection of memory footprints, bounding hierarchy nodes (BVH), and stepping through active shaders.
+*   **[RenderDoc](https://renderdoc.org/):** The preferred manual frame debugger for the Vulkan compute preview. Use it to inspect compute dispatches, descriptor sets, storage buffers, storage images, glTF textures, denoiser resources, and shadow/refraction state when terminal logs or screenshots are not enough. RenderDoc does not introspect Vulkan/D3D12 ray-tracing pipeline work; future HWRT captures can replay ray-tracing results for later passes, but the ray-tracing work itself is opaque. See [`renderdoc-vulkan-debugging.md`](renderdoc-vulkan-debugging.md) for the N-Ray launch/capture workflow.
 *   **[apitrace](https://apitrace.github.io/):** Useful for tracing and intercepting API graphics streams to filter out complex multi-threaded concurrency validation bugs.
 
 ---

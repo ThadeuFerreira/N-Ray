@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
@@ -18,11 +20,36 @@
 #include <iostream>
 #include <optional>
 #include <sstream>
+#include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <json.hpp>
 
-#include "vulkan_triangle_spv.h"
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#elif defined(__linux__)
+#include <dlfcn.h>
+#endif
+
+#include "../../vendor/slang/external/renderdoc_app.h"
+
+#ifdef NRAY_VULKAN_SHADER_DEBUG
+#include "../../build/generated/vulkan_shader_debug/tut28_star_nest_comp_spv.h"
+#include "../../build/generated/vulkan_shader_debug/tut28_lets_self_reflect_comp_spv.h"
+#include "../../build/generated/vulkan_shader_debug/tut28_spiral_galaxy_comp_spv.h"
+#include "../../build/generated/vulkan_shader_debug/tut28_battered_alien_planet_comp_spv.h"
+#include "../../build/generated/vulkan_shader_debug/tut28_flux_core_comp_spv.h"
+#include "../../build/generated/vulkan_shader_debug/vulkan_gltf_flat_comp_spv.h"
+#include "../../build/generated/vulkan_shader_debug/vulkan_gltf_shadowmap_comp_spv.h"
+#include "../../build/generated/vulkan_shader_debug/vulkan_denoise_prepare_comp_spv.h"
+#include "../../build/generated/vulkan_shader_debug/vulkan_denoise_atrous_comp_spv.h"
+#include "../../build/generated/vulkan_shader_debug/vulkan_denoise_composite_comp_spv.h"
+#else
 #include "tut28_star_nest_comp_spv.h"
 #include "tut28_lets_self_reflect_comp_spv.h"
 #include "tut28_spiral_galaxy_comp_spv.h"
@@ -33,8 +60,312 @@
 #include "vulkan_denoise_prepare_comp_spv.h"
 #include "vulkan_denoise_atrous_comp_spv.h"
 #include "vulkan_denoise_composite_comp_spv.h"
+#endif
 
 namespace {
+#ifdef NRAY_VULKAN_SHADER_DEBUG
+static constexpr bool kVulkanShaderDebugBuild = true;
+#else
+static constexpr bool kVulkanShaderDebugBuild = false;
+#endif
+
+template <typename Handle>
+uint64_t vulkanObjectHandle(Handle handle) {
+	if constexpr (std::is_pointer_v<Handle>) {
+		return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(handle));
+	}
+	else {
+		return static_cast<uint64_t>(handle);
+	}
+}
+
+bool hasInstanceExtension(const char* extensionName) {
+	uint32_t extensionCount = 0;
+	VkResult result = vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, nullptr);
+	if (result != VK_SUCCESS) {
+		return false;
+	}
+
+	std::vector<VkExtensionProperties> extensions(extensionCount);
+	result = vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, extensions.data());
+	if (result != VK_SUCCESS) {
+		return false;
+	}
+
+	for (const VkExtensionProperties& extension : extensions) {
+		if (std::strcmp(extension.extensionName, extensionName) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+class VulkanDebugUtils {
+public:
+	void setInstanceExtensionEnabled(bool enabled) {
+		m_instanceExtensionEnabled = enabled;
+	}
+
+	bool instanceExtensionEnabled() const {
+		return m_instanceExtensionEnabled;
+	}
+
+	bool labelsAvailable() const {
+		return m_instanceExtensionEnabled &&
+			vkCmdBeginDebugUtilsLabelEXT != nullptr &&
+			vkCmdEndDebugUtilsLabelEXT != nullptr;
+	}
+
+	bool objectNamesAvailable() const {
+		return m_instanceExtensionEnabled && vkSetDebugUtilsObjectNameEXT != nullptr;
+	}
+
+	template <typename Handle>
+	void name(VkDevice device, VkObjectType objectType, Handle handle, const char* label) const {
+		uint64_t objectHandle = vulkanObjectHandle(handle);
+		if (!objectNamesAvailable() || device == VK_NULL_HANDLE || objectHandle == 0 || label == nullptr) {
+			return;
+		}
+
+		VkDebugUtilsObjectNameInfoEXT nameInfo{};
+		nameInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+		nameInfo.objectType = objectType;
+		nameInfo.objectHandle = objectHandle;
+		nameInfo.pObjectName = label;
+		vkSetDebugUtilsObjectNameEXT(device, &nameInfo);
+	}
+
+	void beginLabel(VkCommandBuffer commandBuffer, const char* label, const float color[4] = nullptr) const {
+		if (!labelsAvailable() || commandBuffer == VK_NULL_HANDLE || label == nullptr) {
+			return;
+		}
+
+		VkDebugUtilsLabelEXT labelInfo{};
+		labelInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+		labelInfo.pLabelName = label;
+		if (color != nullptr) {
+			std::memcpy(labelInfo.color, color, sizeof(labelInfo.color));
+		}
+		else {
+			labelInfo.color[0] = 0.2f;
+			labelInfo.color[1] = 0.6f;
+			labelInfo.color[2] = 1.0f;
+			labelInfo.color[3] = 1.0f;
+		}
+		vkCmdBeginDebugUtilsLabelEXT(commandBuffer, &labelInfo);
+	}
+
+	void endLabel(VkCommandBuffer commandBuffer) const {
+		if (!labelsAvailable() || commandBuffer == VK_NULL_HANDLE) {
+			return;
+		}
+		vkCmdEndDebugUtilsLabelEXT(commandBuffer);
+	}
+
+private:
+	bool m_instanceExtensionEnabled = false;
+};
+
+class VulkanDebugRegion {
+public:
+	VulkanDebugRegion(const VulkanDebugUtils& debugUtils, VkCommandBuffer commandBuffer, const char* label)
+		: m_debugUtils(debugUtils)
+		, m_commandBuffer(commandBuffer) {
+		m_debugUtils.beginLabel(m_commandBuffer, label);
+	}
+
+	VulkanDebugRegion(const VulkanDebugRegion&) = delete;
+	VulkanDebugRegion& operator=(const VulkanDebugRegion&) = delete;
+
+	~VulkanDebugRegion() {
+		m_debugUtils.endLabel(m_commandBuffer);
+	}
+
+private:
+	const VulkanDebugUtils& m_debugUtils;
+	VkCommandBuffer m_commandBuffer = VK_NULL_HANDLE;
+};
+
+bool envFlagEnabled(const char* name) {
+	const char* raw = std::getenv(name);
+	return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+}
+
+RENDERDOC_API_1_4_1* renderDocApi() {
+	static RENDERDOC_API_1_4_1* api = nullptr;
+	static bool probed = false;
+	if (probed) {
+		return api;
+	}
+	probed = true;
+
+	pRENDERDOC_GetAPI getApi = nullptr;
+#ifdef _WIN32
+	HMODULE module = GetModuleHandleA("renderdoc.dll");
+	if (module != nullptr) {
+		getApi = reinterpret_cast<pRENDERDOC_GetAPI>(GetProcAddress(module, "RENDERDOC_GetAPI"));
+	}
+#elif defined(__linux__)
+	getApi = reinterpret_cast<pRENDERDOC_GetAPI>(dlsym(RTLD_DEFAULT, "RENDERDOC_GetAPI"));
+	if (getApi == nullptr) {
+		void* module = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
+		if (module == nullptr) {
+			module = dlopen("librenderdoc.so.1", RTLD_NOW | RTLD_NOLOAD);
+		}
+		if (module != nullptr) {
+			getApi = reinterpret_cast<pRENDERDOC_GetAPI>(dlsym(module, "RENDERDOC_GetAPI"));
+		}
+	}
+#endif
+
+	if (getApi == nullptr) {
+		return nullptr;
+	}
+
+	void* apiPointers = nullptr;
+	if (getApi(eRENDERDOC_API_Version_1_4_1, &apiPointers) != 1) {
+		return nullptr;
+	}
+
+	api = reinterpret_cast<RENDERDOC_API_1_4_1*>(apiPointers);
+	if (api != nullptr && api->SetCaptureOptionU32 != nullptr) {
+		api->SetCaptureOptionU32(eRENDERDOC_Option_CaptureAllCmdLists, 1);
+		api->SetCaptureOptionU32(eRENDERDOC_Option_RefAllResources, 1);
+	}
+	return api;
+}
+
+bool setRenderDocCaptureTemplate(const std::string& pathTemplate) {
+	RENDERDOC_API_1_4_1* api = renderDocApi();
+	if (api == nullptr || api->SetCaptureFilePathTemplate == nullptr) {
+		return false;
+	}
+	api->SetCaptureFilePathTemplate(pathTemplate.c_str());
+	return true;
+}
+
+class RenderDocCaptureController {
+public:
+	RenderDocCaptureController()
+		: m_pending(envFlagEnabled("NRAY_RENDERDOC_CAPTURE")) {
+	}
+
+	bool requestCapture(std::string& message) {
+		if (renderDocApi() == nullptr) {
+			message = "RenderDoc Vulkan capture unavailable: launch N-Ray through RenderDoc or inject RenderDoc before requesting capture";
+			return false;
+		}
+
+		m_pending = true;
+		message = "RenderDoc Vulkan capture armed for next compute dispatch";
+		return true;
+	}
+
+	bool begin(VkInstance instance, const char* label) {
+		if (!m_pending) {
+			return false;
+		}
+
+		RENDERDOC_API_1_4_1* api = renderDocApi();
+		if (api == nullptr || api->StartFrameCapture == nullptr || api->EndFrameCapture == nullptr) {
+			m_pending = false;
+			setStatus("RenderDoc Vulkan capture unavailable: RenderDoc API was not loaded in this process");
+			return false;
+		}
+		if (instance == VK_NULL_HANDLE) {
+			m_pending = false;
+			setStatus("RenderDoc Vulkan capture unavailable: Vulkan instance is missing");
+			return false;
+		}
+
+		RENDERDOC_DevicePointer devicePointer = RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance);
+		if (devicePointer == nullptr) {
+			m_pending = false;
+			setStatus("RenderDoc Vulkan capture unavailable: RenderDoc could not derive a device pointer from the Vulkan instance");
+			return false;
+		}
+
+		m_pending = false;
+		m_active = true;
+		m_activeApi = api;
+		m_activeDevice = devicePointer;
+		m_activeLabel = label != nullptr ? label : "Vulkan Compute Dispatch";
+		std::cerr << "[RenderDoc] Starting Vulkan capture: " << m_activeLabel << '\n';
+		m_activeApi->StartFrameCapture(m_activeDevice, nullptr);
+		return true;
+	}
+
+	bool end() {
+		if (!m_active || m_activeApi == nullptr) {
+			return false;
+		}
+
+		uint32_t saved = m_activeApi->EndFrameCapture(m_activeDevice, nullptr);
+		m_active = false;
+		m_activeApi = nullptr;
+		m_activeDevice = nullptr;
+		if (saved != 0) {
+			setStatus("RenderDoc Vulkan capture saved: " + m_activeLabel);
+		}
+		else {
+			setStatus("RenderDoc Vulkan capture ended without a saved capture; check that RenderDoc's Vulkan layer is active");
+		}
+		std::cerr << "[RenderDoc] " << m_lastStatus << '\n';
+		m_activeLabel.clear();
+		return true;
+	}
+
+	bool consumeStatus(std::string& message) {
+		if (!m_statusDirty) {
+			return false;
+		}
+		message = m_lastStatus;
+		m_statusDirty = false;
+		return true;
+	}
+
+private:
+	void setStatus(std::string message) {
+		m_lastStatus = std::move(message);
+		m_statusDirty = true;
+	}
+
+	bool m_pending = false;
+	bool m_active = false;
+	bool m_statusDirty = false;
+	RENDERDOC_API_1_4_1* m_activeApi = nullptr;
+	RENDERDOC_DevicePointer m_activeDevice = nullptr;
+	std::string m_activeLabel;
+	std::string m_lastStatus;
+};
+
+class RenderDocCaptureScope {
+public:
+	RenderDocCaptureScope(RenderDocCaptureController& controller, VkInstance instance, const char* label)
+		: m_controller(&controller)
+		, m_active(controller.begin(instance, label)) {
+	}
+
+	RenderDocCaptureScope(const RenderDocCaptureScope&) = delete;
+	RenderDocCaptureScope& operator=(const RenderDocCaptureScope&) = delete;
+
+	~RenderDocCaptureScope() {
+		end();
+	}
+
+	bool end() {
+		if (!m_active || m_controller == nullptr) {
+			return false;
+		}
+		m_active = false;
+		return m_controller->end();
+	}
+
+private:
+	RenderDocCaptureController* m_controller = nullptr;
+	bool m_active = false;
+};
+
 struct PushConstants {
 	int width = 0;
 	int height = 0;
@@ -50,7 +381,6 @@ struct PushConstants {
 };
 
 static_assert(sizeof(PushConstants) == 128, "Push constants must match Vulkan preview shaders.");
-static_assert(nray_vulkan_triangle_comp_spv_len % 4 == 0, "SPIR-V bytecode size must be a multiple of 4.");
 static_assert(nray_vulkan_gltf_flat_comp_spv_len % 4 == 0, "SPIR-V bytecode size must be a multiple of 4.");
 static_assert(nray_vulkan_gltf_shadowmap_comp_spv_len % 4 == 0, "SPIR-V bytecode size must be a multiple of 4.");
 static_assert(nray_vulkan_denoise_prepare_comp_spv_len % 4 == 0, "SPIR-V bytecode size must be a multiple of 4.");
@@ -282,10 +612,16 @@ struct ModelEntry {
 	std::string scenePath;  // resolved .gltf/.glb scene file (generic absolute path)
 	std::string folderPath; // canonical model folder, persisted to project_settings.json
 	std::string folderKey;  // normalized folder path used for dedup comparison
+	bool transient = false; // imported with persist=false; never written to project_settings.json
+};
+
+struct ProjectSettingsState {
+	std::vector<ModelEntry> entries;
+	std::string lastSelectedModelFolderPath;
+	std::string lastSelectedModelFolderKey;
 };
 
 static const ShaderEntry kShaders[] = {
-	{ "Hello World Triangle",       nray_vulkan_triangle_comp_spv,          nray_vulkan_triangle_comp_spv_len,          false },
 	{ "Star Nest",                  tut28_star_nest_comp_spv,               tut28_star_nest_comp_spv_len,               false },
 	{ "Lets Self Reflect",          tut28_lets_self_reflect_comp_spv,       tut28_lets_self_reflect_comp_spv_len,       false },
 	{ "Spiral Galaxy",              tut28_spiral_galaxy_comp_spv,           tut28_spiral_galaxy_comp_spv_len,           false },
@@ -294,6 +630,23 @@ static const ShaderEntry kShaders[] = {
 	{ "glTF Model Preview",         nray_vulkan_gltf_flat_comp_spv,         nray_vulkan_gltf_flat_comp_spv_len,         true  },
 };
 static const int kShaderCount = static_cast<int>(sizeof(kShaders) / sizeof(kShaders[0]));
+
+int modelPreviewShaderArrayIndex() {
+	for (int i = 0; i < kShaderCount; ++i) {
+		if (kShaders[i].requiresModel) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+int defaultShaderArrayIndex() {
+	int modelPreview = modelPreviewShaderArrayIndex();
+	if (modelPreview >= 0) {
+		return modelPreview;
+	}
+	return 0;
+}
 
 static constexpr uint32_t kMaxPreviewTextures = 256;
 // Total descriptor set bindings: 0=pixels, 1-4=scene SSBOs, 5=accum, 6=settings,
@@ -355,7 +708,7 @@ const char* denoiserDebugViewName(VulkanDenoiserDebugView view) {
 }
 
 bool denoiserVerboseLoggingEnabled(const VulkanDenoiserSettings& settings) {
-	static const bool envEnabled = std::getenv("NRAY_VULKAN_DENOISER_LOG") != nullptr;
+	static const bool envEnabled = envFlagEnabled("NRAY_VULKAN_DENOISER_LOG");
 	return settings.verboseLogging || envEnabled;
 }
 
@@ -428,9 +781,10 @@ public:
 		const Image* instanceId = nullptr;
 	};
 
-	bool create(VkDevice device, VkPhysicalDevice physicalDevice, VkExtent2D extent) {
+	bool create(VkDevice device, VkPhysicalDevice physicalDevice, VkExtent2D extent, VulkanDebugUtils debugUtils) {
 		m_device = device;
 		m_physicalDevice = physicalDevice;
+		m_debugUtils = debugUtils;
 		m_extent = extent;
 		vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &m_memoryProps);
 		m_formatsSupported = validateTargetFormats();
@@ -514,6 +868,7 @@ public:
 		m_created = false;
 		m_device = VK_NULL_HANDLE;
 		m_physicalDevice = VK_NULL_HANDLE;
+		m_debugUtils = VulkanDebugUtils{};
 		m_extent = {};
 		m_formatsSupported = false;
 		m_lastSkipReason.clear();
@@ -600,15 +955,21 @@ public:
 
 		uint32_t passCount = active ? m_stats.passCount : 0u;
 		if (active) {
-			PushConstants prepareConstants = basePushConstants;
-			prepareConstants.denoisePass = glm::uvec4(0u, 1u, static_cast<uint32_t>(settings.debugView), 0u);
-			vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_preparePipeline);
-			vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
-			vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &prepareConstants);
-			vkCmdDispatch(commandBuffer, ceilDiv(m_extent.width, 16), ceilDiv(m_extent.height, 16), 1);
-			barrierImages(commandBuffer, { Ping }, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+			{
+				VulkanDebugRegion region(m_debugUtils, commandBuffer, "Denoiser Prepare");
+				PushConstants prepareConstants = basePushConstants;
+				prepareConstants.denoisePass = glm::uvec4(0u, 1u, static_cast<uint32_t>(settings.debugView), 0u);
+				vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_preparePipeline);
+				vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+				vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &prepareConstants);
+				vkCmdDispatch(commandBuffer, ceilDiv(m_extent.width, 16), ceilDiv(m_extent.height, 16), 1);
+				barrierImages(commandBuffer, { Ping }, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+			}
 
 			for (uint32_t pass = 0; pass < passCount; ++pass) {
+				char passLabel[32];
+				std::snprintf(passLabel, sizeof(passLabel), "Denoiser Atrous Pass %u", pass);
+				VulkanDebugRegion region(m_debugUtils, commandBuffer, passLabel);
 				uint32_t stride = 1u << pass;
 				PushConstants atrousConstants = basePushConstants;
 				atrousConstants.denoisePass = glm::uvec4(pass, stride, static_cast<uint32_t>(settings.debugView), 0u);
@@ -625,12 +986,15 @@ public:
 			}
 		}
 
-		PushConstants compositeConstants = basePushConstants;
-		compositeConstants.denoisePass = glm::uvec4(passCount, 0u, static_cast<uint32_t>(settings.debugView), 0u);
-		vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_compositePipeline);
-		vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
-		vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &compositeConstants);
-		vkCmdDispatch(commandBuffer, ceilDiv(m_extent.width, 16), ceilDiv(m_extent.height, 16), 1);
+		{
+			VulkanDebugRegion region(m_debugUtils, commandBuffer, "Denoiser Composite");
+			PushConstants compositeConstants = basePushConstants;
+			compositeConstants.denoisePass = glm::uvec4(passCount, 0u, static_cast<uint32_t>(settings.debugView), 0u);
+			vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_compositePipeline);
+			vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+			vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &compositeConstants);
+			vkCmdDispatch(commandBuffer, ceilDiv(m_extent.width, 16), ceilDiv(m_extent.height, 16), 1);
+		}
 
 		if (active) {
 			std::ostringstream out;
@@ -802,6 +1166,10 @@ private:
 			logDenoiser(vkErrorMessage((std::string("vkCreateImage ") + label).c_str(), result));
 			return false;
 		}
+		{
+			std::string name = std::string("N-Ray denoiser ") + label + " image";
+			m_debugUtils.name(m_device, VK_OBJECT_TYPE_IMAGE, image.image, name.c_str());
+		}
 
 		VkMemoryRequirements memoryReqs{};
 		vkGetImageMemoryRequirements(m_device, image.image, &memoryReqs);
@@ -842,6 +1210,10 @@ private:
 		if (result != VK_SUCCESS) {
 			logDenoiser(vkErrorMessage((std::string("vkCreateImageView ") + label).c_str(), result));
 			return false;
+		}
+		{
+			std::string name = std::string("N-Ray denoiser ") + label + " image view";
+			m_debugUtils.name(m_device, VK_OBJECT_TYPE_IMAGE_VIEW, image.view, name.c_str());
 		}
 
 		image.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -993,6 +1365,8 @@ private:
 			logDenoiser(vkErrorMessage((std::string("vkCreateShaderModule ") + tag).c_str(), result));
 			return false;
 		}
+		std::string name = std::string("N-Ray denoiser shader module: ") + tag;
+		m_debugUtils.name(m_device, VK_OBJECT_TYPE_SHADER_MODULE, outModule, name.c_str());
 		return true;
 	}
 
@@ -1013,6 +1387,8 @@ private:
 			logDenoiser(vkErrorMessage((std::string("vkCreateComputePipelines ") + tag).c_str(), result));
 			return false;
 		}
+		std::string name = std::string("N-Ray denoiser compute pipeline: ") + tag;
+		m_debugUtils.name(m_device, VK_OBJECT_TYPE_PIPELINE, outPipeline, name.c_str());
 		return true;
 	}
 
@@ -1052,6 +1428,7 @@ private:
 
 	VkDevice m_device = VK_NULL_HANDLE;
 	VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
+	VulkanDebugUtils m_debugUtils;
 	VkPhysicalDeviceMemoryProperties m_memoryProps{};
 	VkExtent2D m_extent{};
 	bool m_created = false;
@@ -1199,10 +1576,14 @@ std::optional<ModelEntry> buildModelEntryForFolder(const std::filesystem::path& 
 	return entry;
 }
 
-void saveModelEntriesToSettings(const std::vector<ModelEntry>& entries) {
+void writeProjectSettings(const ProjectSettingsState& state) {
 	nlohmann::json root;
 	root["models"] = nlohmann::json::array();
-	for (const ModelEntry& entry : entries) {
+	if (!state.lastSelectedModelFolderPath.empty()) {
+		root["lastSelectedModelFolder"] = state.lastSelectedModelFolderPath;
+	}
+	for (const ModelEntry& entry : state.entries) {
+		if (entry.transient) { continue; }
 		nlohmann::json item;
 		item["name"] = entry.name;
 		item["folder"] = entry.folderPath;
@@ -1215,20 +1596,22 @@ void saveModelEntriesToSettings(const std::vector<ModelEntry>& entries) {
 		return;
 	}
 	out << root.dump(4) << '\n';
-	logModelImport("saved " + std::to_string(entries.size()) + " model(s) to " + kProjectSettingsFile);
+	int persistedCount = 0;
+	for (const auto& e : state.entries) { if (!e.transient) { ++persistedCount; } }
+	logModelImport("saved " + std::to_string(persistedCount) + " model(s) to " + kProjectSettingsFile);
 }
 
-std::vector<ModelEntry> loadModelEntriesFromSettings() {
-	std::vector<ModelEntry> entries;
+ProjectSettingsState loadProjectSettings() {
+	ProjectSettingsState state;
 
 	std::error_code ec;
 	if (!std::filesystem::exists(kProjectSettingsFile, ec) || ec) {
-		return entries;
+		return state;
 	}
 
 	std::ifstream in(kProjectSettingsFile);
 	if (!in.is_open()) {
-		return entries;
+		return state;
 	}
 
 	nlohmann::json root;
@@ -1237,67 +1620,117 @@ std::vector<ModelEntry> loadModelEntriesFromSettings() {
 	}
 	catch (const std::exception& e) {
 		logModelImport(std::string("failed to parse ") + kProjectSettingsFile + ": " + e.what());
-		return entries;
+		return state;
 	}
 
-	if (!root.contains("models") || !root["models"].is_array()) {
-		return entries;
+	if (root.contains("models") && root["models"].is_array()) {
+		for (const nlohmann::json& item : root["models"]) {
+			std::string folder;
+			std::string overrideName;
+			if (item.is_string()) {
+				folder = item.get<std::string>();
+			}
+			else if (item.is_object()) {
+				if (item.contains("folder") && item["folder"].is_string()) {
+					folder = item["folder"].get<std::string>();
+				}
+				if (item.contains("name") && item["name"].is_string()) {
+					overrideName = item["name"].get<std::string>();
+				}
+			}
+
+			folder = trimAscii(folder);
+			if (folder.empty()) {
+				continue;
+			}
+
+			std::optional<std::filesystem::path> resolved = resolveExistingFolder(folder);
+			if (!resolved.has_value()) {
+				logModelImport("settings model folder missing, skipping: " + folder);
+				continue;
+			}
+
+			std::optional<ModelEntry> entry = buildModelEntryForFolder(*resolved);
+			if (!entry.has_value()) {
+				logModelImport("settings model folder has no .gltf/.glb, skipping: " + folder);
+				continue;
+			}
+			if (!overrideName.empty()) {
+				entry->name = overrideName;
+			}
+
+			bool duplicate = false;
+			for (const ModelEntry& existing : state.entries) {
+				if (existing.folderKey == entry->folderKey) {
+					duplicate = true;
+					break;
+				}
+			}
+			if (!duplicate) {
+				state.entries.push_back(std::move(*entry));
+			}
+		}
 	}
 
-	for (const nlohmann::json& item : root["models"]) {
-		std::string folder;
-		std::string overrideName;
-		if (item.is_string()) {
-			folder = item.get<std::string>();
-		}
-		else if (item.is_object()) {
-			if (item.contains("folder") && item["folder"].is_string()) {
-				folder = item["folder"].get<std::string>();
+	if (root.contains("lastSelectedModelFolder") && root["lastSelectedModelFolder"].is_string()) {
+		std::string selectedFolder = trimAscii(root["lastSelectedModelFolder"].get<std::string>());
+		if (!selectedFolder.empty()) {
+			std::optional<std::filesystem::path> resolved = resolveExistingFolder(selectedFolder);
+			if (resolved.has_value()) {
+				state.lastSelectedModelFolderPath = genericPathString(canonicalOrAbsolute(*resolved));
+				state.lastSelectedModelFolderKey = normalizePathKey(*resolved);
 			}
-			if (item.contains("name") && item["name"].is_string()) {
-				overrideName = item["name"].get<std::string>();
+			else {
+				logModelImport("last selected model folder missing, using default scene: " + selectedFolder);
 			}
-		}
-
-		folder = trimAscii(folder);
-		if (folder.empty()) {
-			continue;
-		}
-
-		std::optional<std::filesystem::path> resolved = resolveExistingFolder(folder);
-		if (!resolved.has_value()) {
-			logModelImport("settings model folder missing, skipping: " + folder);
-			continue;
-		}
-
-		std::optional<ModelEntry> entry = buildModelEntryForFolder(*resolved);
-		if (!entry.has_value()) {
-			logModelImport("settings model folder has no .gltf/.glb, skipping: " + folder);
-			continue;
-		}
-		if (!overrideName.empty()) {
-			entry->name = overrideName;
-		}
-
-		bool duplicate = false;
-		for (const ModelEntry& existing : entries) {
-			if (existing.folderKey == entry->folderKey) {
-				duplicate = true;
-				break;
-			}
-		}
-		if (!duplicate) {
-			entries.push_back(std::move(*entry));
 		}
 	}
 
-	logModelImport("loaded " + std::to_string(entries.size()) + " model(s) from " + kProjectSettingsFile);
-	return entries;
+	logModelImport("loaded " + std::to_string(state.entries.size()) + " model(s) from " + kProjectSettingsFile);
+	return state;
+}
+
+ProjectSettingsState& projectSettingsState() {
+	static ProjectSettingsState state = loadProjectSettings();
+	return state;
 }
 
 std::vector<ModelEntry>& activeModelEntries() {
-	static std::vector<ModelEntry> entries = loadModelEntriesFromSettings();
-	return entries;
+	return projectSettingsState().entries;
+}
+
+void saveModelEntriesToSettings(const std::vector<ModelEntry>& entries) {
+	ProjectSettingsState& state = projectSettingsState();
+	state.entries = entries;
+	writeProjectSettings(state);
+}
+
+void saveSelectedModelToSettings(int selectedModel) {
+	ProjectSettingsState& state = projectSettingsState();
+	if (selectedModel >= 0 && selectedModel < static_cast<int>(state.entries.size())) {
+		const ModelEntry& entry = state.entries[selectedModel];
+		state.lastSelectedModelFolderPath = entry.folderPath;
+		state.lastSelectedModelFolderKey = entry.folderKey;
+	}
+	else {
+		state.lastSelectedModelFolderPath.clear();
+		state.lastSelectedModelFolderKey.clear();
+	}
+	writeProjectSettings(state);
+}
+
+int initialSelectedModelFromSettings() {
+	const ProjectSettingsState& state = projectSettingsState();
+	if (state.lastSelectedModelFolderKey.empty()) {
+		return -1;
+	}
+	for (int i = 0; i < static_cast<int>(state.entries.size()); ++i) {
+		if (state.entries[i].folderKey == state.lastSelectedModelFolderKey) {
+			return i;
+		}
+	}
+	logModelImport("last selected model is no longer registered; using default scene");
+	return -1;
 }
 
 }
@@ -1326,6 +1759,8 @@ struct VulkanComputePreview::Impl {
 	VkDevice device = VK_NULL_HANDLE;
 	VkQueue queue = VK_NULL_HANDLE;
 	uint32_t queueFamily = 0;
+	VulkanDebugUtils debugUtils;
+	RenderDocCaptureController renderDocCapture;
 
 	VkBuffer pixelBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory pixelMemory = VK_NULL_HANDLE;
@@ -1410,6 +1845,7 @@ struct VulkanComputePreview::Impl {
 	bool timestampSupported = false;
 	bool memBudgetSupported = false;
 	bool descriptorIndexingSupported = false;
+	bool shaderNonSemanticInfoSupported = false;
 	uint64_t localHeapBytes = 0;
 	uint32_t localHeapIndex = UINT32_MAX;
 	uint64_t localHeapUsed = 0;
@@ -1417,13 +1853,14 @@ struct VulkanComputePreview::Impl {
 	uint32_t frameCount = 0;
 	VulkanDenoiser denoiser;
 
-	int selectedShader = 0;
-	int selectedModel = -1;
+	int selectedShader = defaultShaderArrayIndex();
+	int selectedModel = initialSelectedModelFromSettings();
 	int renderWidth = 0;
 	int renderHeight = 0;
 	bool initialized = false;
 	bool volkReady = false;
 	bool instanceCleanupUnsafe = false;
+	bool persistSettings = true;
 	std::string status = "Vulkan preview not initialized";
 	std::string deviceName = "unknown device";
 
@@ -1458,7 +1895,7 @@ struct VulkanComputePreview::Impl {
 			!createAccumBuffer() ||
 			!createSettingsBuffer() ||
 			!createShadowMapBuffer() ||
-			!denoiser.create(device, physicalDevice, VkExtent2D{static_cast<uint32_t>(renderWidth), static_cast<uint32_t>(renderHeight)}) ||
+			!denoiser.create(device, physicalDevice, VkExtent2D{static_cast<uint32_t>(renderWidth), static_cast<uint32_t>(renderHeight)}, debugUtils) ||
 			!createDescriptorSetLayout() ||
 			!createDescriptorPoolAndSet() ||
 			!createPipeline()) {
@@ -1526,6 +1963,7 @@ struct VulkanComputePreview::Impl {
 		}
 
 		const ShaderEntry& selectedEntry = kShaders[selectedShader >= 0 && selectedShader < kShaderCount ? selectedShader : 0];
+		std::string captureLabel = std::string("Vulkan Compute Dispatch: ") + selectedEntry.name;
 		if (selectedEntry.requiresModel && !modelBuffersReady) {
 			status = "Cannot render glTF model preview: no model buffers are ready";
 			if (!modelScene.status.empty()) {
@@ -1594,6 +2032,9 @@ struct VulkanComputePreview::Impl {
 			return false;
 		}
 
+		RenderDocCaptureScope renderDocScope(renderDocCapture, instance, captureLabel.c_str());
+		applyRenderDocStatus();
+
 		VkResult result = vkResetFences(device, 1, &fence);
 		if (result != VK_SUCCESS) {
 			status = vkErrorMessage("vkResetFences", result);
@@ -1615,19 +2056,113 @@ struct VulkanComputePreview::Impl {
 			return false;
 		}
 
-		if (traceSample) {
-			if (accumNeedsClear) {
-				vkCmdFillBuffer(commandBuffer, accumBuffer, 0, VK_WHOLE_SIZE, 0);
+		{
+			VulkanDebugRegion frameRegion(debugUtils, commandBuffer, captureLabel.c_str());
 
-				VkBufferMemoryBarrier clearBarrier{};
-				clearBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-				clearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-				clearBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-				clearBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-				clearBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-				clearBarrier.buffer = accumBuffer;
-				clearBarrier.offset = 0;
-				clearBarrier.size = VK_WHOLE_SIZE;
+			if (traceSample) {
+				if (accumNeedsClear) {
+					VulkanDebugRegion region(debugUtils, commandBuffer, "Accumulation Clear");
+					vkCmdFillBuffer(commandBuffer, accumBuffer, 0, VK_WHOLE_SIZE, 0);
+
+					VkBufferMemoryBarrier clearBarrier{};
+					clearBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+					clearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+					clearBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+					clearBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+					clearBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+					clearBarrier.buffer = accumBuffer;
+					clearBarrier.offset = 0;
+					clearBarrier.size = VK_WHOLE_SIZE;
+					vkCmdPipelineBarrier(
+						commandBuffer,
+						VK_PIPELINE_STAGE_TRANSFER_BIT,
+						VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+						0,
+						0,
+						nullptr,
+						1,
+						&clearBarrier,
+						0,
+						nullptr
+					);
+
+					accumNeedsClear = false;
+				}
+				else {
+					VulkanDebugRegion region(debugUtils, commandBuffer, "Accumulation Sample Barrier");
+					VkBufferMemoryBarrier sampleBarrier{};
+					sampleBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+					sampleBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+					sampleBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+					sampleBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+					sampleBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+					sampleBarrier.buffer = accumBuffer;
+					sampleBarrier.offset = 0;
+					sampleBarrier.size = VK_WHOLE_SIZE;
+					vkCmdPipelineBarrier(
+						commandBuffer,
+						VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+						VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+						0,
+						0,
+						nullptr,
+						1,
+						&sampleBarrier,
+						0,
+						nullptr
+					);
+				}
+			}
+
+			float modelRayBias = selectedEntry.requiresModel && modelBuffersReady
+				? computeModelRayBias(modelScene)
+				: 0.0001f;
+
+			PushConstants pushConstants{
+				renderWidth,
+				renderHeight,
+				timeSeconds,
+				currentSample,
+				glm::vec4(camera.position, 0.0f),
+				glm::vec4(camera.forward, 0.0f),
+				glm::vec4(camera.right, 0.0f),
+				glm::vec4(camera.up, 0.0f),
+				glm::vec4(camera.verticalScale, camera.aspect, modelRayBias, 0.0f),
+				sceneCounts,
+				glm::uvec4(0u)
+			};
+
+			bool runShadowMapPrepass =
+				traceSample &&
+				selectedEntry.requiresModel &&
+				modelBuffersReady &&
+				settings.shadowMode == VulkanPreviewShadowMode::ShadowMap &&
+				shadowMapPipeline != VK_NULL_HANDLE &&
+				shadowMapBuffer.buffer != VK_NULL_HANDLE &&
+				sceneCounts.x > 0u;
+
+			if (timestampSupported && timestampPool != VK_NULL_HANDLE) {
+				vkCmdResetQueryPool(commandBuffer, timestampPool, 0, 2);
+				vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampPool, 0);
+			}
+
+			if (traceSample && selectedEntry.requiresModel && modelBuffersReady) {
+				denoiser.prepareForModelDispatch(commandBuffer);
+			}
+
+			if (runShadowMapPrepass) {
+				VulkanDebugRegion region(debugUtils, commandBuffer, "Shadow Map Prepass");
+				vkCmdFillBuffer(commandBuffer, shadowMapBuffer.buffer, 0, VK_WHOLE_SIZE, kShadowMapClearValue);
+
+				VkBufferMemoryBarrier shadowClearBarrier{};
+				shadowClearBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+				shadowClearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+				shadowClearBarrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+				shadowClearBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				shadowClearBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				shadowClearBarrier.buffer = shadowMapBuffer.buffer;
+				shadowClearBarrier.offset = 0;
+				shadowClearBarrier.size = VK_WHOLE_SIZE;
 				vkCmdPipelineBarrier(
 					commandBuffer,
 					VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -1636,23 +2171,25 @@ struct VulkanComputePreview::Impl {
 					0,
 					nullptr,
 					1,
-					&clearBarrier,
+					&shadowClearBarrier,
 					0,
 					nullptr
 				);
 
-				accumNeedsClear = false;
-			}
-			else {
-				VkBufferMemoryBarrier sampleBarrier{};
-				sampleBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-				sampleBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-				sampleBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-				sampleBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-				sampleBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-				sampleBarrier.buffer = accumBuffer;
-				sampleBarrier.offset = 0;
-				sampleBarrier.size = VK_WHOLE_SIZE;
+				vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, shadowMapPipeline);
+				vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+				vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pushConstants);
+				vkCmdDispatch(commandBuffer, ceilDiv(sceneCounts.x, 64), 1, 1);
+
+				VkBufferMemoryBarrier shadowReadBarrier{};
+				shadowReadBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+				shadowReadBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+				shadowReadBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+				shadowReadBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				shadowReadBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				shadowReadBarrier.buffer = shadowMapBuffer.buffer;
+				shadowReadBarrier.offset = 0;
+				shadowReadBarrier.size = VK_WHOLE_SIZE;
 				vkCmdPipelineBarrier(
 					commandBuffer,
 					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -1661,163 +2198,79 @@ struct VulkanComputePreview::Impl {
 					0,
 					nullptr,
 					1,
-					&sampleBarrier,
+					&shadowReadBarrier,
+					0,
+					nullptr
+				);
+			}
+
+			if (traceSample) {
+				std::string dispatchLabel = std::string("Main Compute Dispatch: ") + selectedEntry.name;
+				VulkanDebugRegion region(debugUtils, commandBuffer, dispatchLabel.c_str());
+				vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+				vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+				vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pushConstants);
+				vkCmdDispatch(commandBuffer, ceilDiv(static_cast<uint32_t>(renderWidth), 16), ceilDiv(static_cast<uint32_t>(renderHeight), 16), 1);
+			}
+
+			if (selectedEntry.requiresModel && modelBuffersReady) {
+				VulkanDenoiser::FeatureImages features{
+					&denoiser.imageForBinding(kBindingDenoiseNormalRoughness),
+					&denoiser.imageForBinding(kBindingDenoiseAlbedoMetallic),
+					&denoiser.imageForBinding(kBindingDenoiseDepth),
+					&denoiser.imageForBinding(kBindingDenoiseMaterialId),
+					&denoiser.imageForBinding(kBindingDenoiseInstanceId)
+				};
+				denoiser.record(
+					commandBuffer,
+					pipelineLayout,
+					descriptorSet,
+					pushConstants,
+					true,
+					postprocessOnly,
+					features,
+					denoiseSampleCount,
+					settings.denoiser
+				);
+			}
+			else {
+				denoiser.beginFrame(false, false, denoiseSampleCount, settings.denoiser);
+			}
+
+			if (timestampSupported && timestampPool != VK_NULL_HANDLE) {
+				vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestampPool, 1);
+			}
+
+			{
+				VulkanDebugRegion region(debugUtils, commandBuffer, "Final Host Readback Barrier");
+				VkMemoryBarrier memoryBarrier{};
+				memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+				memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+				// On coherent memory (always true on Intel UMA) the next frame's sample barrier
+				// handles COMPUTE->COMPUTE ordering; only HOST visibility is needed here.
+				// On non-coherent memory keep the conservative mask.
+				VkPipelineStageFlags finalDstStage;
+				if (pixelMemoryCoherent) {
+					memoryBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+					finalDstStage = VK_PIPELINE_STAGE_HOST_BIT;
+				} else {
+					memoryBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+					finalDstStage = VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+				}
+				vkCmdPipelineBarrier(
+					commandBuffer,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					finalDstStage,
+					0,
+					1,
+					&memoryBarrier,
+					0,
+					nullptr,
 					0,
 					nullptr
 				);
 			}
 		}
-
-		float modelRayBias = selectedEntry.requiresModel && modelBuffersReady
-			? computeModelRayBias(modelScene)
-			: 0.0001f;
-
-		PushConstants pushConstants{
-			renderWidth,
-			renderHeight,
-			timeSeconds,
-			currentSample,
-			glm::vec4(camera.position, 0.0f),
-			glm::vec4(camera.forward, 0.0f),
-			glm::vec4(camera.right, 0.0f),
-			glm::vec4(camera.up, 0.0f),
-			glm::vec4(camera.verticalScale, camera.aspect, modelRayBias, 0.0f),
-			sceneCounts,
-			glm::uvec4(0u)
-		};
-
-		bool runShadowMapPrepass =
-			traceSample &&
-			selectedEntry.requiresModel &&
-			modelBuffersReady &&
-			settings.shadowMode == VulkanPreviewShadowMode::ShadowMap &&
-			shadowMapPipeline != VK_NULL_HANDLE &&
-			shadowMapBuffer.buffer != VK_NULL_HANDLE &&
-			sceneCounts.x > 0u;
-
-		if (timestampSupported && timestampPool != VK_NULL_HANDLE) {
-			vkCmdResetQueryPool(commandBuffer, timestampPool, 0, 2);
-			vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampPool, 0);
-		}
-
-		if (traceSample && selectedEntry.requiresModel && modelBuffersReady) {
-			denoiser.prepareForModelDispatch(commandBuffer);
-		}
-
-		if (runShadowMapPrepass) {
-			vkCmdFillBuffer(commandBuffer, shadowMapBuffer.buffer, 0, VK_WHOLE_SIZE, kShadowMapClearValue);
-
-			VkBufferMemoryBarrier shadowClearBarrier{};
-			shadowClearBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-			shadowClearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-			shadowClearBarrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-			shadowClearBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			shadowClearBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			shadowClearBarrier.buffer = shadowMapBuffer.buffer;
-			shadowClearBarrier.offset = 0;
-			shadowClearBarrier.size = VK_WHOLE_SIZE;
-			vkCmdPipelineBarrier(
-				commandBuffer,
-				VK_PIPELINE_STAGE_TRANSFER_BIT,
-				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				0,
-				0,
-				nullptr,
-				1,
-				&shadowClearBarrier,
-				0,
-				nullptr
-			);
-
-			vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, shadowMapPipeline);
-			vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
-			vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pushConstants);
-			vkCmdDispatch(commandBuffer, ceilDiv(sceneCounts.x, 64), 1, 1);
-
-			VkBufferMemoryBarrier shadowReadBarrier{};
-			shadowReadBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-			shadowReadBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-			shadowReadBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-			shadowReadBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			shadowReadBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			shadowReadBarrier.buffer = shadowMapBuffer.buffer;
-			shadowReadBarrier.offset = 0;
-			shadowReadBarrier.size = VK_WHOLE_SIZE;
-			vkCmdPipelineBarrier(
-				commandBuffer,
-				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				0,
-				0,
-				nullptr,
-				1,
-				&shadowReadBarrier,
-				0,
-				nullptr
-			);
-		}
-
-		if (traceSample) {
-			vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-			vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
-			vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pushConstants);
-			vkCmdDispatch(commandBuffer, ceilDiv(static_cast<uint32_t>(renderWidth), 16), ceilDiv(static_cast<uint32_t>(renderHeight), 16), 1);
-		}
-
-		if (selectedEntry.requiresModel && modelBuffersReady) {
-			VulkanDenoiser::FeatureImages features{
-				&denoiser.imageForBinding(kBindingDenoiseNormalRoughness),
-				&denoiser.imageForBinding(kBindingDenoiseAlbedoMetallic),
-				&denoiser.imageForBinding(kBindingDenoiseDepth),
-				&denoiser.imageForBinding(kBindingDenoiseMaterialId),
-				&denoiser.imageForBinding(kBindingDenoiseInstanceId)
-			};
-			denoiser.record(
-				commandBuffer,
-				pipelineLayout,
-				descriptorSet,
-				pushConstants,
-				true,
-				postprocessOnly,
-				features,
-				denoiseSampleCount,
-				settings.denoiser
-			);
-		}
-		else {
-			denoiser.beginFrame(false, false, denoiseSampleCount, settings.denoiser);
-		}
-
-		if (timestampSupported && timestampPool != VK_NULL_HANDLE) {
-			vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestampPool, 1);
-		}
-
-		VkMemoryBarrier memoryBarrier{};
-		memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-		memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		// On coherent memory (always true on Intel UMA) the next frame's sample barrier
-		// handles COMPUTE→COMPUTE ordering; only HOST visibility is needed here.
-		// On non-coherent memory keep the conservative mask.
-		VkPipelineStageFlags finalDstStage;
-		if (pixelMemoryCoherent) {
-			memoryBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-			finalDstStage = VK_PIPELINE_STAGE_HOST_BIT;
-		} else {
-			memoryBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-			finalDstStage = VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-		}
-		vkCmdPipelineBarrier(
-			commandBuffer,
-			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			finalDstStage,
-			0,
-			1,
-			&memoryBarrier,
-			0,
-			nullptr,
-			0,
-			nullptr
-		);
 
 		result = vkEndCommandBuffer(commandBuffer);
 		if (result != VK_SUCCESS) {
@@ -1840,6 +2293,9 @@ struct VulkanComputePreview::Impl {
 		if (result != VK_SUCCESS) {
 			status = vkErrorMessage("vkWaitForFences", result);
 			return false;
+		}
+		if (renderDocScope.end()) {
+			applyRenderDocStatus();
 		}
 
 		if (!pixelMemoryCoherent) {
@@ -1885,6 +2341,16 @@ struct VulkanComputePreview::Impl {
 		pixels.resize(static_cast<size_t>(renderWidth) * static_cast<size_t>(renderHeight));
 		std::memcpy(pixels.data(), mappedPixels, pixelBufferSize);
 		return true;
+	}
+
+	bool requestRenderDocCapture() {
+		std::string message;
+		bool requested = renderDocCapture.requestCapture(message);
+		status = message;
+		if (!requested) {
+			std::cerr << "[RenderDoc] " << status << '\n';
+		}
+		return requested;
 	}
 
 	void shutdown() {
@@ -1960,6 +2426,8 @@ struct VulkanComputePreview::Impl {
 		timestampSupported = false;
 		memBudgetSupported = false;
 		descriptorIndexingSupported = false;
+		shaderNonSemanticInfoSupported = false;
+		debugUtils = VulkanDebugUtils{};
 	}
 
 	void abandonUnsafePartialInstance() {
@@ -1969,6 +2437,7 @@ struct VulkanComputePreview::Impl {
 		renderHeight = 0;
 		initialized = false;
 		instanceCleanupUnsafe = false;
+		debugUtils = VulkanDebugUtils{};
 	}
 
 	void destroyDescriptorPool() {
@@ -2011,6 +2480,10 @@ struct VulkanComputePreview::Impl {
 		VkResult result = vkCreateBuffer(device, &bufferInfo, nullptr, &buffer);
 		if (result != VK_SUCCESS) {
 			return failVk((std::string("vkCreateBuffer ") + tag).c_str(), result);
+		}
+		{
+			std::string name = std::string("N-Ray ") + tag + " buffer";
+			debugUtils.name(device, VK_OBJECT_TYPE_BUFFER, buffer, name.c_str());
 		}
 
 		VkMemoryRequirements memoryReqs{};
@@ -2161,6 +2634,7 @@ struct VulkanComputePreview::Impl {
 		if (result != VK_SUCCESS) {
 			return failVk("vkCreateBuffer accum", result);
 		}
+		debugUtils.name(device, VK_OBJECT_TYPE_BUFFER, accumBuffer, "N-Ray HDR accumulation buffer");
 
 		VkMemoryRequirements memoryReqs{};
 		vkGetBufferMemoryRequirements(device, accumBuffer, &memoryReqs);
@@ -2244,6 +2718,13 @@ struct VulkanComputePreview::Impl {
 		return fail(vkErrorMessage(op, result));
 	}
 
+	void applyRenderDocStatus() {
+		std::string message;
+		if (renderDocCapture.consumeStatus(message)) {
+			status = message;
+		}
+	}
+
 	bool createInstance() {
 		VkApplicationInfo appInfo{};
 		appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -2251,11 +2732,21 @@ struct VulkanComputePreview::Impl {
 		appInfo.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
 		appInfo.pEngineName = "N-Ray";
 		appInfo.engineVersion = VK_MAKE_VERSION(0, 1, 0);
-		appInfo.apiVersion = VK_API_VERSION_1_1;
+		appInfo.apiVersion = kVulkanShaderDebugBuild && volkGetInstanceVersion() >= VK_API_VERSION_1_2
+			? VK_API_VERSION_1_2
+			: VK_API_VERSION_1_1;
+
+		std::vector<const char*> enabledExtensions;
+		bool debugUtilsAvailable = hasInstanceExtension(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+		if (debugUtilsAvailable) {
+			enabledExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+		}
 
 		VkInstanceCreateInfo createInfo{};
 		createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
 		createInfo.pApplicationInfo = &appInfo;
+		createInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExtensions.size());
+		createInfo.ppEnabledExtensionNames = enabledExtensions.empty() ? nullptr : enabledExtensions.data();
 
 		VkResult result = vkCreateInstance(&createInfo, nullptr, &instance);
 		if (result != VK_SUCCESS) {
@@ -2263,6 +2754,7 @@ struct VulkanComputePreview::Impl {
 		}
 
 		volkLoadInstance(instance);
+		debugUtils.setInstanceExtensionEnabled(debugUtilsAvailable);
 		return true;
 	}
 
@@ -2375,6 +2867,7 @@ struct VulkanComputePreview::Impl {
 
 		memBudgetSupported = false;
 		descriptorIndexingSupported = false;
+		shaderNonSemanticInfoSupported = false;
 		{
 			uint32_t extCount = 0;
 			vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, nullptr);
@@ -2386,6 +2879,9 @@ struct VulkanComputePreview::Impl {
 				}
 				if (strcmp(ext.extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) == 0) {
 					descriptorIndexingSupported = true;
+				}
+				if (strcmp(ext.extensionName, VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME) == 0) {
+					shaderNonSemanticInfoSupported = true;
 				}
 			}
 		}
@@ -2406,6 +2902,14 @@ struct VulkanComputePreview::Impl {
 
 		VkPhysicalDeviceProperties props{};
 		vkGetPhysicalDeviceProperties(physicalDevice, &props);
+		if (kVulkanShaderDebugBuild && props.apiVersion < VK_API_VERSION_1_2) {
+			return fail("Vulkan shader debug build disabled: debug SPIR-V targets Vulkan 1.2, but the selected device reports an older API version");
+		}
+		if (kVulkanShaderDebugBuild &&
+			!shaderNonSemanticInfoSupported &&
+			props.apiVersion < VK_API_VERSION_1_3) {
+			return fail("Vulkan shader debug build disabled: VK_KHR_shader_non_semantic_info or Vulkan 1.3 support is required for embedded shader debug info");
+		}
 		if (props.limits.maxPerStageDescriptorSampledImages < kMaxPreviewTextures ||
 			props.limits.maxDescriptorSetSampledImages < kMaxPreviewTextures) {
 			return fail("Vulkan preview disabled: device sampled-image descriptor limit is too low for the glTF texture array");
@@ -2423,6 +2927,9 @@ struct VulkanComputePreview::Impl {
 		if (memBudgetSupported) {
 			enabledExtensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 		}
+		if (kVulkanShaderDebugBuild && shaderNonSemanticInfoSupported) {
+			enabledExtensions.push_back(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
+		}
 
 		VkDeviceCreateInfo createInfo{};
 		createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -2439,6 +2946,7 @@ struct VulkanComputePreview::Impl {
 
 		volkLoadDevice(device);
 		vkGetDeviceQueue(device, queueFamily, 0, &queue);
+		debugUtils.name(device, VK_OBJECT_TYPE_DEVICE, device, "N-Ray Vulkan Compute Device");
 		return true;
 	}
 
@@ -2492,6 +3000,10 @@ struct VulkanComputePreview::Impl {
 		VkResult result = vkCreateBuffer(device, &bufferInfo, nullptr, &resource.buffer);
 		if (result != VK_SUCCESS) {
 			return failVk((std::string("vkCreateBuffer ") + tag).c_str(), result);
+		}
+		{
+			std::string name = std::string("N-Ray ") + tag + " buffer";
+			debugUtils.name(device, VK_OBJECT_TYPE_BUFFER, resource.buffer, name.c_str());
 		}
 
 		VkMemoryRequirements memoryReqs{};
@@ -2629,6 +3141,10 @@ struct VulkanComputePreview::Impl {
 		if (result != VK_SUCCESS) {
 			return failVk((std::string("vkCreateBuffer ") + tag).c_str(), result);
 		}
+		{
+			std::string name = std::string("N-Ray ") + tag + " buffer";
+			debugUtils.name(device, VK_OBJECT_TYPE_BUFFER, buffer, name.c_str());
+		}
 
 		VkMemoryRequirements memoryReqs{};
 		vkGetBufferMemoryRequirements(device, buffer, &memoryReqs);
@@ -2684,6 +3200,10 @@ struct VulkanComputePreview::Impl {
 		if (result != VK_SUCCESS) {
 			return failVk((std::string("vkAllocateCommandBuffers ") + tag).c_str(), result);
 		}
+		{
+			std::string name = std::string("N-Ray immediate command buffer: ") + tag;
+			debugUtils.name(device, VK_OBJECT_TYPE_COMMAND_BUFFER, uploadCommandBuffer, name.c_str());
+		}
 
 		VkCommandBufferBeginInfo beginInfo{};
 		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -2694,7 +3214,11 @@ struct VulkanComputePreview::Impl {
 			return failVk((std::string("vkBeginCommandBuffer ") + tag).c_str(), result);
 		}
 
-		record(uploadCommandBuffer);
+		{
+			std::string label = std::string("Immediate Submit: ") + tag;
+			VulkanDebugRegion region(debugUtils, uploadCommandBuffer, label.c_str());
+			record(uploadCommandBuffer);
+		}
 
 		result = vkEndCommandBuffer(uploadCommandBuffer);
 		if (result != VK_SUCCESS) {
@@ -2780,6 +3304,14 @@ struct VulkanComputePreview::Impl {
 		if (result != VK_SUCCESS) {
 			destroyTransientBuffer(stagingBuffer, stagingMemory);
 			return failVk("vkCreateImage texture", result);
+		}
+		{
+			std::string name = "N-Ray glTF texture image";
+			if (!source.name.empty()) {
+				name += ": ";
+				name += source.name;
+			}
+			debugUtils.name(device, VK_OBJECT_TYPE_IMAGE, texture.image, name.c_str());
 		}
 
 		VkMemoryRequirements memoryReqs{};
@@ -2897,6 +3429,14 @@ struct VulkanComputePreview::Impl {
 			destroyTextureResource(texture);
 			return failVk("vkCreateImageView texture", result);
 		}
+		{
+			std::string name = "N-Ray glTF texture image view";
+			if (!source.name.empty()) {
+				name += ": ";
+				name += source.name;
+			}
+			debugUtils.name(device, VK_OBJECT_TYPE_IMAGE_VIEW, texture.view, name.c_str());
+		}
 
 		VkSamplerCreateInfo samplerInfo{};
 		samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -2918,6 +3458,14 @@ struct VulkanComputePreview::Impl {
 		if (result != VK_SUCCESS) {
 			destroyTextureResource(texture);
 			return failVk("vkCreateSampler texture", result);
+		}
+		{
+			std::string name = "N-Ray glTF texture sampler";
+			if (!source.name.empty()) {
+				name += ": ";
+				name += source.name;
+			}
+			debugUtils.name(device, VK_OBJECT_TYPE_SAMPLER, texture.sampler, name.c_str());
 		}
 
 		texture.width = width;
@@ -2979,7 +3527,7 @@ struct VulkanComputePreview::Impl {
 
 	bool createDummySceneBuffer() {
 		uint32_t zero[4] = {};
-		return createStorageBuffer(dummyBuffer, zero, sizeof(zero));
+		return createStorageBuffer(dummyBuffer, zero, sizeof(zero), 0, "dummy scene");
 	}
 
 	bool loadModelSceneResources() {
@@ -2995,49 +3543,45 @@ struct VulkanComputePreview::Impl {
 
 		auto& models = activeModelEntries();
 		if (selectedModel < 0 || selectedModel >= static_cast<int>(models.size())) {
-			// No model selected (fresh start, or none imported yet). Keep the
-			// preview usable for the shader-only modes by creating the fallback
-			// texture array the descriptor set requires; model preview becomes
-			// available once a model is selected/imported.
-			logModelImport("loadModelSceneResources: no model selected; using fallback textures");
-			if (!createFallbackTextureResources()) {
-				status = "Vulkan fallback texture creation failed";
+			selectedModel = -1;
+			logModelImport("loadModelSceneResources: no model selected; using default procedural scene");
+			if (!createDefaultGltfPreviewScene(modelScene)) {
+				status = modelScene.status.empty()
+					? "Default Vulkan preview scene creation failed"
+					: modelScene.status;
+				logModelImport(status);
 				return false;
 			}
-			modelScene = {};
-			modelScene.status = models.empty()
-				? "No glTF models registered. Import a model folder to enable model preview."
-				: "No glTF model selected.";
-			return true;
 		}
-
-		const int modelIndex = selectedModel;
-		const ModelEntry& modelEntry = models[modelIndex];
-		{
-			std::ostringstream out;
-			out << "loading model resources index=" << modelIndex
-				<< " name=\"" << modelEntry.name << "\""
-				<< " scene=\"" << modelEntry.scenePath << "\"";
-			logModelImport(out.str());
-		}
-		if (!loadGltfPreviewScene(modelEntry.scenePath, modelScene)) {
-			if (!modelScene.status.empty()) {
-				modelScene.status = modelEntry.name + " (" + modelEntry.scenePath + "): " + modelScene.status;
+		else {
+			const int modelIndex = selectedModel;
+			const ModelEntry& modelEntry = models[modelIndex];
+			{
+				std::ostringstream out;
+				out << "loading model resources index=" << modelIndex
+					<< " name=\"" << modelEntry.name << "\""
+					<< " scene=\"" << modelEntry.scenePath << "\"";
+				logModelImport(out.str());
 			}
-			status = modelScene.status;
-			logModelImport("glTF load failed: " + status);
-			return false;
-		}
-		modelScene.status = modelEntry.name + ": " + modelScene.status;
-		{
-			std::ostringstream out;
-			out << "glTF loaded index=" << modelIndex
-				<< " triangles=" << modelScene.tris.size()
-				<< " triIsect=" << modelScene.triIsect.size()
-				<< " bvhNodes=" << modelScene.flatBvh.size()
-				<< " materials=" << modelScene.materials.size()
-				<< " textures=" << modelScene.textures.size();
-			logModelImport(out.str());
+			if (!loadGltfPreviewScene(modelEntry.scenePath, modelScene)) {
+				if (!modelScene.status.empty()) {
+					modelScene.status = modelEntry.name + " (" + modelEntry.scenePath + "): " + modelScene.status;
+				}
+				status = modelScene.status;
+				logModelImport("glTF load failed: " + status);
+				return false;
+			}
+			modelScene.status = modelEntry.name + ": " + modelScene.status;
+			{
+				std::ostringstream out;
+				out << "glTF loaded index=" << modelIndex
+					<< " triangles=" << modelScene.tris.size()
+					<< " triIsect=" << modelScene.triIsect.size()
+					<< " bvhNodes=" << modelScene.flatBvh.size()
+					<< " materials=" << modelScene.materials.size()
+					<< " textures=" << modelScene.textures.size();
+				logModelImport(out.str());
+			}
 		}
 		if (!createTextureResources(modelScene.textures)) {
 			std::string textureFailure = status;
@@ -3145,10 +3689,10 @@ struct VulkanComputePreview::Impl {
 			});
 		}
 
-		if (!createStorageBuffer(sceneBuffers[SCENE_TRI_ISECT], gpuTriIsect.data(), gpuTriIsect.size() * sizeof(GpuTriIntersect)) ||
-			!createStorageBuffer(sceneBuffers[SCENE_TRI_SHADING], gpuTriShading.data(), gpuTriShading.size() * sizeof(GpuTriShading)) ||
-			!createStorageBuffer(sceneBuffers[SCENE_MATERIAL], gpuMaterials.data(), gpuMaterials.size() * sizeof(GpuMaterial)) ||
-			!createStorageBuffer(sceneBuffers[SCENE_BVH], gpuBvh.data(), gpuBvh.size() * sizeof(GpuBvhNode))) {
+		if (!createStorageBuffer(sceneBuffers[SCENE_TRI_ISECT], gpuTriIsect.data(), gpuTriIsect.size() * sizeof(GpuTriIntersect), 0, "scene triangle intersection") ||
+			!createStorageBuffer(sceneBuffers[SCENE_TRI_SHADING], gpuTriShading.data(), gpuTriShading.size() * sizeof(GpuTriShading), 0, "scene triangle shading") ||
+			!createStorageBuffer(sceneBuffers[SCENE_MATERIAL], gpuMaterials.data(), gpuMaterials.size() * sizeof(GpuMaterial), 0, "scene material") ||
+			!createStorageBuffer(sceneBuffers[SCENE_BVH], gpuBvh.data(), gpuBvh.size() * sizeof(GpuBvhNode), 0, "scene BVH")) {
 			modelScene.status = "glTF model Vulkan upload failed: " + status;
 			status = modelScene.status;
 			logModelImport("scene SSBO upload failed: " + status);
@@ -3207,6 +3751,7 @@ struct VulkanComputePreview::Impl {
 		if (result != VK_SUCCESS) {
 			return failVk("vkCreateBuffer", result);
 		}
+		debugUtils.name(device, VK_OBJECT_TYPE_BUFFER, pixelBuffer, "N-Ray pixel readback buffer");
 
 		VkMemoryRequirements memoryReqs{};
 		vkGetBufferMemoryRequirements(device, pixelBuffer, &memoryReqs);
@@ -3271,6 +3816,7 @@ struct VulkanComputePreview::Impl {
 		if (result != VK_SUCCESS) {
 			return failVk("vkCreateDescriptorSetLayout", result);
 		}
+		debugUtils.name(device, VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, descriptorSetLayout, "N-Ray compute descriptor set layout");
 
 		return true;
 	}
@@ -3299,6 +3845,7 @@ struct VulkanComputePreview::Impl {
 		if (result != VK_SUCCESS) {
 			return failVk("vkCreateDescriptorPool", result);
 		}
+		debugUtils.name(device, VK_OBJECT_TYPE_DESCRIPTOR_POOL, descriptorPool, "N-Ray compute descriptor pool");
 
 		VkDescriptorSetAllocateInfo allocateInfo{};
 		allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -3310,6 +3857,7 @@ struct VulkanComputePreview::Impl {
 		if (result != VK_SUCCESS) {
 			return failVk("vkAllocateDescriptorSets", result);
 		}
+		debugUtils.name(device, VK_OBJECT_TYPE_DESCRIPTOR_SET, descriptorSet, "N-Ray compute descriptor set");
 
 		std::array<VkDescriptorBufferInfo, kTotalBindings> bufferInfos{};
 		std::array<VkDescriptorImageInfo, kTotalBindings> imageInfos{};
@@ -3399,6 +3947,10 @@ struct VulkanComputePreview::Impl {
 		if (result != VK_SUCCESS) {
 			return failVk((std::string("vkCreateShaderModule ") + tag).c_str(), result);
 		}
+		{
+			std::string name = std::string("N-Ray compute shader module: ") + tag;
+			debugUtils.name(device, VK_OBJECT_TYPE_SHADER_MODULE, outModule, name.c_str());
+		}
 		return true;
 	}
 
@@ -3423,6 +3975,7 @@ struct VulkanComputePreview::Impl {
 		if (result != VK_SUCCESS) {
 			return failVk("vkCreatePipelineLayout", result);
 		}
+		debugUtils.name(device, VK_OBJECT_TYPE_PIPELINE_LAYOUT, pipelineLayout, "N-Ray compute pipeline layout");
 		return true;
 	}
 
@@ -3447,6 +4000,10 @@ struct VulkanComputePreview::Impl {
 		VkResult result = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &outPipeline);
 		if (result != VK_SUCCESS) {
 			return failVk((std::string("vkCreateComputePipelines ") + tag).c_str(), result);
+		}
+		{
+			std::string name = std::string("N-Ray compute pipeline: ") + tag;
+			debugUtils.name(device, VK_OBJECT_TYPE_PIPELINE, outPipeline, name.c_str());
 		}
 
 		return true;
@@ -3521,6 +4078,7 @@ struct VulkanComputePreview::Impl {
 		if (result != VK_SUCCESS) {
 			return failVk("vkCreateCommandPool", result);
 		}
+		debugUtils.name(device, VK_OBJECT_TYPE_COMMAND_POOL, commandPool, "N-Ray compute command pool");
 
 		VkCommandBufferAllocateInfo allocateInfo{};
 		allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -3532,6 +4090,7 @@ struct VulkanComputePreview::Impl {
 		if (result != VK_SUCCESS) {
 			return failVk("vkAllocateCommandBuffers", result);
 		}
+		debugUtils.name(device, VK_OBJECT_TYPE_COMMAND_BUFFER, commandBuffer, "N-Ray compute command buffer");
 
 		VkFenceCreateInfo fenceInfo{};
 		fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
@@ -3540,6 +4099,7 @@ struct VulkanComputePreview::Impl {
 		if (result != VK_SUCCESS) {
 			return failVk("vkCreateFence", result);
 		}
+		debugUtils.name(device, VK_OBJECT_TYPE_FENCE, fence, "N-Ray compute fence");
 
 		if (timestampSupported) {
 			VkQueryPoolCreateInfo queryPoolInfo{};
@@ -3549,6 +4109,9 @@ struct VulkanComputePreview::Impl {
 			result = vkCreateQueryPool(device, &queryPoolInfo, nullptr, &timestampPool);
 			if (result != VK_SUCCESS) {
 				timestampSupported = false;
+			}
+			else {
+				debugUtils.name(device, VK_OBJECT_TYPE_QUERY_POOL, timestampPool, "N-Ray compute timestamp query pool");
 			}
 		}
 
@@ -3600,7 +4163,7 @@ struct VulkanComputePreview::Impl {
 
 	bool switchModel(int index) {
 		auto& models = activeModelEntries();
-		if (!initialized || index < 0 || index >= static_cast<int>(models.size())) {
+		if (!initialized || index < -1 || index >= static_cast<int>(models.size())) {
 			std::ostringstream out;
 			out << "setModel rejected index=" << index
 				<< " current=" << selectedModel
@@ -3611,8 +4174,13 @@ struct VulkanComputePreview::Impl {
 		}
 		if (index == selectedModel) {
 			std::ostringstream out;
-			out << "setModel no-op index=" << index
-				<< " name=\"" << models[index].name << "\"";
+			out << "setModel no-op index=" << index;
+			if (index >= 0) {
+				out << " name=\"" << models[index].name << "\"";
+			}
+			else {
+				out << " name=\"Default Scene\"";
+			}
 			logModelImport(out.str());
 			return true;
 		}
@@ -3620,9 +4188,14 @@ struct VulkanComputePreview::Impl {
 		{
 			std::ostringstream out;
 			out << "setModel requested from index=" << selectedModel
-				<< " to index=" << index
-				<< " name=\"" << models[index].name << "\""
-				<< " scene=\"" << models[index].scenePath << "\"";
+				<< " to index=" << index;
+			if (index >= 0) {
+				out << " name=\"" << models[index].name << "\""
+					<< " scene=\"" << models[index].scenePath << "\"";
+			}
+			else {
+				out << " name=\"Default Scene\"";
+			}
 			logModelImport(out.str());
 		}
 
@@ -3657,10 +4230,9 @@ struct VulkanComputePreview::Impl {
 			selectedModel = previousModel;
 
 			// Restore the previous selection and rebuild its descriptor set.
-			// loadModelSceneResources handles a -1 selection gracefully (fallback
-			// textures, no model), so this also recreates a valid descriptor set
-			// when there was no previously loaded model — without it the preview
-			// would be left with a destroyed descriptor set and crash on dispatch.
+			// loadModelSceneResources handles a -1 selection by uploading the
+			// default procedural scene, so this also recreates a valid descriptor
+			// set when there was no previously loaded model.
 			bool restored = loadModelSceneResources() && createDescriptorPoolAndSet();
 			{
 				std::ostringstream out;
@@ -3673,14 +4245,18 @@ struct VulkanComputePreview::Impl {
 			}
 			if (restored) {
 				setActiveStatus();
-				status += "\nFailed to select model: " + models[index].name;
+				status += index >= 0
+					? "\nFailed to select model: " + models[index].name
+					: "\nFailed to select default scene";
 				if (!failureStatus.empty()) {
 					status += "\n";
 					status += failureStatus;
 				}
 			}
 			else {
-				status = "Failed to select model: " + models[index].name;
+				status = index >= 0
+					? "Failed to select model: " + models[index].name
+					: "Failed to select default scene";
 				if (!failureStatus.empty()) {
 					status += "\n";
 					status += failureStatus;
@@ -3693,10 +4269,19 @@ struct VulkanComputePreview::Impl {
 		frameCount = 0;
 		lastGpuMs = 0.0;
 		setActiveStatus();
+		if (persistSettings) {
+			saveSelectedModelToSettings(selectedModel);
+		}
 		{
 			std::ostringstream out;
-			out << "setModel activated index=" << selectedModel
-				<< " name=\"" << models[selectedModel].name << "\""
+			out << "setModel activated index=" << selectedModel;
+			if (selectedModel >= 0) {
+				out << " name=\"" << models[selectedModel].name << "\"";
+			}
+			else {
+				out << " name=\"Default Scene\"";
+			}
+			out
 				<< " triangles=" << sceneCounts.x
 				<< " bvhNodes=" << sceneCounts.y
 				<< " materials=" << sceneCounts.z
@@ -3706,7 +4291,7 @@ struct VulkanComputePreview::Impl {
 		return modelBuffersReady;
 	}
 
-	int importModelFromFolder(const std::string& folderPath) {
+	int importModelFromFolder(const std::string& folderPath, bool persist = true) {
 		logModelImport("import folder requested raw=\"" + folderPath + "\"");
 		std::string rawPath = trimAscii(folderPath);
 		if (rawPath.empty()) {
@@ -3749,11 +4334,16 @@ struct VulkanComputePreview::Impl {
 		bool hasTexturesFolder = std::filesystem::exists(folder / "textures", texturesEc)
 			&& std::filesystem::is_directory(folder / "textures", texturesEc) && !texturesEc;
 
-		models.push_back(*entry);
+		ModelEntry newEntry = *entry;
+		if (!persist) {
+			newEntry.transient = true;
+		}
+		models.push_back(newEntry);
 		int importedIndex = static_cast<int>(models.size()) - 1;
 
-		// Persist so the model reappears automatically on the next run.
-		saveModelEntriesToSettings(models);
+		if (persist && persistSettings) {
+			saveModelEntriesToSettings(models);
+		}
 
 		status = "Imported model folder: " + entry->name + " -> " + entry->scenePath;
 		if (!hasTexturesFolder) {
@@ -3804,6 +4394,18 @@ void VulkanComputePreview::shutdown() {
 	m_impl->shutdown();
 }
 
+bool VulkanComputePreview::requestRenderDocCapture() {
+	return m_impl->requestRenderDocCapture();
+}
+
+bool VulkanComputePreview::setCaptureTemplate(const std::string& pathTemplate) {
+	return setRenderDocCaptureTemplate(pathTemplate);
+}
+
+void VulkanComputePreview::setPersistSettings(bool persist) {
+	m_impl->persistSettings = persist;
+}
+
 bool VulkanComputePreview::isAvailable() const {
 	return m_impl->initialized;
 }
@@ -3843,10 +4445,7 @@ bool VulkanComputePreview::isModelPreviewIndex(int index) {
 }
 
 int VulkanComputePreview::modelPreviewShaderIndex() {
-	for (int i = 0; i < kShaderCount; ++i) {
-		if (kShaders[i].requiresModel) return i;
-	}
-	return -1;
+	return modelPreviewShaderArrayIndex();
 }
 
 bool VulkanComputePreview::setModel(int index) {
@@ -3867,8 +4466,8 @@ const char* VulkanComputePreview::modelName(int index) {
 	return models[index].name.c_str();
 }
 
-int VulkanComputePreview::importModelFromFolder(const std::string& folderPath) {
-	return m_impl->importModelFromFolder(folderPath);
+int VulkanComputePreview::importModelFromFolder(const std::string& folderPath, bool persist) {
+	return m_impl->importModelFromFolder(folderPath, persist);
 }
 
 bool VulkanComputePreview::modelBounds(glm::vec3& boundsMin, glm::vec3& boundsMax) const {

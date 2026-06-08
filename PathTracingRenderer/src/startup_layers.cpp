@@ -82,6 +82,9 @@ void startupRuntimeLayer(RuntimeResources& runtime) {
 	try {
 		bool vulkanReady = runtime.vulkanPreview.initialize(screen.resX, screen.resY);
 		(vulkanReady ? std::cout : std::cerr) << runtime.vulkanPreview.statusMessage() << '\n';
+		if (vulkanReady) {
+			frameVulkanPreviewModel(runtime);
+		}
 	}
 	catch (const std::exception& e) {
 		runtime.vulkanPreview.shutdown();

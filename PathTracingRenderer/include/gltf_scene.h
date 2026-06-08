@@ -121,5 +121,5 @@ struct GltfPreviewScene {
 	bool loaded = false;
 };
 
-std::string defaultGltfPreviewPath();
+bool createDefaultGltfPreviewScene(GltfPreviewScene& scene);
 bool loadGltfPreviewScene(const std::string& requestedPath, GltfPreviewScene& scene);

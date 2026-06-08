@@ -3,6 +3,9 @@
 #   make            # build Release (default)
 #   make CONFIG=debug_x64
 #   make build-performance # build Performance with aggressive CPU flags
+#   make shader-debug-headers # generate debug SPIR-V headers under build/
+#   make build-shader-debug # build Debug with generated debug SPIR-V headers
+#   make run-shader-debug # build + run the Debug shader-debug binary
 #   make run-performance   # build + run the Performance binary
 #   make raylib     # (re)build vendor/raylib/src/libraylib.a only
 #   make generate   # regenerate build/ project files only
@@ -12,7 +15,7 @@
 #
 # premake5.lua sets `location "build"`, so generated makefiles live under build/.
 
-.PHONY: all generate build build-performance raylib run run-performance clean distclean
+.PHONY: all generate build build-performance build-renderdoc-headless shader-debug-headers build-shader-debug raylib run run-shader-debug run-performance clean distclean
 
 CONFIG     ?= release_x64
 PERF_CONFIG := performance_x64
@@ -42,8 +45,21 @@ build: raylib generate
 build-performance: raylib generate
 	$(MAKE) -C build config=$(PERF_CONFIG)
 
+build-renderdoc-headless: generate
+	$(MAKE) -C build config=release_x64 NrayRenderDocHeadless
+
+shader-debug-headers:
+	python3 tools/generate_vulkan_shader_headers.py --debug
+
+build-shader-debug: raylib shader-debug-headers
+	NRAY_VULKAN_SHADER_DEBUG=1 premake5 gmake2
+	$(MAKE) -C build config=debug_x64
+
 run: build
 	cd PathTracingRenderer && ../bin/$(if $(findstring debug,$(CONFIG)),Debug,Release)/PathTracingRenderer
+
+run-shader-debug: build-shader-debug
+	cd PathTracingRenderer && ../bin/Debug/PathTracingRenderer
 
 run-performance: build-performance
 	cd PathTracingRenderer && ../bin/Performance/PathTracingRenderer

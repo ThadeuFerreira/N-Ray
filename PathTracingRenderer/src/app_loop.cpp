@@ -13,8 +13,6 @@
 #include <ui_layout.h>
 
 namespace {
-void frameVulkanPreviewModel(RuntimeResources& runtime);
-
 VulkanPreviewShadowMode gVulkanPreviewShadowMode = VulkanPreviewShadowMode::RayTraced;
 VulkanDenoiserSettings gVulkanDenoiserSettings{};
 char gModelFolderPath[512] = {};
@@ -216,7 +214,8 @@ bool activateModelPreview(RuntimeResources& runtime, int modelIndex, std::string
 			runtime.vulkanPreview.setShader(previewShader);
 		}
 	}
-	logModelImportUi("activated model index=" + std::to_string(modelIndex) + " name=\"" + VulkanComputePreview::modelName(modelIndex) + "\"");
+	std::string modelName = modelIndex >= 0 ? VulkanComputePreview::modelName(modelIndex) : "Default Scene";
+	logModelImportUi("activated model index=" + std::to_string(modelIndex) + " name=\"" + modelName + "\"");
 	frameVulkanPreviewModel(runtime);
 	importStatus = firstLine(runtime.vulkanPreview.statusMessage());
 	return true;
@@ -347,6 +346,8 @@ VulkanPreviewSettings makeVulkanPreviewSettings() {
 	return settings;
 }
 
+}
+
 void frameVulkanPreviewModel(RuntimeResources& runtime) {
 	glm::vec3 boundsMin;
 	glm::vec3 boundsMax;
@@ -381,6 +382,8 @@ void frameVulkanPreviewModel(RuntimeResources& runtime) {
 	params.renderInvalidated = true;
 	params.shouldSample = false;
 }
+
+namespace {
 
 bool displayedFrameMatchesTarget(const RuntimeResources& runtime) {
 	size_t pixelCount = static_cast<size_t>(screen.resX) * static_cast<size_t>(screen.resY);
@@ -594,47 +597,52 @@ void drawVulkanMainMenuBar(RuntimeResources& runtime) {
 
 	if (ImGui::BeginMenu("Scene", vulkanAvailable)) {
 		if (ImGui::BeginMenu("Load Scene")) {
-				int modelCount = VulkanComputePreview::modelCount();
-				if (modelCount == 0) {
-					ImGui::TextDisabled("No imported scenes");
-				}
-				for (int i = 0; i < modelCount; i++) {
-					bool selected = i == runtime.vulkanPreview.modelIndex();
-					if (ImGui::MenuItem(VulkanComputePreview::modelName(i), nullptr, selected)) {
-						logModelImportUi("menu requested model index=" + std::to_string(i) + " name=\"" + VulkanComputePreview::modelName(i) + "\"");
-						activateModelPreview(runtime, i, gModelFolderImportStatus);
-					}
-				}
-				ImGui::EndMenu();
+			if (ImGui::MenuItem("Default Scene", nullptr, runtime.vulkanPreview.modelIndex() < 0)) {
+				logModelImportUi("menu requested default scene");
+				activateModelPreview(runtime, -1, gModelFolderImportStatus);
 			}
-
 			ImGui::Separator();
-			ImGui::TextUnformatted("Import glTF scene folder");
-			ImGui::SetNextItemWidth(440.0f);
-			if (ImGui::InputText("##menuModelFolderPath", gModelFolderPath, sizeof(gModelFolderPath), ImGuiInputTextFlags_EnterReturnsTrue)) {
-				importModelFolderFromUiPath(runtime, gModelFolderPath, gModelFolderImportStatus);
+			int modelCount = VulkanComputePreview::modelCount();
+			if (modelCount == 0) {
+				ImGui::TextDisabled("No imported scenes");
 			}
-			if (ImGui::Button("Paste")) {
-				applyClipboardToModelFolder(gModelFolderPath, sizeof(gModelFolderPath));
-			}
-			ImGui::SameLine();
-			if (ImGui::Button("Browse")) {
-				std::string selectedFolder;
-				if (browseFolderByOsDialog(selectedFolder) && !selectedFolder.empty()) {
-					setModelFolderPath(gModelFolderPath, sizeof(gModelFolderPath), selectedFolder);
-					importModelFolderFromUiPath(runtime, gModelFolderPath, gModelFolderImportStatus);
-				}
-				else {
-					gModelFolderImportStatus = "Browse folder cancelled or unavailable on this OS";
+			for (int i = 0; i < modelCount; i++) {
+				bool selected = i == runtime.vulkanPreview.modelIndex();
+				if (ImGui::MenuItem(VulkanComputePreview::modelName(i), nullptr, selected)) {
+					logModelImportUi("menu requested model index=" + std::to_string(i) + " name=\"" + VulkanComputePreview::modelName(i) + "\"");
+					activateModelPreview(runtime, i, gModelFolderImportStatus);
 				}
 			}
-			ImGui::SameLine();
-			if (ImGui::Button("Import")) {
+			ImGui::EndMenu();
+		}
+
+		ImGui::Separator();
+		ImGui::TextUnformatted("Import glTF scene folder");
+		ImGui::SetNextItemWidth(440.0f);
+		if (ImGui::InputText("##menuModelFolderPath", gModelFolderPath, sizeof(gModelFolderPath), ImGuiInputTextFlags_EnterReturnsTrue)) {
+			importModelFolderFromUiPath(runtime, gModelFolderPath, gModelFolderImportStatus);
+		}
+		if (ImGui::Button("Paste")) {
+			applyClipboardToModelFolder(gModelFolderPath, sizeof(gModelFolderPath));
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Browse")) {
+			std::string selectedFolder;
+			if (browseFolderByOsDialog(selectedFolder) && !selectedFolder.empty()) {
+				setModelFolderPath(gModelFolderPath, sizeof(gModelFolderPath), selectedFolder);
 				importModelFolderFromUiPath(runtime, gModelFolderPath, gModelFolderImportStatus);
 			}
-			if (!gModelFolderImportStatus.empty()) {
-				ImGui::TextWrapped("Import: %s", gModelFolderImportStatus.c_str());
+			else {
+				gModelFolderImportStatus = "Browse folder cancelled or unavailable on this OS";
 			}
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Import")) {
+			importModelFolderFromUiPath(runtime, gModelFolderPath, gModelFolderImportStatus);
+		}
+		if (!gModelFolderImportStatus.empty()) {
+			ImGui::TextWrapped("Import: %s", gModelFolderImportStatus.c_str());
+		}
 		ImGui::EndMenu();
 	}
 
@@ -743,6 +751,12 @@ void drawVulkanMainMenuBar(RuntimeResources& runtime) {
 		}
 		if (ImGui::MenuItem("Frame Active Scene")) {
 			frameVulkanPreviewModel(runtime);
+		}
+		if (ImGui::MenuItem("Capture Next Vulkan Dispatch")) {
+			runtime.vulkanPreview.requestRenderDocCapture();
+			// A converged frame skips dispatch; clear the valid flag so
+			// the next frame always renders and fires the capture.
+			runtime.vulkanFrameValid = false;
 		}
 		ImGui::EndMenu();
 	}

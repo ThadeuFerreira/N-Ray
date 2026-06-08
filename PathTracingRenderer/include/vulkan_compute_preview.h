@@ -165,6 +165,9 @@ public:
 	bool resize(int width, int height);
 	bool render(float timeSeconds, const VulkanPreviewCamera& camera, const VulkanPreviewSettings& settings, std::vector<RenderPixel>& pixels);
 	void shutdown();
+	bool requestRenderDocCapture();
+	bool setCaptureTemplate(const std::string& pathTemplate);
+	void setPersistSettings(bool persist);
 
 	// Progressive accumulation progress: completed sample count and whether it has
 	// reached the configured maxSamples.
@@ -189,7 +192,7 @@ public:
 	int modelIndex() const;
 	static int modelCount();
 	static const char* modelName(int index);
-	int importModelFromFolder(const std::string& folderPath);
+	int importModelFromFolder(const std::string& folderPath, bool persist = true);
 	bool modelBounds(glm::vec3& boundsMin, glm::vec3& boundsMax) const;
 
 	// Live material overrides for the active glTF model preview. materialCount()
