@@ -111,8 +111,9 @@ this manifest when testing import flows that cross engine/runtime seams:
   repo-root `..`).
 - The import path (`VulkanComputePreview::importModelFromFolder`) takes a folder,
   resolves it, finds the first `scene.gltf`/`.glb` inside, appends a model entry,
-  and saves the updated list with `saveModelEntriesToSettings()`, rewriting folder
-  paths to canonical form.
+  and saves the updated list with `saveModelEntriesToSettings()`. Folders inside
+  the app CWD or repo root are saved as portable relative paths; external folders
+  remain absolute.
 - The UI should treat these entries as the authoritative model list. Successful
   scene selection writes `lastSelectedModelFolder`; startup loads that model
   directly, while clearing selection removes the field and starts on the default

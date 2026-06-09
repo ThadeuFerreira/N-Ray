@@ -1509,6 +1509,43 @@ std::string normalizePathKey(std::filesystem::path path) {
 	return text;
 }
 
+bool isPortableRelativePath(const std::filesystem::path& path) {
+	if (path.empty() || path.is_absolute()) {
+		return false;
+	}
+	for (const std::filesystem::path& part : path) {
+		if (part == "..") {
+			return false;
+		}
+	}
+	return true;
+}
+
+std::string persistableFolderPath(const std::filesystem::path& folder) {
+	std::filesystem::path absoluteFolder = canonicalOrAbsolute(folder);
+	std::string bestText;
+
+	std::array<std::filesystem::path, 2> bases{
+		canonicalOrAbsolute(std::filesystem::current_path()),
+		canonicalOrAbsolute(std::filesystem::current_path().parent_path())
+	};
+	for (const std::filesystem::path& base : bases) {
+		std::filesystem::path relative = absoluteFolder.lexically_relative(base);
+		if (!isPortableRelativePath(relative)) {
+			continue;
+		}
+		std::string text = genericPathString(relative);
+		if (bestText.empty() || text.size() < bestText.size()) {
+			bestText = std::move(text);
+		}
+	}
+
+	if (!bestText.empty()) {
+		return bestText;
+	}
+	return genericPathString(absoluteFolder);
+}
+
 std::string sceneFileNameLower(const std::filesystem::path& path) {
 	return toLowerAscii(path.filename().string());
 }
@@ -1571,7 +1608,7 @@ std::optional<ModelEntry> buildModelEntryForFolder(const std::filesystem::path& 
 	ModelEntry entry;
 	entry.name = folderName;
 	entry.scenePath = genericPathString(canonicalOrAbsolute(*sceneFile));
-	entry.folderPath = genericPathString(folder);
+	entry.folderPath = persistableFolderPath(folder);
 	entry.folderKey = normalizePathKey(folder);
 	return entry;
 }
