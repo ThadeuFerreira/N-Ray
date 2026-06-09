@@ -30,6 +30,16 @@ The current Vulkan milestone is `VulkanComputePreview`:
   evaluation, multi-bounce BSDF/event selection, thin transmission, in-progress
   volume refraction, Russian roulette, optional shadow-modes, and denoising guide
   output.
+- Selectable HDRI/EXR skies are uploaded as an equirectangular
+  `rgba32f` sampled image at descriptor binding 17. The preview keeps a 1x1
+  fallback image bound when no environment has loaded, so the shader descriptor
+  set remains valid.
+- Three-point key/fill/rim lighting is controlled through `VulkanPreviewSettings`
+  and `GpuSettings`. Direct sun lighting short-circuits before shadow visibility
+  when the sun is disabled or has zero intensity. The key/fill/rim point lights
+  default to unshadowed direct lighting; finite-distance BVH point-light shadows
+  are available only through the lighting debug toggle for performance A/B
+  checks.
 - The CPU copies that RGBA buffer into the existing raylib `Texture2D`, so the
   app can keep its raylib/rlImGui window while Vulkan compute is proven inside
   the real runtime.
@@ -109,10 +119,15 @@ layout(binding = 7) uniform sampler2D sceneTextures[256];
 layout(std430, set = 0, binding = 8) buffer ShadowMapBuffer {
     uint shadowMap[];
 };
+
+layout(binding = 17) uniform sampler2D environmentMap;
 ```
 
 Use push constants or a small uniform buffer for camera, frame index, resolution,
-sample count, and feature toggles.
+sample count, environment controls, direct-light controls, and feature toggles.
+When extending `GpuSettings`, update the C++ struct, GLSL struct, size asserts,
+SPIR-V header, headless JSON/debug options, and any ImGui reset/invalidation
+path together.
 
 Recommended first-pass GPU structs:
 
@@ -253,6 +268,13 @@ Progressive path tracing needs separate accumulation state:
 
 - Build with `make`.
 - Run `make run` and confirm the Vulkan preview status line.
+- For Vulkan shader edits, compile `PathTracingRenderer/shaders/*.comp` with
+  `glslc`, validate with `spirv-val`, and regenerate the checked-in SPIR-V
+  header before running the app.
+- For lighting or shadow performance regressions, run
+  `bin/Release/NrayRenderDocHeadless --help` and at least one small A/B render
+  comparing baseline lighting against `--point-light-shadows`; compare
+  `gpuDispatchMs` and the JSON `lighting` object.
 - For importer/Vulkan asset work, validate against local `assets/*/scene.gltf`
   bundles and keep their folder-local buffers/textures beside the scene file.
 - Add debug shader modes before full PBR:

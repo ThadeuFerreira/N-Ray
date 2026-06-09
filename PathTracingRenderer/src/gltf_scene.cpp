@@ -62,18 +62,35 @@ std::string lowerAscii(std::string value) {
 	return value;
 }
 
+float readNumberValue(const tinygltf::Value& value, float fallback) {
+	if (!value.IsReal() && !value.IsInt()) {
+		return fallback;
+	}
+	return static_cast<float>(value.GetNumberAsDouble());
+}
+
+uint32_t textureIndexOrInvalid(int textureIndex, size_t textureCount);
+
+uint32_t readTextureInfoIndex(const tinygltf::Value& textureInfo, size_t textureCount) {
+	if (!textureInfo.IsObject()) {
+		return GLTF_PREVIEW_INVALID_TEXTURE;
+	}
+
+	const tinygltf::Value& index = textureInfo.Get("index");
+	if (!index.IsInt()) {
+		return GLTF_PREVIEW_INVALID_TEXTURE;
+	}
+
+	return textureIndexOrInvalid(index.GetNumberAsInt(), textureCount);
+}
+
 float readTransmissionFactor(const tinygltf::Material& material) {
 	auto extIt = material.extensions.find("KHR_materials_transmission");
 	if (extIt == material.extensions.end() || !extIt->second.IsObject()) {
 		return 0.0f;
 	}
 
-	const tinygltf::Value& factor = extIt->second.Get("transmissionFactor");
-	if (!factor.IsReal() && !factor.IsInt()) {
-		return 0.0f;
-	}
-
-	return clamp01(static_cast<float>(factor.GetNumberAsDouble()));
+	return clamp01(readNumberValue(extIt->second.Get("transmissionFactor"), 0.0f));
 }
 
 float readIor(const tinygltf::Material& material) {
@@ -82,12 +99,7 @@ float readIor(const tinygltf::Material& material) {
 		return 1.5f;
 	}
 
-	const tinygltf::Value& ior = extIt->second.Get("ior");
-	if (!ior.IsReal() && !ior.IsInt()) {
-		return 1.5f;
-	}
-
-	return std::max(1.0f, static_cast<float>(ior.GetNumberAsDouble()));
+	return std::max(1.0f, readNumberValue(extIt->second.Get("ior"), 1.5f));
 }
 
 float readEmissiveStrength(const tinygltf::Material& material) {
@@ -117,17 +129,76 @@ uint32_t readTransmissionTexture(const tinygltf::Material& material, size_t text
 		return GLTF_PREVIEW_INVALID_TEXTURE;
 	}
 
-	const tinygltf::Value& textureInfo = extIt->second.Get("transmissionTexture");
-	if (!textureInfo.IsObject()) {
-		return GLTF_PREVIEW_INVALID_TEXTURE;
+	return readTextureInfoIndex(extIt->second.Get("transmissionTexture"), textureCount);
+}
+
+template <typename Vec>
+Vec readVecValue(const tinygltf::Value& value, const Vec& fallback) {
+	const int components = static_cast<int>(Vec::length());
+	if (!value.IsArray() || static_cast<int>(value.ArrayLen()) < components) {
+		return fallback;
 	}
 
-	const tinygltf::Value& index = textureInfo.Get("index");
-	if (!index.IsInt()) {
-		return GLTF_PREVIEW_INVALID_TEXTURE;
+	Vec result = fallback;
+	for (int i = 0; i < components; ++i) {
+		const tinygltf::Value& component = value.Get(i);
+		if (component.IsNumber()) {
+			result[i] = static_cast<float>(component.GetNumberAsDouble());
+		}
+	}
+	return result;
+}
+
+glm::vec4 readVec4Value(const tinygltf::Value& value, const glm::vec4& fallback) {
+	return readVecValue(value, fallback);
+}
+
+glm::vec3 readVec3Value(const tinygltf::Value& value, const glm::vec3& fallback) {
+	return readVecValue(value, fallback);
+}
+
+struct SpecGlossExtension {
+	bool present = false;
+	glm::vec4 diffuseFactor = glm::vec4(1.0f);
+	uint32_t diffuseTexture = GLTF_PREVIEW_INVALID_TEXTURE;
+	glm::vec3 specularFactor = glm::vec3(1.0f);
+	float glossinessFactor = 1.0f;
+	uint32_t specularGlossinessTexture = GLTF_PREVIEW_INVALID_TEXTURE;
+};
+
+SpecGlossExtension readSpecGlossExtension(const tinygltf::Material& material, size_t textureCount) {
+	SpecGlossExtension result;
+	auto extIt = material.extensions.find("KHR_materials_pbrSpecularGlossiness");
+	if (extIt == material.extensions.end() || !extIt->second.IsObject()) {
+		return result;
 	}
 
-	return textureIndexOrInvalid(index.GetNumberAsInt(), textureCount);
+	result.present = true;
+	const tinygltf::Value& ext = extIt->second;
+	result.diffuseFactor = readVec4Value(ext.Get("diffuseFactor"), glm::vec4(1.0f));
+	result.diffuseTexture = readTextureInfoIndex(ext.Get("diffuseTexture"), textureCount);
+	result.specularFactor = readVec3Value(ext.Get("specularFactor"), glm::vec3(1.0f));
+	result.glossinessFactor = clamp01(readNumberValue(ext.Get("glossinessFactor"), 1.0f));
+	result.specularGlossinessTexture = readTextureInfoIndex(ext.Get("specularGlossinessTexture"), textureCount);
+	return result;
+}
+
+struct ClearcoatExtension {
+	float factor = 0.0f;
+	float roughnessFactor = 0.0f;
+};
+
+ClearcoatExtension readClearcoatExtension(const tinygltf::Material& material) {
+	ClearcoatExtension result;
+	auto extIt = material.extensions.find("KHR_materials_clearcoat");
+	if (extIt == material.extensions.end() || !extIt->second.IsObject()) {
+		return result;
+	}
+
+	const tinygltf::Value& ext = extIt->second;
+	result.factor = clamp01(readNumberValue(ext.Get("clearcoatFactor"), 0.0f));
+	result.roughnessFactor = clamp01(readNumberValue(ext.Get("clearcoatRoughnessFactor"), 0.0f));
+	return result;
 }
 
 struct VolumeExtension {
@@ -232,11 +303,17 @@ uint8_t floatToByte(float value) {
 	return static_cast<uint8_t>(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
 }
 
-GltfPreviewTexture makeFallbackTexture(glm::vec4 color, const std::string& name) {
+GltfPreviewTexture makeFallbackTexture(
+	glm::vec4 color,
+	const std::string& name,
+	const std::string& fallbackReason = std::string()
+) {
 	GltfPreviewTexture texture;
 	texture.name = name;
 	texture.width = 1;
 	texture.height = 1;
+	texture.fallback = !fallbackReason.empty();
+	texture.fallbackReason = fallbackReason;
 	texture.rgba = {
 		floatToByte(color.r),
 		floatToByte(color.g),
@@ -248,19 +325,30 @@ GltfPreviewTexture makeFallbackTexture(glm::vec4 color, const std::string& name)
 
 GltfPreviewTexture convertTexture(const tinygltf::Model& model, int textureIndex) {
 	if (textureIndex < 0 || textureIndex >= static_cast<int>(model.textures.size())) {
-		return makeFallbackTexture(glm::vec4(1.0f), "missing texture");
+		return makeFallbackTexture(glm::vec4(1.0f), "missing texture", "texture index out of range");
 	}
 
 	const tinygltf::Texture& gltfTexture = model.textures[textureIndex];
 	if (gltfTexture.source < 0 || gltfTexture.source >= static_cast<int>(model.images.size())) {
-		return makeFallbackTexture(glm::vec4(1.0f), gltfTexture.name);
+		return makeFallbackTexture(glm::vec4(1.0f), gltfTexture.name, "texture source image index out of range");
 	}
 
 	const tinygltf::Image& image = model.images[gltfTexture.source];
+	// makeFallbackTexture returns a fresh struct that drops provenance, so stamp
+	// the source image/uri/mime onto whatever texture we ultimately return.
+	auto withSource = [&](GltfPreviewTexture t) {
+		t.sourceImage = gltfTexture.source;
+		t.sourceUri = image.uri;
+		t.mimeType = image.mimeType;
+		return t;
+	};
 	GltfPreviewTexture texture;
 	texture.name = !gltfTexture.name.empty() ? gltfTexture.name : image.name;
 	texture.width = static_cast<uint32_t>(std::max(image.width, 1));
 	texture.height = static_cast<uint32_t>(std::max(image.height, 1));
+	texture.sourceImage = gltfTexture.source;
+	texture.sourceUri = image.uri;
+	texture.mimeType = image.mimeType;
 
 	if (gltfTexture.sampler >= 0 && gltfTexture.sampler < static_cast<int>(model.samplers.size())) {
 		const tinygltf::Sampler& sampler = model.samplers[gltfTexture.sampler];
@@ -272,8 +360,7 @@ GltfPreviewTexture convertTexture(const tinygltf::Model& model, int textureIndex
 
 	size_t pixelCount = static_cast<size_t>(texture.width) * static_cast<size_t>(texture.height);
 	if (image.as_is || image.image.empty() || image.width <= 0 || image.height <= 0 || image.component <= 0) {
-		texture = makeFallbackTexture(glm::vec4(1.0f), texture.name);
-		return texture;
+		return withSource(makeFallbackTexture(glm::vec4(1.0f), texture.name, "image decoder produced no RGBA pixels"));
 	}
 
 	size_t components = static_cast<size_t>(image.component);
@@ -281,8 +368,7 @@ GltfPreviewTexture convertTexture(const tinygltf::Model& model, int textureIndex
 	if (image.bits == 8) {
 		size_t expectedBytes = pixelCount * components;
 		if (image.image.size() < expectedBytes) {
-			texture = makeFallbackTexture(glm::vec4(1.0f), texture.name);
-			return texture;
+			return withSource(makeFallbackTexture(glm::vec4(1.0f), texture.name, "decoded 8-bit image is shorter than expected"));
 		}
 		for (size_t i = 0; i < pixelCount; ++i) {
 			const unsigned char* pixel = image.image.data() + i * components;
@@ -299,8 +385,7 @@ GltfPreviewTexture convertTexture(const tinygltf::Model& model, int textureIndex
 	else if (image.bits == 16) {
 		size_t expectedBytes = pixelCount * components * sizeof(uint16_t);
 		if (image.image.size() < expectedBytes) {
-			texture = makeFallbackTexture(glm::vec4(1.0f), texture.name);
-			return texture;
+			return withSource(makeFallbackTexture(glm::vec4(1.0f), texture.name, "decoded 16-bit image is shorter than expected"));
 		}
 		for (size_t i = 0; i < pixelCount; ++i) {
 			size_t base = i * components;
@@ -320,7 +405,7 @@ GltfPreviewTexture convertTexture(const tinygltf::Model& model, int textureIndex
 		}
 	}
 	else {
-		texture = makeFallbackTexture(glm::vec4(1.0f), texture.name);
+		return withSource(makeFallbackTexture(glm::vec4(1.0f), texture.name, "unsupported image bit depth"));
 	}
 
 	return texture;
@@ -427,6 +512,61 @@ std::string channelStatsString(const TextureChannelStats& stats) {
 	return out.str();
 }
 
+std::string textureChannelStatsString(const GltfPreviewTexture& texture) {
+	std::ostringstream out;
+	out << "r=" << channelStatsString(textureChannelStats(texture, 0))
+		<< " g=" << channelStatsString(textureChannelStats(texture, 1))
+		<< " b=" << channelStatsString(textureChannelStats(texture, 2))
+		<< " a=" << channelStatsString(textureChannelStats(texture, 3));
+	return out.str();
+}
+
+void refreshTextureChannelStats(std::vector<GltfPreviewTexture>& textures) {
+	for (GltfPreviewTexture& texture : textures) {
+		texture.channelStats = textureChannelStatsString(texture);
+	}
+}
+
+GltfPreviewTexture deriveMetallicRoughnessFromSpecGloss(
+	const GltfPreviewTexture& specGloss,
+	float glossinessFactor,
+	size_t sourceTextureIndex
+) {
+	const std::string derivedFrom =
+		"specularGlossinessTexture[" + std::to_string(sourceTextureIndex) + "] alpha";
+
+	GltfPreviewTexture derived = specGloss;
+	derived.name = specGloss.name.empty()
+		? "derived spec-gloss roughness"
+		: specGloss.name + " (derived roughness)";
+
+	size_t pixelCount = static_cast<size_t>(derived.width) * static_cast<size_t>(derived.height);
+	if (derived.rgba.size() < pixelCount * 4) {
+		derived = makeFallbackTexture(
+			glm::vec4(1.0f, 1.0f, 0.0f, 1.0f),
+			derived.name,
+			"cannot derive roughness from short spec-gloss texture"
+		);
+	}
+	else {
+		for (size_t i = 0; i < pixelCount; ++i) {
+			uint8_t glossByte = derived.rgba[i * 4 + 3];
+			float glossiness = clamp01(glossinessFactor * (glossByte / 255.0f));
+			uint8_t roughnessByte = floatToByte(1.0f - glossiness);
+			derived.rgba[i * 4 + 0] = 255;
+			derived.rgba[i * 4 + 1] = roughnessByte;
+			derived.rgba[i * 4 + 2] = 0;
+			derived.rgba[i * 4 + 3] = 255;
+		}
+	}
+
+	derived.derived = true;
+	derived.derivedFrom = derivedFrom;
+	// channelStats is recomputed for all textures by refreshTextureChannelStats once
+	// the derived texture has been appended, so don't compute it twice here.
+	return derived;
+}
+
 bool textureAlphaLooksLikeCoverage(uint32_t textureIndex, const std::vector<GltfPreviewTexture>& textures) {
 	if (textureIndex == GLTF_PREVIEW_INVALID_TEXTURE || textureIndex >= textures.size()) {
 		return false;
@@ -529,7 +669,8 @@ void normalizeOpaqueMaterialSemantics(const tinygltf::Material& material, GltfPr
 		return;
 	}
 
-	if (textContainsAny(name, {"metal", "chrome", "steel", "aluminum", "aluminium", "wheel", "rim", "brake", "disc", "rotor", "caliper", "calliper", "exhaust"})) {
+	if (meta.workflow != "specularGlossiness" &&
+		textContainsAny(name, {"metal", "chrome", "steel", "aluminum", "aluminium", "wheel", "rim", "brake", "disc", "rotor", "caliper", "calliper", "exhaust"})) {
 		meta.materialKind = GLTF_PREVIEW_MATERIAL_OPAQUE_METAL;
 		meta.normalizedMetalness = std::max(meta.normalizedMetalness, 0.75f);
 		meta.normalizedSemantic = "metal surface";
@@ -646,6 +787,15 @@ std::string previewTextureLabel(uint32_t textureIndex, const std::vector<GltfPre
 	if (!texture.name.empty()) {
 		out << ", " << texture.name;
 	}
+	if (texture.sourceImage >= 0) {
+		out << ", image=" << texture.sourceImage;
+	}
+	if (texture.fallback) {
+		out << ", fallback";
+	}
+	if (texture.derived) {
+		out << ", derived";
+	}
 	out << ")";
 	return out.str();
 }
@@ -667,6 +817,7 @@ void logGltfPreviewMaterialImport(
 		<< meta.baseColorFactor.g << ", "
 		<< meta.baseColorFactor.b << ", "
 		<< meta.baseColorFactor.a << ")"
+		<< " workflow=" << meta.workflow
 		<< " roughnessFactor=" << meta.roughness
 		<< " metallicFactor=" << meta.metalness
 		<< " alphaMode=" << alphaModeName(meta.alphaMode);
@@ -677,11 +828,13 @@ void logGltfPreviewMaterialImport(
 
 	std::cout
 		<< " doubleSided=" << (material.doubleSided ? "true" : "false")
-		<< " textures baseColor=" << previewTextureLabel(meta.baseColorTexture, textures)
+		<< " normalizedTextures baseColor=" << previewTextureLabel(meta.baseColorTexture, textures)
 		<< " metallicRoughness=" << previewTextureLabel(meta.metallicRoughnessTexture, textures)
 		<< " normal=" << previewTextureLabel(meta.normalTexture, textures)
 		<< " occlusion=" << previewTextureLabel(meta.occlusionTexture, textures)
 		<< " emissive=" << previewTextureLabel(meta.emissiveTexture, textures)
+		<< " clearcoatFactor=" << meta.clearcoatFactor
+		<< " clearcoatRoughnessFactor=" << meta.clearcoatRoughnessFactor
 		<< " transmissionTex=" << previewTextureLabel(meta.transmissionTexture, textures)
 		<< " transmissionFactor=" << meta.transmission
 		<< " thicknessTex=" << previewTextureLabel(meta.thicknessTexture, textures)
@@ -703,12 +856,27 @@ void logGltfPreviewMaterialImport(
 		<< meta.normalizedBaseColorFactor.b << ", "
 		<< meta.normalizedBaseColorFactor.a << ")";
 
+	if (meta.workflow == "specularGlossiness") {
+		std::cout
+			<< " originalSpecGloss diffuse=" << previewTextureLabel(meta.specGlossDiffuseTexture, textures)
+			<< " specGloss=" << previewTextureLabel(meta.specGlossTexture, textures)
+			<< " specularFactor=("
+			<< meta.specGlossSpecularFactor.r << ", "
+			<< meta.specGlossSpecularFactor.g << ", "
+			<< meta.specGlossSpecularFactor.b << ")"
+			<< " glossinessFactor=" << meta.specGlossGlossinessFactor
+			<< " derivedMR=" << (meta.derivedMetallicRoughnessTexture ? "true" : "false");
+	}
+
 	if (meta.metallicRoughnessTexture != GLTF_PREVIEW_INVALID_TEXTURE &&
 		meta.metallicRoughnessTexture < textures.size()) {
 		const GltfPreviewTexture& texture = textures[meta.metallicRoughnessTexture];
 		std::cout
 			<< " mrG(min/mean/max)=" << channelStatsString(textureChannelStats(texture, 1))
 			<< " mrB(min/mean/max)=" << channelStatsString(textureChannelStats(texture, 2));
+		if (texture.derived) {
+			std::cout << " mrDerivedFrom=\"" << texture.derivedFrom << "\"";
+		}
 	}
 
 	std::cout << std::endl;
@@ -742,11 +910,117 @@ void logGltfPreviewMaterialImport(
 	}
 }
 
+bool gltfPreviewSupportsExtension(const std::string& extension) {
+	return extension == "KHR_materials_pbrSpecularGlossiness" ||
+		extension == "KHR_materials_clearcoat" ||
+		extension == "KHR_materials_transmission" ||
+		extension == "KHR_materials_ior" ||
+		extension == "KHR_materials_volume" ||
+		extension == "KHR_materials_unlit" ||
+		extension == "KHR_materials_emissive_strength";
+}
+
+std::vector<std::string> unsupportedRequiredExtensions(const std::vector<std::string>& extensions) {
+	std::vector<std::string> unsupported;
+	for (const std::string& extension : extensions) {
+		if (!gltfPreviewSupportsExtension(extension)) {
+			unsupported.push_back(extension);
+		}
+	}
+	return unsupported;
+}
+
+std::string imageSourceLabel(const tinygltf::Image& image) {
+	if (!image.uri.empty()) {
+		return image.uri;
+	}
+	if (image.bufferView >= 0) {
+		return "bufferView[" + std::to_string(image.bufferView) + "]";
+	}
+	return "embedded/unknown";
+}
+
+void logGltfPreviewAssetImport(const tinygltf::Model& model, const std::string& sourcePath) {
+	std::cout << "glTF preview asset: source=\"" << sourcePath << "\""
+		<< " generator=\"" << model.asset.generator << "\""
+		<< " version=\"" << model.asset.version << "\""
+		<< " extensionsUsed=[" << joinExtensions(model.extensionsUsed) << "]"
+		<< " extensionsRequired=[" << joinExtensions(model.extensionsRequired) << "]"
+		<< std::endl;
+}
+
+void logGltfPreviewTextureImports(
+	const tinygltf::Model& model,
+	const std::vector<GltfPreviewTexture>& textures
+) {
+	for (size_t imageIndex = 0; imageIndex < model.images.size(); ++imageIndex) {
+		const tinygltf::Image& image = model.images[imageIndex];
+		bool decoded = !image.as_is && !image.image.empty() && image.width > 0 && image.height > 0 && image.component > 0;
+		std::vector<size_t> textureRefs;
+		std::string fallbackReason;
+		for (size_t textureIndex = 0; textureIndex < textures.size(); ++textureIndex) {
+			const GltfPreviewTexture& texture = textures[textureIndex];
+			if (texture.sourceImage != static_cast<int>(imageIndex)) {
+				continue;
+			}
+			textureRefs.push_back(textureIndex);
+			if (texture.fallback && fallbackReason.empty()) {
+				fallbackReason = texture.fallbackReason;
+			}
+		}
+
+		std::cout << "glTF preview image[" << imageIndex << "]: source=\""
+			<< imageSourceLabel(image) << "\""
+			<< " name=\"" << image.name << "\""
+			<< " mime=\"" << image.mimeType << "\""
+			<< " decoded=" << (decoded ? "true" : "false")
+			<< " size=" << image.width << "x" << image.height
+			<< " components=" << image.component
+			<< " bits=" << image.bits
+			<< " bytes=" << image.image.size();
+		if (!textureRefs.empty()) {
+			std::cout << " textures=";
+			for (size_t i = 0; i < textureRefs.size(); ++i) {
+				if (i > 0) {
+					std::cout << ",";
+				}
+				std::cout << textureRefs[i];
+			}
+		}
+		if (!fallbackReason.empty()) {
+			std::cout << " fallbackReason=\"" << fallbackReason << "\"";
+		}
+		std::cout << std::endl;
+	}
+
+	for (size_t textureIndex = 0; textureIndex < textures.size(); ++textureIndex) {
+		const GltfPreviewTexture& texture = textures[textureIndex];
+		std::cout << "glTF preview texture[" << textureIndex << "]:"
+			<< " image=" << texture.sourceImage
+			<< " uri=\"" << texture.sourceUri << "\""
+			<< " mime=\"" << texture.mimeType << "\""
+			<< " size=" << texture.width << "x" << texture.height
+			<< " fallback=" << (texture.fallback ? "true" : "false")
+			<< " derived=" << (texture.derived ? "true" : "false")
+			<< " stats(" << texture.channelStats << ")";
+		if (!texture.fallbackReason.empty()) {
+			std::cout << " fallbackReason=\"" << texture.fallbackReason << "\"";
+		}
+		if (!texture.derivedFrom.empty()) {
+			std::cout << " derivedFrom=\"" << texture.derivedFrom << "\"";
+		}
+		if (!texture.name.empty()) {
+			std::cout << " name=\"" << texture.name << "\"";
+		}
+		std::cout << std::endl;
+	}
+}
+
 PBRMaterial convertMaterial(
 	const tinygltf::Model& model,
 	const tinygltf::Material& material,
 	const std::string& sourcePath,
-	const std::vector<GltfPreviewTexture>& textures,
+	std::vector<GltfPreviewTexture>& textures,
 	GltfPreviewMaterialMeta& meta,
 	float& opacity,
 	float& transmission
@@ -779,6 +1053,9 @@ PBRMaterial convertMaterial(
 	meta.transmission = readTransmissionFactor(material);
 	meta.transmissionTexture = readTransmissionTexture(material, model.textures.size());
 	meta.ior = readIor(material);
+	ClearcoatExtension clearcoat = readClearcoatExtension(material);
+	meta.clearcoatFactor = clearcoat.factor;
+	meta.clearcoatRoughnessFactor = clearcoat.roughnessFactor;
 	VolumeExtension volume = readVolumeExtension(material, model.textures.size());
 	meta.volumeThickness = volume.thickness;
 	meta.attenuationDistance = volume.attenuationDistance;
@@ -794,7 +1071,37 @@ PBRMaterial convertMaterial(
 		};
 	}
 
-	glm::vec4 textureAverage = averageBaseColorTexture(model, pbr.baseColorTexture.index);
+	SpecGlossExtension specGloss = readSpecGlossExtension(material, model.textures.size());
+	if (specGloss.present) {
+		meta.workflow = "specularGlossiness";
+		meta.baseColorFactor = specGloss.diffuseFactor;
+		meta.baseColorTexture = specGloss.diffuseTexture;
+		meta.metallicRoughnessTexture = GLTF_PREVIEW_INVALID_TEXTURE;
+		meta.metalness = 0.0f;
+		meta.roughness = 1.0f - specGloss.glossinessFactor;
+		meta.specGlossDiffuseTexture = specGloss.diffuseTexture;
+		meta.specGlossTexture = specGloss.specularGlossinessTexture;
+		meta.specGlossSpecularFactor = specGloss.specularFactor;
+		meta.specGlossGlossinessFactor = specGloss.glossinessFactor;
+
+		if (specGloss.specularGlossinessTexture != GLTF_PREVIEW_INVALID_TEXTURE &&
+			specGloss.specularGlossinessTexture < textures.size()) {
+			GltfPreviewTexture derived = deriveMetallicRoughnessFromSpecGloss(
+				textures[specGloss.specularGlossinessTexture],
+				specGloss.glossinessFactor,
+				specGloss.specularGlossinessTexture
+			);
+			meta.metallicRoughnessTexture = static_cast<uint32_t>(textures.size());
+			meta.roughness = 1.0f;
+			meta.derivedMetallicRoughnessTexture = true;
+			textures.push_back(std::move(derived));
+		}
+	}
+
+	int baseTextureForAverage = meta.baseColorTexture == GLTF_PREVIEW_INVALID_TEXTURE
+		? -1
+		: static_cast<int>(meta.baseColorTexture);
+	glm::vec4 textureAverage = averageBaseColorTexture(model, baseTextureForAverage);
 	glm::vec4 baseColor = meta.baseColorFactor * textureAverage;
 	normalizeMaterialMeta(material, sourcePath, textures, meta, baseColor);
 
@@ -2186,9 +2493,13 @@ bool loadGltfPreviewScene(const std::string& requestedPath, GltfPreviewScene& sc
 		return false;
 	}
 
+	logGltfPreviewAssetImport(model, scene.sourcePath);
+
 	std::string requiredExtensionWarning;
-	if (!model.extensionsRequired.empty()) {
-		requiredExtensionWarning = "preview ignored required glTF extensions: " + joinExtensions(model.extensionsRequired);
+	std::vector<std::string> unsupportedRequired = unsupportedRequiredExtensions(model.extensionsRequired);
+	if (!unsupportedRequired.empty()) {
+		requiredExtensionWarning = "preview ignored required glTF extensions: " + joinExtensions(unsupportedRequired);
+		std::cout << "glTF preview warning: " << requiredExtensionWarning << std::endl;
 	}
 
 	scene.stats.nodeCount = static_cast<uint32_t>(model.nodes.size());
@@ -2214,7 +2525,17 @@ bool loadGltfPreviewScene(const std::string& requestedPath, GltfPreviewScene& sc
 		scene.materialMeta.push_back(meta);
 		scene.materialOpacity.push_back(opacity);
 		scene.materialTransmission.push_back(transmission);
-		logGltfPreviewMaterialImport(material, meta, scene.textures, materialIndex);
+	}
+	scene.stats.textureCount = static_cast<uint32_t>(scene.textures.size());
+	refreshTextureChannelStats(scene.textures);
+	logGltfPreviewTextureImports(model, scene.textures);
+	for (size_t materialIndex = 0; materialIndex < model.materials.size(); ++materialIndex) {
+		logGltfPreviewMaterialImport(
+			model.materials[materialIndex],
+			scene.materialMeta[materialIndex],
+			scene.textures,
+			materialIndex
+		);
 	}
 	uint32_t defaultMaterialIndex = static_cast<uint32_t>(scene.materials.size());
 	scene.materials.push_back(makeDefaultMaterial());
@@ -2267,7 +2588,8 @@ bool loadGltfPreviewScene(const std::string& requestedPath, GltfPreviewScene& sc
 	std::ostringstream out;
 	out << "glTF model ready: " << scene.stats.primitiveCount << " primitives, "
 		<< scene.stats.triangleCount << " triangles, "
-		<< scene.stats.materialCount << " materials, shadow validation rig";
+		<< scene.stats.materialCount << " materials, "
+		<< scene.stats.textureCount << " textures, shadow validation rig";
 	if (!warning.empty()) {
 		out << " (warning: " << warning << ")";
 	}

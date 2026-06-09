@@ -38,6 +38,11 @@
 
 #include "../../vendor/slang/external/renderdoc_app.h"
 
+#include <stb_image.h>
+
+#define TINYEXR_IMPLEMENTATION
+#include "../../vendor/tinygltf/examples/common/tinyexr.h"
+
 #ifdef NRAY_VULKAN_SHADER_DEBUG
 #include "../../build/generated/vulkan_shader_debug/tut28_star_nest_comp_spv.h"
 #include "../../build/generated/vulkan_shader_debug/tut28_lets_self_reflect_comp_spv.h"
@@ -415,6 +420,7 @@ struct GpuMaterial {
 	glm::vec4 textureParams;   // alphaCutoff, normalScale, occlusionStrength, volumeThickness
 	glm::vec4 attenuation;     // rgb attenuationColor, a attenuationDistance
 	glm::uvec4 volumeTextureInfo; // thicknessTexture, unused
+	glm::vec4 opticalParams;   // clearcoatFactor, clearcoatRoughnessFactor, unused, unused
 };
 
 struct GpuBvhNode {
@@ -438,13 +444,130 @@ struct GpuSettings {
 	glm::vec4 shadowDepth;   // x=maxLightZ, y=invDepthRange, z=depthBias, w=normalBias
 	glm::vec4 denoiseParams; // x=strength, y=depthSigma, z=normalSigma, w=lumaSigma
 	glm::uvec4 denoiseFlags; // x=mode, y=debugView, z=fireflyClamp, w=atrousPassCount
+	glm::vec4 environmentParams; // x=enableEnv, y=envReady, z/w unused
+	glm::vec4 pointLightParams;  // x=enableThreePoint, y=sceneRadius, z/w unused
+	glm::vec4 keyLightPositionRadius;
+	glm::vec4 keyLightColorIntensity;
+	glm::vec4 fillLightPositionRadius;
+	glm::vec4 fillLightColorIntensity;
+	glm::vec4 rimLightPositionRadius;
+	glm::vec4 rimLightColorIntensity;
+	glm::vec4 lightingControls; // x=pointLightShadows, y=directDiffuse, z=directSpecular, w=clearcoatSpecular
+	glm::vec4 lightingParams;   // x=directSpecularScale, y=pointLightSizeScale, z/w unused
 };
 
 static_assert(sizeof(GpuTriIntersect) == 64, "GpuTriIntersect must match std430 shader layout.");
 static_assert(sizeof(GpuTriShading) == 144, "GpuTriShading must match std430 shader layout.");
-static_assert(sizeof(GpuMaterial) == 128, "GpuMaterial must match std430 shader layout.");
+static_assert(sizeof(GpuMaterial) == 144, "GpuMaterial must match std430 shader layout.");
 static_assert(sizeof(GpuBvhNode) == 48, "GpuBvhNode must match std430 shader layout.");
-static_assert(sizeof(GpuSettings) == 192, "GpuSettings must match std430 shader layout.");
+static_assert(sizeof(GpuSettings) == 352, "GpuSettings must match std430 shader layout.");
+
+void logModelImport(const std::string& message);
+
+std::string textureIndexForLog(uint32_t textureIndex) {
+	if (textureIndex == GLTF_PREVIEW_INVALID_TEXTURE) {
+		return "none";
+	}
+	return std::to_string(textureIndex);
+}
+
+void appendTextureFlags(
+	std::ostringstream& out,
+	const char* slotName,
+	uint32_t textureIndex,
+	const GltfPreviewScene& scene
+) {
+	out << " " << slotName << "=" << textureIndexForLog(textureIndex);
+	if (textureIndex == GLTF_PREVIEW_INVALID_TEXTURE || textureIndex >= scene.textures.size()) {
+		return;
+	}
+
+	const GltfPreviewTexture& texture = scene.textures[textureIndex];
+	if (texture.fallback) {
+		out << "(fallback";
+		if (!texture.fallbackReason.empty()) {
+			out << ":" << texture.fallbackReason;
+		}
+		out << ")";
+	}
+	if (texture.derived) {
+		out << "(derived";
+		if (!texture.derivedFrom.empty()) {
+			out << ":" << texture.derivedFrom;
+		}
+		out << ")";
+	}
+}
+
+void logGpuMaterialTable(
+	const GltfPreviewScene& scene,
+	const std::vector<GpuMaterial>& gpuMaterials,
+	const glm::uvec4& sceneCounts,
+	uint32_t textureDescriptorCount,
+	int selectedShader
+) {
+	std::ostringstream header;
+	header << "activated glTF scene"
+		<< " sceneCounts=(" << sceneCounts.x << ", " << sceneCounts.y
+		<< ", " << sceneCounts.z << ", " << sceneCounts.w << ")"
+		<< " descriptorTextureCount=" << textureDescriptorCount
+		<< " activeShader=" << selectedShader;
+	const char* shaderName = VulkanComputePreview::shaderName(selectedShader);
+	if (shaderName) {
+		header << "(\"" << shaderName << "\")";
+	}
+	logModelImport(header.str());
+
+	for (size_t i = 0; i < gpuMaterials.size(); ++i) {
+		const GpuMaterial& material = gpuMaterials[i];
+		const GltfPreviewMaterialMeta* meta = i < scene.materialMeta.size() ? &scene.materialMeta[i] : nullptr;
+		std::ostringstream out;
+		out << "GPU material[" << i << "]";
+		if (meta && !meta->name.empty()) {
+			out << " \"" << meta->name << "\"";
+		}
+		if (meta) {
+			out << " workflow=" << meta->workflow;
+		}
+		appendTextureFlags(out, "base", material.textureIndices.x, scene);
+		appendTextureFlags(out, "mr", material.textureIndices.y, scene);
+		appendTextureFlags(out, "normal", material.textureIndices.z, scene);
+		appendTextureFlags(out, "emissive", material.textureIndices.w, scene);
+		out << " kind=" << material.textureInfo.w
+			<< " alphaMode=" << material.textureInfo.y
+			<< " roughness=" << material.params.x
+			<< " metalness=" << material.params.y
+			<< " clearcoat=" << material.opticalParams.x
+			<< " clearcoatRoughness=" << material.opticalParams.y;
+		logModelImport(out.str());
+	}
+}
+
+std::vector<std::string> collectFallbackTextureLabels(const std::vector<GltfPreviewTexture>& textures) {
+	std::vector<std::string> labels;
+	for (size_t i = 0; i < textures.size(); ++i) {
+		const GltfPreviewTexture& texture = textures[i];
+		if (!texture.fallback) {
+			continue;
+		}
+		std::ostringstream label;
+		label << i << ":";
+		if (!texture.name.empty()) {
+			label << texture.name;
+		}
+		else if (!texture.sourceUri.empty()) {
+			label << texture.sourceUri;
+		}
+		else {
+			label << "texture";
+		}
+		if (!texture.fallbackReason.empty()) {
+			label << " (" << texture.fallbackReason << ")";
+		}
+		labels.push_back(label.str());
+	}
+	return labels;
+}
 
 const char* vkResultName(VkResult result) {
 	switch (result) {
@@ -615,10 +738,20 @@ struct ModelEntry {
 	bool transient = false; // imported with persist=false; never written to project_settings.json
 };
 
+struct SkyEntry {
+	std::string name;
+	std::string filePath;
+	std::string fileKey;
+	bool transient = false;
+};
+
 struct ProjectSettingsState {
 	std::vector<ModelEntry> entries;
+	std::vector<SkyEntry> skies;
 	std::string lastSelectedModelFolderPath;
 	std::string lastSelectedModelFolderKey;
+	std::string lastSelectedSkyPath;
+	std::string lastSelectedSkyKey;
 };
 
 static const ShaderEntry kShaders[] = {
@@ -650,10 +783,11 @@ int defaultShaderArrayIndex() {
 
 static constexpr uint32_t kMaxPreviewTextures = 256;
 // Total descriptor set bindings: 0=pixels, 1-4=scene SSBOs, 5=accum, 6=settings,
-// 7=textures, 8=shadow map, 9-16=denoiser storage images.
-static constexpr uint32_t kTotalBindings = 17;
+// 7=textures, 8=shadow map, 9-16=denoiser storage images, 17=environment map.
+static constexpr uint32_t kTotalBindings = 18;
 static constexpr uint32_t kStorageBufferDescriptorCount = 8;
 static constexpr uint32_t kStorageImageDescriptorCount = 8;
+static constexpr uint32_t kCombinedImageSamplerDescriptorCount = kMaxPreviewTextures + 1;
 // Scene SSBO bindings start at index 1 (binding 0 is the pixel buffer).
 static constexpr uint32_t kFirstSceneBinding = 1;
 // Named binding slots — update if the layout in vulkan_gltf_flat.comp changes.
@@ -670,11 +804,14 @@ static constexpr uint32_t kBindingDenoiseMaterialId = 13;
 static constexpr uint32_t kBindingDenoiseInstanceId = 14;
 static constexpr uint32_t kBindingDenoisePing = 15;
 static constexpr uint32_t kBindingDenoisePong = 16;
+static constexpr uint32_t kBindingEnvironment = 17;
 
 // Imported models are persisted here (relative to the working directory, which
 // is the PathTracingRenderer/ folder where the app is run) so they reappear on
 // the next run without re-importing.
 static const char* kProjectSettingsFile = "project_settings.json";
+static const char* kDefaultSkyName = "Sunny Rose Garden";
+static const char* kDefaultSkyFile = "/home/thadeu/Downloads/sunny_rose_garden_2k.exr";
 
 void logModelImport(const std::string& message) {
 	std::cerr << "[VulkanModelImport] " << message << '\n';
@@ -709,6 +846,11 @@ const char* denoiserDebugViewName(VulkanDenoiserDebugView view) {
 
 bool denoiserVerboseLoggingEnabled(const VulkanDenoiserSettings& settings) {
 	static const bool envEnabled = envFlagEnabled("NRAY_VULKAN_DENOISER_LOG");
+	return settings.verboseLogging || envEnabled;
+}
+
+bool lightingVerboseLoggingEnabled(const VulkanPreviewLightingDebugSettings& settings) {
+	static const bool envEnabled = envFlagEnabled("NRAY_VULKAN_LIGHTING_LOG");
 	return settings.verboseLogging || envEnabled;
 }
 
@@ -1489,6 +1631,32 @@ std::optional<std::filesystem::path> resolveExistingFolder(const std::filesystem
 	return std::nullopt;
 }
 
+bool isSupportedSkyExtension(const std::filesystem::path& path) {
+	std::string ext = toLowerAscii(path.extension().string());
+	return ext == ".exr" || ext == ".hdr";
+}
+
+std::optional<std::filesystem::path> resolveExistingFile(const std::filesystem::path& input) {
+	std::error_code ec;
+	if (input.is_absolute()) {
+		if (pathExists(input) && std::filesystem::is_regular_file(input, ec) && !ec) {
+			return canonicalOrAbsolute(input);
+		}
+		return std::nullopt;
+	}
+
+	std::array<std::filesystem::path, 2> candidates{
+		input,
+		std::filesystem::path("..") / input
+	};
+	for (const std::filesystem::path& candidate : candidates) {
+		if (pathExists(candidate) && std::filesystem::is_regular_file(candidate, ec) && !ec) {
+			return canonicalOrAbsolute(candidate);
+		}
+	}
+	return std::nullopt;
+}
+
 std::string genericPathString(const std::filesystem::path& path) {
 	std::string text = path.generic_string();
 	for (char& c : text) {
@@ -1544,6 +1712,163 @@ std::string persistableFolderPath(const std::filesystem::path& folder) {
 		return bestText;
 	}
 	return genericPathString(absoluteFolder);
+}
+
+std::string persistableFilePath(const std::filesystem::path& filePath) {
+	std::filesystem::path absoluteFile = canonicalOrAbsolute(filePath);
+	std::string bestText;
+
+	std::array<std::filesystem::path, 2> bases{
+		canonicalOrAbsolute(std::filesystem::current_path()),
+		canonicalOrAbsolute(std::filesystem::current_path().parent_path())
+	};
+	for (const std::filesystem::path& base : bases) {
+		std::filesystem::path relative = absoluteFile.lexically_relative(base);
+		if (!isPortableRelativePath(relative)) {
+			continue;
+		}
+		std::string text = genericPathString(relative);
+		if (bestText.empty() || text.size() < bestText.size()) {
+			bestText = std::move(text);
+		}
+	}
+
+	if (!bestText.empty()) {
+		return bestText;
+	}
+	return genericPathString(absoluteFile);
+}
+
+std::string displayNameFromFile(const std::filesystem::path& filePath) {
+	std::string name = filePath.stem().string();
+	if (name.empty()) {
+		name = filePath.filename().string();
+	}
+	for (char& c : name) {
+		if (c == '_' || c == '-') {
+			c = ' ';
+		}
+	}
+	bool capitalizeNext = true;
+	for (char& c : name) {
+		unsigned char ch = static_cast<unsigned char>(c);
+		if (std::isspace(ch)) {
+			capitalizeNext = true;
+			continue;
+		}
+		c = capitalizeNext
+			? static_cast<char>(std::toupper(ch))
+			: static_cast<char>(std::tolower(ch));
+		capitalizeNext = false;
+	}
+	return name.empty() ? "Imported Sky" : name;
+}
+
+std::optional<SkyEntry> buildSkyEntryForFile(const std::filesystem::path& filePath, const std::string& overrideName = std::string()) {
+	if (!isSupportedSkyExtension(filePath)) {
+		return std::nullopt;
+	}
+
+	SkyEntry entry;
+	entry.name = overrideName.empty() ? displayNameFromFile(filePath) : overrideName;
+	entry.filePath = persistableFilePath(filePath);
+	entry.fileKey = normalizePathKey(filePath);
+	return entry;
+}
+
+void ensureDefaultSkyEntry(ProjectSettingsState& state) {
+	std::optional<std::filesystem::path> resolved = resolveExistingFile(kDefaultSkyFile);
+	if (!resolved.has_value() || !isSupportedSkyExtension(*resolved)) {
+		logModelImport(std::string("default sky missing, procedural sky remains available: ") + kDefaultSkyFile);
+		return;
+	}
+
+	std::string key = normalizePathKey(*resolved);
+	for (const SkyEntry& entry : state.skies) {
+		if (entry.fileKey == key) {
+			return;
+		}
+	}
+
+	std::optional<SkyEntry> entry = buildSkyEntryForFile(*resolved, kDefaultSkyName);
+	if (entry.has_value()) {
+		state.skies.insert(state.skies.begin(), std::move(*entry));
+	}
+}
+
+// Host-side equirectangular environment image: tightly packed RGBA float pixels
+// (4 channels) ready to upload as VK_FORMAT_R32G32B32A32_SFLOAT. `valid` is false
+// when the file is missing/unsupported/failed to decode, in which case the caller
+// keeps the procedural sky.
+struct EnvironmentImage {
+	int width = 0;
+	int height = 0;
+	std::vector<float> rgba;
+	bool valid = false;
+};
+
+EnvironmentImage loadEnvironmentImage(const std::filesystem::path& path) {
+	EnvironmentImage image;
+	if (!isSupportedSkyExtension(path)) {
+		logModelImport("sky load skipped, unsupported extension: " + genericPathString(path));
+		return image;
+	}
+
+	std::optional<std::filesystem::path> resolved = resolveExistingFile(path);
+	if (!resolved.has_value()) {
+		logModelImport("sky file missing, procedural sky remains: " + genericPathString(path));
+		return image;
+	}
+
+	std::string filePath = genericPathString(*resolved);
+	std::string ext = toLowerAscii(resolved->extension().string());
+
+	if (ext == ".exr") {
+		float* pixels = nullptr;
+		int width = 0;
+		int height = 0;
+		const char* err = nullptr;
+		int result = LoadEXR(&pixels, &width, &height, filePath.c_str(), &err);
+		if (result != TINYEXR_SUCCESS || pixels == nullptr || width <= 0 || height <= 0) {
+			std::string message = err != nullptr ? err : "unknown TinyEXR error";
+			logModelImport("failed to load EXR sky '" + filePath + "': " + message);
+			if (err != nullptr) {
+				FreeEXRErrorMessage(err);
+			}
+			if (pixels != nullptr) {
+				free(pixels);
+			}
+			return image;
+		}
+		// LoadEXR already returns 4-channel RGBA float data.
+		image.width = width;
+		image.height = height;
+		image.rgba.assign(pixels, pixels + static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+		image.valid = true;
+		free(pixels);
+		logModelImport("loaded EXR sky '" + filePath + "' " + std::to_string(width) + "x" + std::to_string(height));
+		return image;
+	}
+
+	// .hdr (and any other stb-decodable float format): force 4 channels.
+	int width = 0;
+	int height = 0;
+	int channels = 0;
+	float* pixels = stbi_loadf(filePath.c_str(), &width, &height, &channels, 4);
+	if (pixels == nullptr || width <= 0 || height <= 0) {
+		logModelImport(std::string("failed to load HDR sky '") + filePath + "': " + stbi_failure_reason());
+		if (pixels != nullptr) {
+			stbi_image_free(pixels);
+		}
+		return image;
+	}
+	image.width = width;
+	image.height = height;
+	image.rgba.assign(pixels, pixels + static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+	image.valid = true;
+	stbi_image_free(pixels);
+	logModelImport("loaded HDR sky '" + filePath + "' " + std::to_string(width) + "x" + std::to_string(height));
+	return image;
 }
 
 std::string sceneFileNameLower(const std::filesystem::path& path) {
@@ -1625,6 +1950,18 @@ void writeProjectSettings(const ProjectSettingsState& state) {
 		item["name"] = entry.name;
 		item["folder"] = entry.folderPath;
 		root["models"].push_back(item);
+	}
+
+	root["skies"] = nlohmann::json::array();
+	if (!state.lastSelectedSkyPath.empty()) {
+		root["lastSelectedSky"] = state.lastSelectedSkyPath;
+	}
+	for (const SkyEntry& entry : state.skies) {
+		if (entry.transient) { continue; }
+		nlohmann::json item;
+		item["name"] = entry.name;
+		item["file"] = entry.filePath;
+		root["skies"].push_back(item);
 	}
 
 	std::ofstream out(kProjectSettingsFile, std::ios::trunc);
@@ -1723,7 +2060,69 @@ ProjectSettingsState loadProjectSettings() {
 		}
 	}
 
-	logModelImport("loaded " + std::to_string(state.entries.size()) + " model(s) from " + kProjectSettingsFile);
+	if (root.contains("skies") && root["skies"].is_array()) {
+		for (const nlohmann::json& item : root["skies"]) {
+			std::string file;
+			std::string overrideName;
+			if (item.is_string()) {
+				file = item.get<std::string>();
+			}
+			else if (item.is_object()) {
+				if (item.contains("file") && item["file"].is_string()) {
+					file = item["file"].get<std::string>();
+				}
+				if (item.contains("name") && item["name"].is_string()) {
+					overrideName = item["name"].get<std::string>();
+				}
+			}
+
+			file = trimAscii(file);
+			if (file.empty()) {
+				continue;
+			}
+
+			std::optional<std::filesystem::path> resolved = resolveExistingFile(file);
+			if (!resolved.has_value() || !isSupportedSkyExtension(*resolved)) {
+				logModelImport("settings sky file missing or unsupported, skipping: " + file);
+				continue;
+			}
+
+			std::optional<SkyEntry> entry = buildSkyEntryForFile(*resolved, overrideName);
+			if (!entry.has_value()) {
+				continue;
+			}
+
+			bool duplicate = false;
+			for (const SkyEntry& existing : state.skies) {
+				if (existing.fileKey == entry->fileKey) {
+					duplicate = true;
+					break;
+				}
+			}
+			if (!duplicate) {
+				state.skies.push_back(std::move(*entry));
+			}
+		}
+	}
+
+	ensureDefaultSkyEntry(state);
+
+	if (root.contains("lastSelectedSky") && root["lastSelectedSky"].is_string()) {
+		std::string selectedSky = trimAscii(root["lastSelectedSky"].get<std::string>());
+		if (!selectedSky.empty()) {
+			std::optional<std::filesystem::path> resolved = resolveExistingFile(selectedSky);
+			if (resolved.has_value()) {
+				state.lastSelectedSkyPath = genericPathString(canonicalOrAbsolute(*resolved));
+				state.lastSelectedSkyKey = normalizePathKey(*resolved);
+			}
+			else {
+				logModelImport("last selected sky missing, using procedural sky: " + selectedSky);
+			}
+		}
+	}
+
+	logModelImport("loaded " + std::to_string(state.entries.size()) + " model(s) and "
+		+ std::to_string(state.skies.size()) + " sky(ies) from " + kProjectSettingsFile);
 	return state;
 }
 
@@ -1767,6 +2166,44 @@ int initialSelectedModelFromSettings() {
 		}
 	}
 	logModelImport("last selected model is no longer registered; using default scene");
+	return -1;
+}
+
+std::vector<SkyEntry>& activeSkyEntries() {
+	return projectSettingsState().skies;
+}
+
+void saveSkyEntriesToSettings(const std::vector<SkyEntry>& skies) {
+	ProjectSettingsState& state = projectSettingsState();
+	state.skies = skies;
+	writeProjectSettings(state);
+}
+
+void saveSelectedSkyToSettings(int selectedSky) {
+	ProjectSettingsState& state = projectSettingsState();
+	if (selectedSky >= 0 && selectedSky < static_cast<int>(state.skies.size())) {
+		const SkyEntry& entry = state.skies[selectedSky];
+		state.lastSelectedSkyPath = entry.filePath;
+		state.lastSelectedSkyKey = entry.fileKey;
+	}
+	else {
+		state.lastSelectedSkyPath.clear();
+		state.lastSelectedSkyKey.clear();
+	}
+	writeProjectSettings(state);
+}
+
+int initialSelectedSkyFromSettings() {
+	const ProjectSettingsState& state = projectSettingsState();
+	if (state.lastSelectedSkyKey.empty()) {
+		return -1;
+	}
+	for (int i = 0; i < static_cast<int>(state.skies.size()); ++i) {
+		if (state.skies[i].fileKey == state.lastSelectedSkyKey) {
+			return i;
+		}
+	}
+	logModelImport("last selected sky is no longer registered; using procedural sky");
 	return -1;
 }
 
@@ -1851,6 +2288,12 @@ struct VulkanComputePreview::Impl {
 	std::vector<TextureResource> textureResources;
 	std::vector<VkDescriptorImageInfo> textureDescriptorInfos;
 	uint32_t textureDescriptorCount = 1;
+	// Equirectangular environment map (binding 17). Always holds a valid resource:
+	// a real sky when one is selected, otherwise a 1x1 fallback so the descriptor
+	// stays bound. `envReady` is true only for a real sky; the shader keys off it
+	// (environmentParams.y) to choose HDRI sampling vs. the procedural sky.
+	TextureResource envTexture;
+	bool envReady = false;
 	bool intelGpu = false;
 	GltfPreviewScene modelScene;
 	bool modelBuffersReady = false;
@@ -1862,6 +2305,10 @@ struct VulkanComputePreview::Impl {
 	// triCount, bvhNodeCount, materialCount, textureCount — cached once at load so
 	// render() doesn't recompute the (constant) sizes every frame.
 	glm::uvec4 sceneCounts = glm::uvec4(0u);
+	// Fallback-texture labels, cached at model activation so diagnostics can expose
+	// the list without rescanning texture metadata every frame.
+	std::vector<std::string> fallbackTextureLabels;
+	std::string lastLightingLogKey;
 
 	VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
 	VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
@@ -1892,6 +2339,7 @@ struct VulkanComputePreview::Impl {
 
 	int selectedShader = defaultShaderArrayIndex();
 	int selectedModel = initialSelectedModelFromSettings();
+	int selectedSky = initialSelectedSkyFromSettings();
 	int renderWidth = 0;
 	int renderHeight = 0;
 	bool initialized = false;
@@ -1933,6 +2381,7 @@ struct VulkanComputePreview::Impl {
 			!createSettingsBuffer() ||
 			!createShadowMapBuffer() ||
 			!denoiser.create(device, physicalDevice, VkExtent2D{static_cast<uint32_t>(renderWidth), static_cast<uint32_t>(renderHeight)}, debugUtils) ||
+			!createEnvironmentResources() ||
 			!createDescriptorSetLayout() ||
 			!createDescriptorPoolAndSet() ||
 			!createPipeline()) {
@@ -2041,6 +2490,86 @@ struct VulkanComputePreview::Impl {
 		);
 		gpuSettings.sunDir = glm::vec4(settings.sunDir, settings.sunAngle);
 		gpuSettings.sunColor = glm::vec4(settings.sunColor, settings.sunIntensity);
+
+		// Environment + analytic three-point lighting. sceneRadius scales the
+		// point-light inverse-square attenuation so lights read consistently across
+		// models of wildly different size; it is derived from the active model bounds.
+		float sceneRadius = 1.0f;
+		if (selectedEntry.requiresModel && modelBuffersReady) {
+			glm::vec3 extent = modelScene.boundsMax - modelScene.boundsMin;
+			float radius = 0.5f * glm::length(extent);
+			if (radius > 1e-4f) {
+				sceneRadius = radius;
+			}
+		}
+		gpuSettings.environmentParams = glm::vec4(
+			settings.enableEnvironment ? 1.0f : 0.0f,
+			envReady ? 1.0f : 0.0f,
+			0.0f,
+			0.0f
+		);
+		gpuSettings.pointLightParams = glm::vec4(
+			settings.enableThreePointLighting ? 1.0f : 0.0f,
+			sceneRadius,
+			0.0f,
+			0.0f
+		);
+		const float pointLightSizeScale = std::max(settings.lightingDebug.pointLightSizeScale, 0.0f);
+		auto lightRadius = [pointLightSizeScale](const VulkanPreviewPointLight& light) {
+			return std::max(light.radius * pointLightSizeScale, 0.0f);
+		};
+		gpuSettings.keyLightPositionRadius = glm::vec4(settings.keyLight.position, lightRadius(settings.keyLight));
+		gpuSettings.keyLightColorIntensity = glm::vec4(
+			settings.keyLight.color,
+			settings.lightingDebug.keyLightEnabled ? settings.keyLight.intensity : 0.0f
+		);
+		gpuSettings.fillLightPositionRadius = glm::vec4(settings.fillLight.position, lightRadius(settings.fillLight));
+		gpuSettings.fillLightColorIntensity = glm::vec4(
+			settings.fillLight.color,
+			settings.lightingDebug.fillLightEnabled ? settings.fillLight.intensity : 0.0f
+		);
+		gpuSettings.rimLightPositionRadius = glm::vec4(settings.rimLight.position, lightRadius(settings.rimLight));
+		gpuSettings.rimLightColorIntensity = glm::vec4(
+			settings.rimLight.color,
+			settings.lightingDebug.rimLightEnabled ? settings.rimLight.intensity : 0.0f
+		);
+		gpuSettings.lightingControls = glm::vec4(
+			settings.lightingDebug.pointLightShadows ? 1.0f : 0.0f,
+			settings.lightingDebug.directDiffuse ? 1.0f : 0.0f,
+			settings.lightingDebug.directSpecular ? 1.0f : 0.0f,
+			settings.lightingDebug.clearcoatSpecular ? 1.0f : 0.0f
+		);
+		gpuSettings.lightingParams = glm::vec4(
+			std::max(settings.lightingDebug.directSpecularScale, 0.0f),
+			pointLightSizeScale,
+			0.0f,
+			0.0f
+		);
+
+		if (lightingVerboseLoggingEnabled(settings.lightingDebug)) {
+			std::ostringstream key;
+			key << "model=" << selectedModel
+				<< " shader=" << selectedShader
+				<< " radius=" << sceneRadius
+				<< " env=" << (settings.enableEnvironment ? 1 : 0) << "/" << (envReady ? 1 : 0)
+				<< " threePoint=" << (settings.enableThreePointLighting ? 1 : 0)
+				<< " pointShadows=" << (settings.lightingDebug.pointLightShadows ? 1 : 0)
+				<< " diffuse=" << (settings.lightingDebug.directDiffuse ? 1 : 0)
+				<< " specular=" << (settings.lightingDebug.directSpecular ? 1 : 0)
+				<< " clearcoat=" << (settings.lightingDebug.clearcoatSpecular ? 1 : 0)
+				<< " specScale=" << settings.lightingDebug.directSpecularScale
+				<< " sizeScale=" << pointLightSizeScale
+				<< " key=" << gpuSettings.keyLightColorIntensity.w << "@" << gpuSettings.keyLightPositionRadius.w
+				<< " fill=" << gpuSettings.fillLightColorIntensity.w << "@" << gpuSettings.fillLightPositionRadius.w
+				<< " rim=" << gpuSettings.rimLightColorIntensity.w << "@" << gpuSettings.rimLightPositionRadius.w
+				<< " denoise=" << denoiserModeName(settings.denoiser.mode);
+			std::string logKey = key.str();
+			if (logKey != lastLightingLogKey) {
+				lastLightingLogKey = logKey;
+				std::cerr << "[VulkanLighting] " << logKey << '\n';
+			}
+		}
+
 		fillShadowProjection(
 			gpuSettings,
 			settings,
@@ -2426,6 +2955,8 @@ struct VulkanComputePreview::Impl {
 		}
 		destroyStorageBuffer(shadowMapBuffer);
 		destroyTextureResources();
+		destroyTextureResource(envTexture);
+		envReady = false;
 		destroyPixelBuffer();
 		destroyAccumBuffer();
 		destroySettingsBuffer();
@@ -2455,6 +2986,7 @@ struct VulkanComputePreview::Impl {
 		materialsOriginal.clear();
 		materialsCurrent.clear();
 		sceneCounts = glm::uvec4(0u);
+		fallbackTextureLabels.clear();
 		textureDescriptorCount = 1;
 		initialized = false;
 		lastGpuMs = 0.0;
@@ -3298,7 +3830,17 @@ struct VulkanComputePreview::Impl {
 		if (!source.name.empty()) {
 			std::cout << " '" << source.name << "'";
 		}
-		std::cout << ": " << width << "x" << height << " bytes=" << expectedBytes << std::endl;
+		std::cout << ": " << width << "x" << height << " bytes=" << expectedBytes
+			<< " sourceImage=" << source.sourceImage
+			<< " fallback=" << (source.fallback ? "true" : "false")
+			<< " derived=" << (source.derived ? "true" : "false");
+		if (!source.fallbackReason.empty()) {
+			std::cout << " fallbackReason=\"" << source.fallbackReason << "\"";
+		}
+		if (!source.derivedFrom.empty()) {
+			std::cout << " derivedFrom=\"" << source.derivedFrom << "\"";
+		}
+		std::cout << std::endl;
 
 		VkBuffer stagingBuffer = VK_NULL_HANDLE;
 		VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
@@ -3513,6 +4055,225 @@ struct VulkanComputePreview::Impl {
 		return true;
 	}
 
+	// Upload a host EnvironmentImage as a VK_FORMAT_R32G32B32A32_SFLOAT 2D image
+	// with an equirectangular sampler (repeat U for the longitudinal wrap, clamp V
+	// at the poles, linear filtering). Mirrors createTextureResource but for float
+	// data. A 1x1 image is used as the fallback when no sky is selected.
+	bool uploadEnvironmentImage(const EnvironmentImage& source, bool isFallback) {
+		destroyTextureResource(envTexture);
+
+		uint32_t width = static_cast<uint32_t>(std::max(source.width, 1));
+		uint32_t height = static_cast<uint32_t>(std::max(source.height, 1));
+		size_t expectedFloats = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+		std::vector<float> fallbackPixels;
+		const std::vector<float>* uploadFloats = &source.rgba;
+		if (uploadFloats->size() < expectedFloats) {
+			fallbackPixels.assign(4u, 0.0f);
+			width = 1;
+			height = 1;
+			expectedFloats = 4u;
+			uploadFloats = &fallbackPixels;
+		}
+		size_t expectedBytes = expectedFloats * sizeof(float);
+
+		VkBuffer stagingBuffer = VK_NULL_HANDLE;
+		VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+		VkDeviceSize stagingAllocationSize = 0;
+		if (!createBufferResource(
+			static_cast<VkDeviceSize>(expectedBytes),
+			VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			stagingBuffer,
+			stagingMemory,
+			stagingAllocationSize,
+			"environment staging")) {
+			destroyTransientBuffer(stagingBuffer, stagingMemory);
+			return false;
+		}
+
+		void* mapped = nullptr;
+		VkResult result = vkMapMemory(device, stagingMemory, 0, stagingAllocationSize, 0, &mapped);
+		if (result != VK_SUCCESS) {
+			destroyTransientBuffer(stagingBuffer, stagingMemory);
+			return failVk("vkMapMemory environment staging", result);
+		}
+		std::memcpy(mapped, uploadFloats->data(), expectedBytes);
+		vkUnmapMemory(device, stagingMemory);
+
+		VkImageCreateInfo imageInfo{};
+		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.imageType = VK_IMAGE_TYPE_2D;
+		imageInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+		imageInfo.extent = { width, height, 1 };
+		imageInfo.mipLevels = 1;
+		imageInfo.arrayLayers = 1;
+		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+		result = vkCreateImage(device, &imageInfo, nullptr, &envTexture.image);
+		if (result != VK_SUCCESS) {
+			destroyTransientBuffer(stagingBuffer, stagingMemory);
+			return failVk("vkCreateImage environment", result);
+		}
+		debugUtils.name(device, VK_OBJECT_TYPE_IMAGE, envTexture.image, "N-Ray environment image");
+
+		VkMemoryRequirements memoryReqs{};
+		vkGetImageMemoryRequirements(device, envTexture.image, &memoryReqs);
+		uint32_t memoryTypeIndex = 0;
+		if (!findMemoryType(memoryReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memoryTypeIndex)) {
+			destroyTransientBuffer(stagingBuffer, stagingMemory);
+			destroyTextureResource(envTexture);
+			return fail("No device-local memory type for Vulkan environment image");
+		}
+
+		VkMemoryAllocateInfo allocateInfo{};
+		allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocateInfo.allocationSize = memoryReqs.size;
+		allocateInfo.memoryTypeIndex = memoryTypeIndex;
+		result = vkAllocateMemory(device, &allocateInfo, nullptr, &envTexture.memory);
+		if (result != VK_SUCCESS) {
+			destroyTransientBuffer(stagingBuffer, stagingMemory);
+			destroyTextureResource(envTexture);
+			return failVk("vkAllocateMemory environment", result);
+		}
+
+		result = vkBindImageMemory(device, envTexture.image, envTexture.memory, 0);
+		if (result != VK_SUCCESS) {
+			destroyTransientBuffer(stagingBuffer, stagingMemory);
+			destroyTextureResource(envTexture);
+			return failVk("vkBindImageMemory environment", result);
+		}
+
+		bool submitted = submitImmediate("environment upload", [&](VkCommandBuffer cmd) {
+			VkImageSubresourceRange range{};
+			range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			range.baseMipLevel = 0;
+			range.levelCount = 1;
+			range.baseArrayLayer = 0;
+			range.layerCount = 1;
+
+			VkImageMemoryBarrier toTransfer{};
+			toTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			toTransfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			toTransfer.image = envTexture.image;
+			toTransfer.subresourceRange = range;
+			toTransfer.srcAccessMask = 0;
+			toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				0, 0, nullptr, 0, nullptr, 1, &toTransfer);
+
+			VkBufferImageCopy copy{};
+			copy.bufferOffset = 0;
+			copy.bufferRowLength = 0;
+			copy.bufferImageHeight = 0;
+			copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			copy.imageSubresource.mipLevel = 0;
+			copy.imageSubresource.baseArrayLayer = 0;
+			copy.imageSubresource.layerCount = 1;
+			copy.imageOffset = { 0, 0, 0 };
+			copy.imageExtent = { width, height, 1 };
+			vkCmdCopyBufferToImage(cmd, stagingBuffer, envTexture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+			VkImageMemoryBarrier toShader{};
+			toShader.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			toShader.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			toShader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			toShader.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			toShader.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			toShader.image = envTexture.image;
+			toShader.subresourceRange = range;
+			toShader.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			toShader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				0, 0, nullptr, 0, nullptr, 1, &toShader);
+		});
+
+		destroyTransientBuffer(stagingBuffer, stagingMemory);
+		if (!submitted) {
+			destroyTextureResource(envTexture);
+			return false;
+		}
+
+		VkImageViewCreateInfo viewInfo{};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = envTexture.image;
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		viewInfo.subresourceRange.baseMipLevel = 0;
+		viewInfo.subresourceRange.levelCount = 1;
+		viewInfo.subresourceRange.baseArrayLayer = 0;
+		viewInfo.subresourceRange.layerCount = 1;
+		result = vkCreateImageView(device, &viewInfo, nullptr, &envTexture.view);
+		if (result != VK_SUCCESS) {
+			destroyTextureResource(envTexture);
+			return failVk("vkCreateImageView environment", result);
+		}
+		debugUtils.name(device, VK_OBJECT_TYPE_IMAGE_VIEW, envTexture.view, "N-Ray environment image view");
+
+		VkSamplerCreateInfo samplerInfo{};
+		samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+		samplerInfo.magFilter = VK_FILTER_LINEAR;
+		samplerInfo.minFilter = VK_FILTER_LINEAR;
+		samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+		samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+		samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		samplerInfo.mipLodBias = 0.0f;
+		samplerInfo.anisotropyEnable = VK_FALSE;
+		samplerInfo.maxAnisotropy = 1.0f;
+		samplerInfo.compareEnable = VK_FALSE;
+		samplerInfo.minLod = 0.0f;
+		samplerInfo.maxLod = 0.0f;
+		samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+		samplerInfo.unnormalizedCoordinates = VK_FALSE;
+		result = vkCreateSampler(device, &samplerInfo, nullptr, &envTexture.sampler);
+		if (result != VK_SUCCESS) {
+			destroyTextureResource(envTexture);
+			return failVk("vkCreateSampler environment", result);
+		}
+		debugUtils.name(device, VK_OBJECT_TYPE_SAMPLER, envTexture.sampler, "N-Ray environment sampler");
+
+		envTexture.width = width;
+		envTexture.height = height;
+		envTexture.descriptor.sampler = envTexture.sampler;
+		envTexture.descriptor.imageView = envTexture.view;
+		envTexture.descriptor.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		envReady = !isFallback;
+		return true;
+	}
+
+	// Build the environment image resource for the current `selectedSky`. Falls
+	// back to a 1x1 image (procedural sky in the shader) when no sky is selected
+	// or the file fails to load. Always leaves binding 17 with a valid descriptor.
+	bool createEnvironmentResources() {
+		EnvironmentImage image;
+		const auto& skies = activeSkyEntries();
+		if (selectedSky >= 0 && selectedSky < static_cast<int>(skies.size())) {
+			image = loadEnvironmentImage(skies[selectedSky].filePath);
+			if (!image.valid) {
+				logModelImport("sky selection failed to load; using procedural sky: " + skies[selectedSky].filePath);
+			}
+		}
+
+		if (image.valid) {
+			return uploadEnvironmentImage(image, false);
+		}
+
+		EnvironmentImage fallback;
+		fallback.width = 1;
+		fallback.height = 1;
+		fallback.rgba.assign(4u, 0.0f);
+		fallback.valid = true;
+		return uploadEnvironmentImage(fallback, true);
+	}
+
 	bool rebuildTextureDescriptorInfos() {
 		if (textureResources.empty()) {
 			return fail("No Vulkan texture descriptors available");
@@ -3570,6 +4331,7 @@ struct VulkanComputePreview::Impl {
 	bool loadModelSceneResources() {
 		modelBuffersReady = false;
 		sceneCounts = glm::uvec4(0u);
+		fallbackTextureLabels.clear();
 		modelScene = {};
 		materialsOriginal.clear();
 		materialsCurrent.clear();
@@ -3698,6 +4460,8 @@ struct VulkanComputePreview::Impl {
 			float attenuationDistance = meta ? meta->attenuationDistance : (material.absorption > 0.0f ? 1.0f / material.absorption : 0.0f);
 			uint32_t alphaMode = meta ? meta->normalizedAlphaMode : GLTF_PREVIEW_ALPHA_OPAQUE;
 			uint32_t materialKind = meta ? meta->materialKind : GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC;
+			float clearcoatFactor = meta ? std::clamp(meta->clearcoatFactor, 0.0f, 1.0f) : 0.0f;
+			float clearcoatRoughnessFactor = meta ? std::clamp(meta->clearcoatRoughnessFactor, 0.0f, 1.0f) : 0.0f;
 			gpuMaterials.push_back({
 				baseColor,
 				glm::vec4(roughness, metalness, emissionIntensity, transmission),
@@ -3706,7 +4470,8 @@ struct VulkanComputePreview::Impl {
 				glm::uvec4(occlusionTexture, alphaMode, transmissionTexture, materialKind),
 				glm::vec4(alphaCutoff, normalScale, occlusionStrength, volumeThickness),
 				glm::vec4(glm::clamp(attenuationColor, glm::vec3(0.0f), glm::vec3(1.0f)), std::max(attenuationDistance, 0.0f)),
-				glm::uvec4(thicknessTexture, 0u, 0u, 0u)
+				glm::uvec4(thicknessTexture, 0u, 0u, 0u),
+				glm::vec4(clearcoatFactor, clearcoatRoughnessFactor, 0.0f, 0.0f)
 			});
 		}
 
@@ -3757,6 +4522,8 @@ struct VulkanComputePreview::Impl {
 				<< ", " << sceneCounts.z << ", " << sceneCounts.w << ")";
 			logModelImport(out.str());
 		}
+		logGpuMaterialTable(modelScene, gpuMaterials, sceneCounts, textureDescriptorCount, selectedShader);
+		fallbackTextureLabels = collectFallbackTextureLabels(modelScene.textures);
 		return true;
 	}
 
@@ -3832,7 +4599,7 @@ struct VulkanComputePreview::Impl {
 			bindings[binding].binding = binding;
 			bindings[binding].descriptorCount = 1;
 			bindings[binding].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-			if (binding == kBindingTextures) {
+			if (binding == kBindingTextures || binding == kBindingEnvironment) {
 				bindings[binding].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 			}
 			else if (binding >= kBindingDenoiseResolvedHdr && binding <= kBindingDenoisePong) {
@@ -3868,7 +4635,7 @@ struct VulkanComputePreview::Impl {
 		poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 		poolSizes[0].descriptorCount = kStorageBufferDescriptorCount;
 		poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-		poolSizes[1].descriptorCount = kMaxPreviewTextures;
+		poolSizes[1].descriptorCount = kCombinedImageSamplerDescriptorCount;
 		poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 		poolSizes[2].descriptorCount = kStorageImageDescriptorCount;
 
@@ -3915,6 +4682,20 @@ struct VulkanComputePreview::Impl {
 				writes[binding].descriptorCount = kMaxPreviewTextures;
 				writes[binding].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 				writes[binding].pImageInfo = textureDescriptorInfos.data();
+				continue;
+			}
+
+			if (binding == kBindingEnvironment) {
+				if (envTexture.view == VK_NULL_HANDLE || envTexture.sampler == VK_NULL_HANDLE) {
+					return fail("Vulkan environment image descriptor is not ready");
+				}
+				imageInfos[binding] = envTexture.descriptor;
+				writes[binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+				writes[binding].dstSet = descriptorSet;
+				writes[binding].dstBinding = binding;
+				writes[binding].descriptorCount = 1;
+				writes[binding].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+				writes[binding].pImageInfo = &imageInfos[binding];
 				continue;
 			}
 
@@ -4264,6 +5045,7 @@ struct VulkanComputePreview::Impl {
 			destroyDescriptorPool();
 			modelBuffersReady = false;
 			sceneCounts = glm::uvec4(0u);
+			fallbackTextureLabels.clear();
 			selectedModel = previousModel;
 
 			// Restore the previous selection and rebuild its descriptor set.
@@ -4397,6 +5179,116 @@ struct VulkanComputePreview::Impl {
 		}
 		return importedIndex;
 	}
+
+	// Switch the active environment sky. index == -1 selects the procedural sky.
+	// Reuploads the environment image and rebuilds the descriptor set (binding 17
+	// points at the env image view/sampler, which change on every switch).
+	bool switchSky(int index) {
+		auto& skies = activeSkyEntries();
+		if (!initialized || index < -1 || index >= static_cast<int>(skies.size())) {
+			std::ostringstream out;
+			out << "setSky rejected index=" << index
+				<< " current=" << selectedSky
+				<< " initialized=" << (initialized ? "true" : "false")
+				<< " skyCount=" << skies.size();
+			logModelImport(out.str());
+			return false;
+		}
+
+		VkResult waitResult = vkDeviceWaitIdle(device);
+		if (waitResult != VK_SUCCESS) {
+			return failVk("vkDeviceWaitIdle sky switch", waitResult);
+		}
+
+		int previousSky = selectedSky;
+		destroyDescriptorPool();
+		selectedSky = index;
+		bool ready = createEnvironmentResources() && createDescriptorPoolAndSet();
+		if (!ready) {
+			logModelImport("setSky failed index=" + std::to_string(index) + "; restoring previous sky");
+			destroyDescriptorPool();
+			selectedSky = previousSky;
+			if (!(createEnvironmentResources() && createDescriptorPoolAndSet())) {
+				status = "Failed to restore environment after sky switch failure";
+				return false;
+			}
+			return false;
+		}
+
+		resetAccumState();
+		if (persistSettings) {
+			saveSelectedSkyToSettings(selectedSky);
+		}
+		{
+			std::ostringstream out;
+			out << "setSky activated index=" << selectedSky;
+			if (selectedSky >= 0) {
+				out << " name=\"" << skies[selectedSky].name << "\""
+					<< " file=\"" << skies[selectedSky].filePath << "\"";
+			}
+			else {
+				out << " name=\"Procedural Sky\"";
+			}
+			out << " envReady=" << (envReady ? "true" : "false");
+			logModelImport(out.str());
+		}
+		return true;
+	}
+
+	int importSkyFromFile(const std::string& filePath, bool persist = true) {
+		std::string rawPath = trimAscii(filePath);
+		logModelImport("import sky requested raw=\"" + rawPath + "\"");
+		if (rawPath.empty()) {
+			status = "Failed to import sky: path is empty";
+			logModelImport(status);
+			return -1;
+		}
+
+		std::optional<std::filesystem::path> resolved = resolveExistingFile(rawPath);
+		if (!resolved.has_value()) {
+			status = "Failed to import sky: file not found (" + rawPath + ")";
+			logModelImport(status);
+			return -1;
+		}
+		if (!isSupportedSkyExtension(*resolved)) {
+			status = "Failed to import sky: unsupported format, use .exr or .hdr (" + rawPath + ")";
+			logModelImport(status);
+			return -1;
+		}
+
+		std::string normalizedFile = normalizePathKey(*resolved);
+		auto& skies = activeSkyEntries();
+		for (int i = 0; i < static_cast<int>(skies.size()); ++i) {
+			if (skies[i].fileKey == normalizedFile) {
+				status = "Using existing sky: " + skies[i].name;
+				logModelImport(status + " index=" + std::to_string(i));
+				return i;
+			}
+		}
+
+		std::optional<SkyEntry> entry = buildSkyEntryForFile(*resolved);
+		if (!entry.has_value()) {
+			status = "Failed to import sky: could not build entry (" + rawPath + ")";
+			logModelImport(status);
+			return -1;
+		}
+
+		SkyEntry newEntry = *entry;
+		if (!persist) {
+			newEntry.transient = true;
+		}
+		skies.push_back(newEntry);
+		int importedIndex = static_cast<int>(skies.size()) - 1;
+
+		if (persist && persistSettings) {
+			saveSkyEntriesToSettings(skies);
+		}
+
+		status = "Imported sky: " + newEntry.name + " -> " + newEntry.filePath;
+		logModelImport("import sky added index=" + std::to_string(importedIndex)
+			+ " name=\"" + newEntry.name + "\" skyCount=" + std::to_string(skies.size()));
+		return importedIndex;
+	}
 };
 
 VulkanComputePreview::VulkanComputePreview()
@@ -4507,6 +5399,32 @@ int VulkanComputePreview::importModelFromFolder(const std::string& folderPath, b
 	return m_impl->importModelFromFolder(folderPath, persist);
 }
 
+bool VulkanComputePreview::setSky(int index) {
+	return m_impl->switchSky(index);
+}
+
+int VulkanComputePreview::skyIndex() const {
+	return m_impl->selectedSky;
+}
+
+int VulkanComputePreview::skyCount() {
+	return static_cast<int>(activeSkyEntries().size());
+}
+
+const char* VulkanComputePreview::skyName(int index) {
+	const auto& skies = activeSkyEntries();
+	if (index < 0 || index >= static_cast<int>(skies.size())) return "Procedural Sky";
+	return skies[index].name.c_str();
+}
+
+const char* VulkanComputePreview::selectedSkyFilePath() {
+	return projectSettingsState().lastSelectedSkyPath.c_str();
+}
+
+int VulkanComputePreview::importSkyFromFile(const std::string& filePath, bool persist) {
+	return m_impl->importSkyFromFile(filePath, persist);
+}
+
 bool VulkanComputePreview::modelBounds(glm::vec3& boundsMin, glm::vec3& boundsMax) const {
 	if (!m_impl->modelBuffersReady) {
 		return false;
@@ -4582,6 +5500,8 @@ GpuStats VulkanComputePreview::gpuStats() const {
 	GpuStats s{};
 	s.gpuDispatchMs = m_impl->lastGpuMs;
 	s.frameCount = m_impl->frameCount;
+	s.sceneCounts = m_impl->sceneCounts;
+	s.textureDescriptorCount = m_impl->textureDescriptorCount;
 	uint64_t raysPerSample =
 		static_cast<uint64_t>(std::max(m_impl->renderWidth, 0)) *
 		static_cast<uint64_t>(std::max(m_impl->renderHeight, 0));
@@ -4597,5 +5517,11 @@ GpuStats VulkanComputePreview::gpuStats() const {
 	s.samplesAccumulated = m_impl->currentSample;
 	s.maxSamples = m_impl->maxSamplesCached;
 	s.denoiser = m_impl->denoiser.stats();
+	s.debugView = s.denoiser.debugView;
+	s.fallbackTextureCount = static_cast<uint32_t>(m_impl->fallbackTextureLabels.size());
 	return s;
+}
+
+const std::vector<std::string>& VulkanComputePreview::fallbackTextureLabels() const {
+	return m_impl->fallbackTextureLabels;
 }

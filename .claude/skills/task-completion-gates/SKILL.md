@@ -27,6 +27,11 @@ Use this skill for any task where the user expects code changes to land in a pas
   unnecessary builds if they would dirty vendored raylib state.
 - For future headless RenderDoc implementation work, `make build-renderdoc-headless`
   and `bin/Release/NrayRenderDocHeadless --help` are the minimum gates.
+- For Vulkan lighting or performance changes, run a small headless A/B render
+  with fixed `--width`, `--height`, `--samples`, `--max-bounces`, and model
+  selection. Compare baseline `gpuDispatchMs` against an explicit
+  `--point-light-shadows` run and confirm the JSON `lighting` object matches
+  the intended toggles.
 - When Vulkan, RenderDoc, and the Python replay module are available, run one
   small capture plus report using the commands documented in
   `docs/headless-renderdoc-vulkan-plan.md`.

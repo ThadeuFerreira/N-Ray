@@ -82,8 +82,9 @@ data to decide how light is absorbed, reflected, refracted, emitted, or scattere
 into the next ray. The current glTF Vulkan compute preview is now a progressive
 path-traced renderer: it flattens glTF geometry into SSBOs, traverses the BVH in
 compute, samples base-color/metallic-roughness/normal/emissive/transmission
-textures, supports direct sun shadows, denoising guide buffers, and accumulates
-multi-bounce diffuse/specular/transmission paths.
+textures, supports selectable HDRI/EXR skies, direct sun shadows, three-point
+analytic lighting, denoising guide buffers, and accumulates multi-bounce
+diffuse/specular/transmission paths.
 
 Current transparency status: thin glass/transmission is wired and visibly affects
 the image. Volume refraction is present in the compute shader with front/back
@@ -96,6 +97,14 @@ triangles as two-sided so thin validation geometry stays visible while the
 compute path is being stabilized. See
 [`docs/gltf-vulkan-pbr-import.md`](docs/gltf-vulkan-pbr-import.md#pbr-is-the-material-model-not-the-transport-algorithm)
 for the detailed comparison.
+
+Lighting performance debugging is exposed in both the UI and headless tool.
+Use `Scene -> Vulkan -> Lighting Debug` to toggle direct diffuse/specular,
+clearcoat specular, key/fill/rim lights, specular scale, and opt-in point-light
+shadows. For repeatable checks, run `bin/Release/NrayRenderDocHeadless` with
+`--lighting-log` and compare JSON `gpuDispatchMs` with and without
+`--point-light-shadows`; the default path should not pay BVH shadow-ray cost for
+disabled lights or unshadowed point lights.
 
 Future `VK_KHR_ray_tracing_pipeline` work is tracked separately from the current
 compute preview. Use the repo-local Vulkan skill and Sascha Willems

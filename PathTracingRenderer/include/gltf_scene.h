@@ -50,6 +50,14 @@ struct GltfPreviewTexture {
 	int minFilter = 9729;
 	int magFilter = 9729;
 	std::string name;
+	int sourceImage = -1;
+	std::string sourceUri;
+	std::string mimeType;
+	bool fallback = false;
+	std::string fallbackReason;
+	bool derived = false;
+	std::string derivedFrom;
+	std::string channelStats;
 };
 
 struct GltfPreviewMaterialMeta {
@@ -61,6 +69,8 @@ struct GltfPreviewMaterialMeta {
 	float alphaCutoff = 0.5f;
 	float normalScale = 1.0f;
 	float occlusionStrength = 1.0f;
+	float clearcoatFactor = 0.0f;
+	float clearcoatRoughnessFactor = 0.0f;
 	float transmission = 0.0f;
 	float ior = 1.5f;
 	float volumeThickness = 0.0f;
@@ -75,6 +85,12 @@ struct GltfPreviewMaterialMeta {
 	uint32_t thicknessTexture = GLTF_PREVIEW_INVALID_TEXTURE;
 	uint32_t alphaMode = GLTF_PREVIEW_ALPHA_OPAQUE;
 	bool unlit = false;
+	std::string workflow = "metallicRoughness";
+	uint32_t specGlossDiffuseTexture = GLTF_PREVIEW_INVALID_TEXTURE;
+	uint32_t specGlossTexture = GLTF_PREVIEW_INVALID_TEXTURE;
+	glm::vec3 specGlossSpecularFactor = glm::vec3(1.0f);
+	float specGlossGlossinessFactor = 1.0f;
+	bool derivedMetallicRoughnessTexture = false;
 
 	uint32_t materialKind = GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC;
 	uint32_t normalizedAlphaMode = GLTF_PREVIEW_ALPHA_OPAQUE;

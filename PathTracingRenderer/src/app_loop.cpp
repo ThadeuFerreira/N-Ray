@@ -15,8 +15,11 @@
 namespace {
 VulkanPreviewShadowMode gVulkanPreviewShadowMode = VulkanPreviewShadowMode::RayTraced;
 VulkanDenoiserSettings gVulkanDenoiserSettings{};
+VulkanPreviewLightingDebugSettings gVulkanLightingDebugSettings{};
 char gModelFolderPath[512] = {};
 std::string gModelFolderImportStatus;
+char gSkyFilePath[512] = {};
+std::string gSkyImportStatus;
 
 bool vulkanMaterialPanelVisible(const RuntimeResources& runtime) {
 	return runtime.vulkanPreview.isAvailable() &&
@@ -59,6 +62,13 @@ void invalidateVulkanPostprocess(RuntimeResources& runtime) {
 	runtime.vulkanFrameValid = false;
 	runtime.vulkanFrameDispatched = false;
 	params.displayInvalidated = true;
+}
+
+void invalidateVulkanTrace(RuntimeResources& runtime) {
+	runtime.vulkanFrameValid = false;
+	runtime.vulkanFrameDispatched = false;
+	params.renderInvalidated = true;
+	params.shouldSample = false;
 }
 
 UiLayout makeUiLayout(const RuntimeResources& runtime) {
@@ -236,6 +246,63 @@ void importModelFolderFromUiPath(RuntimeResources& runtime, char* modelFolderPat
 	}
 }
 
+bool browseSkyFileByOsDialog(std::string& selectedPath) {
+#ifdef _WIN32
+	const char* command = "powershell -NoProfile -Command \"Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object System.Windows.Forms.OpenFileDialog; $dialog.Filter = 'Environment maps (*.exr;*.hdr)|*.exr;*.hdr'; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.FileName }\"";
+#elif defined(__APPLE__)
+	const char* command = "osascript -e 'POSIX path of (choose file with prompt \"Select .exr or .hdr sky\")'";
+#else
+#if __linux__
+	const char* command = "zenity --file-selection --title=\"Select .exr or .hdr sky\" --file-filter=\"Environment maps | *.exr *.hdr\" 2>/dev/null";
+	const char* fallback = "kdialog --getopenfilename \"$HOME\" \"*.exr *.hdr\" --title \"Select .exr or .hdr sky\" 2>/dev/null";
+#else
+	const char* command = "";
+#endif
+#endif
+
+#if defined(__linux__)
+	if (runFolderPickerCommand(command, selectedPath)) {
+		return true;
+	}
+	return runFolderPickerCommand(fallback, selectedPath);
+#else
+	if (command[0] == '\0') {
+		return false;
+	}
+	return runFolderPickerCommand(command, selectedPath);
+#endif
+}
+
+// Select an environment sky index (-1 = procedural). Resets accumulation so the
+// new lighting integrates from scratch.
+bool activateSky(RuntimeResources& runtime, int skyIndex, std::string& importStatus) {
+	runtime.vulkanFrameValid = false;
+	runtime.vulkanFrameDispatched = false;
+	if (!runtime.vulkanPreview.setSky(skyIndex)) {
+		importStatus = firstLine(runtime.vulkanPreview.statusMessage());
+		return false;
+	}
+	params.renderInvalidated = true;
+	params.shouldSample = false;
+	importStatus = skyIndex >= 0
+		? std::string("Selected sky: ") + VulkanComputePreview::skyName(skyIndex)
+		: std::string("Selected procedural sky");
+	return true;
+}
+
+void importSkyFromUiPath(RuntimeResources& runtime, char* skyFilePath, std::string& importStatus) {
+	std::string requestedPath = trimWhitespace(skyFilePath != nullptr ? skyFilePath : "");
+	if (requestedPath.empty()) {
+		importStatus = "Import path is empty";
+		return;
+	}
+	int importedSky = runtime.vulkanPreview.importSkyFromFile(requestedPath);
+	importStatus = firstLine(runtime.vulkanPreview.statusMessage());
+	if (importedSky >= 0) {
+		activateSky(runtime, importedSky, importStatus);
+	}
+}
+
 void updateUiHoverState() {
 	params.isMouseHoveringUI = ImGui::IsAnyItemHovered() || ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow);
 }
@@ -326,7 +393,7 @@ VulkanPreviewCamera makeVulkanPreviewCamera() {
 	return camera;
 }
 
-VulkanPreviewSettings makeVulkanPreviewSettings() {
+VulkanPreviewSettings makeVulkanPreviewSettings(RuntimeResources& runtime) {
 	VulkanPreviewSettings settings{};
 	settings.maxSamples = std::clamp(params.maxSamples, kMinSamples, kMaxSamples);
 	settings.maxBounces = std::max(0, params.maxBounces);
@@ -336,6 +403,7 @@ VulkanPreviewSettings makeVulkanPreviewSettings() {
 	settings.contrast = params.contrast;
 	settings.skyIntensity = params.skyIntensity;
 	settings.enableSky = params.enableSky;
+	settings.enableEnvironment = params.enableEnvironment;
 	settings.enableSun = params.enableSun;
 	settings.sunDir = params.sunDir;
 	settings.sunAngle = params.sunAngle;
@@ -343,6 +411,39 @@ VulkanPreviewSettings makeVulkanPreviewSettings() {
 	settings.sunIntensity = params.sunIntensity;
 	settings.shadowMode = gVulkanPreviewShadowMode;
 	settings.denoiser = gVulkanDenoiserSettings;
+
+	// Three-point lighting. Light positions are placed around the active model
+	// bounds (Z-up; the preview camera frames the model from -Y, so "front" is
+	// -Y, "right" is +X, "up" is +Z). Intensities come from the UI; positions are
+	// derived each frame so they track the model size. Falls back to a unit scene
+	// centered at the origin when no model bounds are available.
+	settings.enableThreePointLighting = params.enableThreePointLighting;
+	glm::vec3 center(0.0f);
+	float radius = 1.0f;
+	glm::vec3 boundsMin;
+	glm::vec3 boundsMax;
+	if (runtime.vulkanPreview.modelBounds(boundsMin, boundsMax)) {
+		center = (boundsMin + boundsMax) * 0.5f;
+		float r = 0.5f * glm::length(boundsMax - boundsMin);
+		if (std::isfinite(r) && r > 1e-4f) {
+			radius = r;
+		}
+	}
+
+	auto makeLight = [&](const glm::vec3& offset, const glm::vec3& color, float intensity) {
+		VulkanPreviewPointLight light;
+		light.position = center + offset * radius;
+		light.radius = radius;
+		light.color = color;
+		light.intensity = intensity;
+		return light;
+	};
+
+	// key: front-left-above (warm), fill: front-right softer (cool), rim: behind-above (neutral).
+	settings.keyLight  = makeLight(glm::vec3(-1.3f, -1.5f, 1.3f), glm::vec3(1.0f, 0.95f, 0.85f), params.keyLightIntensity);
+	settings.fillLight = makeLight(glm::vec3( 1.5f, -1.2f, 0.6f), glm::vec3(0.8f, 0.88f, 1.0f),  params.fillLightIntensity);
+	settings.rimLight  = makeLight(glm::vec3( 0.3f,  1.6f, 1.4f), glm::vec3(1.0f, 1.0f, 1.0f),   params.rimLightIntensity);
+	settings.lightingDebug = gVulkanLightingDebugSettings;
 	return settings;
 }
 
@@ -436,7 +537,7 @@ bool updateVulkanComputePreview(RuntimeResources& runtime) {
 		!displayOnlyRedraw;
 
 	if (!convergedModelFrame) {
-		VulkanPreviewSettings settings = makeVulkanPreviewSettings();
+		VulkanPreviewSettings settings = makeVulkanPreviewSettings(runtime);
 		settings.resetAccumulation = resetAccumulation;
 		settings.postprocessOnly = displayOnlyRedraw;
 		if (!runtime.vulkanPreview.render(static_cast<float>(GetTime()), makeVulkanPreviewCamera(), settings, runtime.vulkanFrame)) {
@@ -643,6 +744,57 @@ void drawVulkanMainMenuBar(RuntimeResources& runtime) {
 		if (!gModelFolderImportStatus.empty()) {
 			ImGui::TextWrapped("Import: %s", gModelFolderImportStatus.c_str());
 		}
+
+		ImGui::Separator();
+		if (ImGui::BeginMenu("Skies")) {
+			if (ImGui::MenuItem("Procedural Sky", nullptr, runtime.vulkanPreview.skyIndex() < 0)) {
+				activateSky(runtime, -1, gSkyImportStatus);
+			}
+			ImGui::Separator();
+			int skyCount = VulkanComputePreview::skyCount();
+			if (skyCount == 0) {
+				ImGui::TextDisabled("No imported skies");
+			}
+			for (int i = 0; i < skyCount; i++) {
+				bool selected = i == runtime.vulkanPreview.skyIndex();
+				if (ImGui::MenuItem(VulkanComputePreview::skyName(i), nullptr, selected)) {
+					activateSky(runtime, i, gSkyImportStatus);
+				}
+			}
+			ImGui::EndMenu();
+		}
+
+		ImGui::Separator();
+		ImGui::TextUnformatted("Import sky (.exr / .hdr)");
+		ImGui::SetNextItemWidth(440.0f);
+		if (ImGui::InputText("##menuSkyFilePath", gSkyFilePath, sizeof(gSkyFilePath), ImGuiInputTextFlags_EnterReturnsTrue)) {
+			importSkyFromUiPath(runtime, gSkyFilePath, gSkyImportStatus);
+		}
+		if (ImGui::Button("Paste##sky")) {
+			const char* clipboard = ImGui::GetClipboardText();
+			if (clipboard != nullptr) {
+				copyToPathBuffer(gSkyFilePath, sizeof(gSkyFilePath), trimWhitespace(clipboard));
+			}
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Browse##sky")) {
+			std::string selectedFile;
+			if (browseSkyFileByOsDialog(selectedFile) && !selectedFile.empty()) {
+				copyToPathBuffer(gSkyFilePath, sizeof(gSkyFilePath), selectedFile);
+				importSkyFromUiPath(runtime, gSkyFilePath, gSkyImportStatus);
+			}
+			else {
+				gSkyImportStatus = "Browse file cancelled or unavailable on this OS";
+			}
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Import##sky")) {
+			importSkyFromUiPath(runtime, gSkyFilePath, gSkyImportStatus);
+		}
+		if (!gSkyImportStatus.empty()) {
+			ImGui::TextWrapped("Sky: %s", gSkyImportStatus.c_str());
+		}
+
 		ImGui::EndMenu();
 	}
 
@@ -663,11 +815,45 @@ void drawVulkanMainMenuBar(RuntimeResources& runtime) {
 				bool selected = static_cast<int>(gVulkanPreviewShadowMode) == i;
 				if (ImGui::MenuItem(shadowLabels[i], nullptr, selected)) {
 					gVulkanPreviewShadowMode = static_cast<VulkanPreviewShadowMode>(i);
-					runtime.vulkanFrameValid = false;
-					runtime.vulkanFrameDispatched = false;
-					params.renderInvalidated = true;
+					invalidateVulkanTrace(runtime);
 				}
 			}
+			ImGui::EndMenu();
+		}
+		if (ImGui::BeginMenu("Lighting Debug")) {
+			bool changed = false;
+			changed |= ImGui::Checkbox("3-Point Lighting", &params.enableThreePointLighting);
+			changed |= ImGui::Checkbox("Key Light", &gVulkanLightingDebugSettings.keyLightEnabled);
+			ImGui::SetNextItemWidth(180.0f);
+			changed |= ImGui::SliderFloat("Key Intensity", &params.keyLightIntensity, 0.0f, 64.0f, "%.2f");
+			changed |= ImGui::Checkbox("Fill Light", &gVulkanLightingDebugSettings.fillLightEnabled);
+			ImGui::SetNextItemWidth(180.0f);
+			changed |= ImGui::SliderFloat("Fill Intensity", &params.fillLightIntensity, 0.0f, 64.0f, "%.2f");
+			changed |= ImGui::Checkbox("Rim Light", &gVulkanLightingDebugSettings.rimLightEnabled);
+			ImGui::SetNextItemWidth(180.0f);
+			changed |= ImGui::SliderFloat("Rim Intensity", &params.rimLightIntensity, 0.0f, 64.0f, "%.2f");
+			ImGui::Separator();
+			changed |= ImGui::Checkbox("Point Light Shadows", &gVulkanLightingDebugSettings.pointLightShadows);
+			changed |= ImGui::Checkbox("Direct Diffuse", &gVulkanLightingDebugSettings.directDiffuse);
+			changed |= ImGui::Checkbox("Direct Specular", &gVulkanLightingDebugSettings.directSpecular);
+			changed |= ImGui::Checkbox("Clearcoat Specular", &gVulkanLightingDebugSettings.clearcoatSpecular);
+			ImGui::SetNextItemWidth(180.0f);
+			changed |= ImGui::SliderFloat("Specular Scale", &gVulkanLightingDebugSettings.directSpecularScale, 0.0f, 4.0f, "%.2f");
+			ImGui::SetNextItemWidth(180.0f);
+			changed |= ImGui::SliderFloat("Point Light Size", &gVulkanLightingDebugSettings.pointLightSizeScale, 0.0f, 2.0f, "%.3f");
+			changed |= ImGui::Checkbox("Verbose Lighting Logs", &gVulkanLightingDebugSettings.verboseLogging);
+			if (ImGui::Button("Reset Lighting Debug")) {
+				gVulkanLightingDebugSettings = VulkanPreviewLightingDebugSettings{};
+				changed = true;
+			}
+			if (changed) {
+				invalidateVulkanTrace(runtime);
+			}
+			GpuStats gpuStats = runtime.vulkanPreview.gpuStats();
+			ImGui::Separator();
+			ImGui::Text("Sample: %.2f ms", gpuStats.gpuDispatchMs);
+			ImGui::Text("Point shadows: %s", gVulkanLightingDebugSettings.pointLightShadows ? "on" : "off");
+			ImGui::Text("Denoiser: %s", denoiserModeLabel(gVulkanDenoiserSettings.mode));
 			ImGui::EndMenu();
 		}
 		if (ImGui::BeginMenu("Denoiser")) {
@@ -769,6 +955,49 @@ void drawVulkanMainMenuBar(RuntimeResources& runtime) {
 	ImGui::EndMainMenuBar();
 }
 
+void drawMaterialControlLabel(const char* label, bool multipliedByTexture = false) {
+	ImGui::TextUnformatted(label);
+	if (multipliedByTexture) {
+		ImGui::SameLine();
+		ImGui::TextDisabled("(x tex)");
+	}
+}
+
+bool materialSliderFloat(
+	const char* label,
+	const char* id,
+	float* value,
+	float minValue,
+	float maxValue,
+	bool multipliedByTexture = false,
+	const char* format = "%.3f"
+) {
+	drawMaterialControlLabel(label, multipliedByTexture);
+	ImGui::SetNextItemWidth(-1.0f);
+	return ImGui::SliderFloat(id, value, minValue, maxValue, format);
+}
+
+bool materialDragFloat(
+	const char* label,
+	const char* id,
+	float* value,
+	float speed,
+	float minValue,
+	float maxValue,
+	bool multipliedByTexture = false,
+	const char* format = "%.3f"
+) {
+	drawMaterialControlLabel(label, multipliedByTexture);
+	ImGui::SetNextItemWidth(-1.0f);
+	return ImGui::DragFloat(id, value, speed, minValue, maxValue, format);
+}
+
+bool materialColorEdit3(const char* label, const char* id, float* value, bool multipliedByTexture = false) {
+	drawMaterialControlLabel(label, multipliedByTexture);
+	ImGui::SetNextItemWidth(-1.0f);
+	return ImGui::ColorEdit3(id, value);
+}
+
 void drawVulkanMaterialPanel(RuntimeResources& runtime, const UiLayout& layout) {
 	if (!layout.materialPanelVisible) {
 		return;
@@ -808,6 +1037,7 @@ void drawVulkanMaterialPanel(RuntimeResources& runtime, const UiLayout& layout) 
 		ImGui::TableSetColumnIndex(0);
 		ImGui::TextUnformatted("Material");
 		if (materialCount > 1) {
+			drawMaterialControlLabel("Index");
 			ImGui::SetNextItemWidth(-1.0f);
 			ImGui::SliderInt("##vulkanMaterialIndex", &selectedMaterial, 0, materialCount - 1);
 		}
@@ -829,37 +1059,15 @@ void drawVulkanMaterialPanel(RuntimeResources& runtime, const UiLayout& layout) 
 		bool changed = false;
 		ImGui::TableSetColumnIndex(1);
 		ImGui::TextUnformatted("Surface");
-		ImGui::SetNextItemWidth(-1.0f);
-		changed |= ImGui::ColorEdit3("Albedo##vulkanMaterial", &matState.baseColor.x);
-		if (matState.hasBaseColorTexture) {
-			ImGui::SameLine();
-			ImGui::TextDisabled("(x tex)");
-		}
-		ImGui::SetNextItemWidth(-1.0f);
-		changed |= ImGui::SliderFloat("Alpha##vulkanMaterial", &matState.alpha, 0.0f, 1.0f);
-		ImGui::SetNextItemWidth(-1.0f);
-		changed |= ImGui::SliderFloat("Metalness##vulkanMaterial", &matState.metalness, 0.0f, 1.0f);
-		if (matState.hasMetallicRoughnessTexture) {
-			ImGui::SameLine();
-			ImGui::TextDisabled("(x tex)");
-		}
-		ImGui::SetNextItemWidth(-1.0f);
-		changed |= ImGui::SliderFloat("Roughness##vulkanMaterial", &matState.roughness, 0.0f, 1.0f);
-		if (matState.hasMetallicRoughnessTexture) {
-			ImGui::SameLine();
-			ImGui::TextDisabled("(x tex)");
-		}
+		changed |= materialColorEdit3("Albedo", "##vulkanMaterialAlbedo", &matState.baseColor.x, matState.hasBaseColorTexture);
+		changed |= materialSliderFloat("Alpha", "##vulkanMaterialAlpha", &matState.alpha, 0.0f, 1.0f);
+		changed |= materialSliderFloat("Metalness", "##vulkanMaterialMetalness", &matState.metalness, 0.0f, 1.0f, matState.hasMetallicRoughnessTexture);
+		changed |= materialSliderFloat("Roughness", "##vulkanMaterialRoughness", &matState.roughness, 0.0f, 1.0f, matState.hasMetallicRoughnessTexture);
 
 		ImGui::TableSetColumnIndex(2);
 		ImGui::TextUnformatted("Light/Optics");
-		ImGui::SetNextItemWidth(-1.0f);
-		changed |= ImGui::ColorEdit3("Emission##vulkanMaterial", &matState.emissiveFactor.x);
-		if (matState.hasEmissiveTexture) {
-			ImGui::SameLine();
-			ImGui::TextDisabled("(x tex)");
-		}
-		ImGui::SetNextItemWidth(-1.0f);
-		changed |= ImGui::SliderFloat("Intensity##vulkanMaterial", &matState.emissiveIntensity, 0.0f, 20.0f);
+		changed |= materialColorEdit3("Emission", "##vulkanMaterialEmission", &matState.emissiveFactor.x, matState.hasEmissiveTexture);
+		changed |= materialSliderFloat("Intensity", "##vulkanMaterialEmissionIntensity", &matState.emissiveIntensity, 0.0f, 20.0f);
 
 		ImGui::Separator();
 		VulkanPreviewOpticalMode previousOpticalMode = matState.opticalMode;
@@ -869,8 +1077,9 @@ void drawVulkanMaterialPanel(RuntimeResources& runtime, const UiLayout& layout) 
 			"Thin Transmission",
 			"Volume Transmission"
 		};
+		drawMaterialControlLabel("Mode");
 		ImGui::SetNextItemWidth(-1.0f);
-		if (ImGui::Combo("Mode##vulkanMaterialOptics", &opticalModeIndex, opticalModeLabels, 3)) {
+		if (ImGui::Combo("##vulkanMaterialOptics", &opticalModeIndex, opticalModeLabels, 3)) {
 			opticalModeIndex = std::clamp(opticalModeIndex, 0, 2);
 			matState.opticalMode = static_cast<VulkanPreviewOpticalMode>(opticalModeIndex);
 			if (matState.opticalMode == VulkanPreviewOpticalMode::Coverage) {
@@ -889,30 +1098,16 @@ void drawVulkanMaterialPanel(RuntimeResources& runtime, const UiLayout& layout) 
 		}
 		ImGui::TextDisabled("%s", opticalModeLabel(matState.opticalMode));
 
-		ImGui::SetNextItemWidth(-1.0f);
-		changed |= ImGui::SliderFloat("Transmission##vulkanMaterial", &matState.transmission, 0.0f, 1.0f);
-		if (matState.hasTransmissionTexture) {
-			ImGui::SameLine();
-			ImGui::TextDisabled("(x tex)");
-		}
-		ImGui::SetNextItemWidth(-1.0f);
-		changed |= ImGui::SliderFloat("IOR##vulkanMaterial", &matState.ior, 1.0f, 2.5f);
+		changed |= materialSliderFloat("Transmission", "##vulkanMaterialTransmission", &matState.transmission, 0.0f, 1.0f, matState.hasTransmissionTexture);
+		changed |= materialSliderFloat("IOR", "##vulkanMaterialIor", &matState.ior, 1.0f, 2.5f);
 
 		if (matState.opticalMode == VulkanPreviewOpticalMode::VolumeTransmission) {
-			ImGui::SetNextItemWidth(-1.0f);
-			changed |= ImGui::DragFloat("Thickness##vulkanMaterial", &matState.volumeThickness, 0.001f, 0.0f, 10.0f, "%.4f");
-			if (matState.hasThicknessTexture) {
-				ImGui::SameLine();
-				ImGui::TextDisabled("(x tex)");
-			}
-			ImGui::SetNextItemWidth(-1.0f);
-			changed |= ImGui::ColorEdit3("Attenuation##vulkanMaterial", &matState.attenuationColor.x);
-			ImGui::SetNextItemWidth(-1.0f);
-			changed |= ImGui::DragFloat("Atten Distance##vulkanMaterial", &matState.attenuationDistance, 0.01f, 0.0f, 100.0f, "%.3f");
+			changed |= materialDragFloat("Thickness", "##vulkanMaterialThickness", &matState.volumeThickness, 0.001f, 0.0f, 10.0f, matState.hasThicknessTexture, "%.4f");
+			changed |= materialColorEdit3("Attenuation", "##vulkanMaterialAttenuation", &matState.attenuationColor.x);
+			changed |= materialDragFloat("Atten Distance", "##vulkanMaterialAttenuationDistance", &matState.attenuationDistance, 0.01f, 0.0f, 100.0f);
 		}
 		if (matState.hasNormalTexture) {
-			ImGui::SetNextItemWidth(-1.0f);
-			changed |= ImGui::SliderFloat("Normal Scale##vulkanMaterial", &matState.normalScale, 0.0f, 4.0f);
+			changed |= materialSliderFloat("Normal Scale", "##vulkanMaterialNormalScale", &matState.normalScale, 0.0f, 4.0f);
 		}
 
 		if (changed) {

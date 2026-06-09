@@ -31,6 +31,7 @@ struct GpuMaterial {
 	vec4 textureParams;
 	vec4 attenuation;
 	uvec4 volumeTextureInfo;
+	vec4 opticalParams;
 };
 
 struct GpuSettings {

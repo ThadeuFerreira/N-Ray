@@ -6,6 +6,46 @@ The recent render-worker split fixed the biggest responsiveness problem: Dear Im
 
 This report is based on static inspection of the current renderer and worker code. It does not include runtime profiling numbers yet. The next step should be to establish a repeatable benchmark scene and measure each recommendation before and after implementation.
 
+## Vulkan Preview Lighting Regression Note
+
+This file originally focused on the CPU path tracer, but the current primary
+performance surface is the Vulkan glTF compute preview. The June 2026
+environment-lighting pass introduced a concrete regression that is worth keeping
+as a future checklist item: disabled analytic lights must not trace shadow rays.
+
+The slow path was caused by direct sun shadow visibility being evaluated even
+when the sun was disabled. In a ray-traced shadow mode this made a "sun off"
+configuration still launch finite BVH visibility rays, which looked like a
+general sample-time regression. The fix is to short-circuit direct sun lighting
+before any visibility work when the sun toggle or sun intensity is off.
+
+The 3-point key/fill/rim lights now default to unshadowed direct lighting for
+performance. Finite-distance BVH shadow rays for those lights are still useful
+for diagnosis and quality comparisons, but they are an explicit debug option
+(`Point Light Shadows` in `Scene -> Vulkan -> Lighting Debug`, or
+`--point-light-shadows` in `NrayRenderDocHeadless`). Keep that default unless a
+future feature specifically budgets for the extra visibility rays.
+
+Use the headless tool for quick A/B checks before changing lighting code:
+
+```bash
+cd PathTracingRenderer
+../bin/Release/NrayRenderDocHeadless \
+  --model-index 0 --width 128 --height 128 --samples 1 --max-bounces 3 \
+  --shadow ray-traced --lighting-log --json-out /tmp/nray_light_base.json
+
+../bin/Release/NrayRenderDocHeadless \
+  --model-index 0 --width 128 --height 128 --samples 1 --max-bounces 3 \
+  --shadow ray-traced --point-light-shadows --lighting-log \
+  --json-out /tmp/nray_light_point_shadows.json
+```
+
+Compare `gpuDispatchMs` and the JSON `lighting` object. The first run should
+log `pointShadows=0`; the second should log `pointShadows=1` and is expected to
+be slower. If the baseline looks as slow as the point-shadow run, check
+`directSunLighting`, `directPointLighting`, and the `GpuSettings` feature flags
+before assuming the denoiser or HDRI sampler is at fault.
+
 ## Current Render Flow
 
 The main loop calls the path trace update from `PathTracingRenderer/src/app_loop.cpp`. When sampling is enabled, `AsyncRenderWorker` snapshots the current params, camera, screen, HDRI handle, and triangle list, then renders on a background thread.

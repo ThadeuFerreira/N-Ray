@@ -47,6 +47,21 @@ struct HeadlessOptions {
 	VulkanPreviewShadowMode shadowMode   = VulkanPreviewShadowMode::RayTraced;
 	VulkanDenoiserMode denoiserMode      = VulkanDenoiserMode::Off;
 	VulkanDenoiserDebugView debugView    = VulkanDenoiserDebugView::Final;
+	bool enableEnvironment = true;
+	bool enableThreePointLighting = true;
+	bool keyLightEnabled = true;
+	bool fillLightEnabled = true;
+	bool rimLightEnabled = true;
+	bool pointLightShadows = false;
+	bool directDiffuse = true;
+	bool directSpecular = true;
+	bool clearcoatSpecular = true;
+	bool lightingLog = false;
+	float keyLightIntensity = 16.0f;
+	float fillLightIntensity = 4.0f;
+	float rimLightIntensity = 12.0f;
+	float directSpecularScale = 1.0f;
+	float pointLightSizeScale = 0.25f;
 	bool doCapture         = false;
 	std::string captureTemplate;
 	std::string jsonOut;
@@ -67,6 +82,21 @@ static void printHelp(const char* argv0) {
 		"  --samples <count>          samples to accumulate (default 1)\n"
 		"  --max-bounces <count>      max path-trace bounces (default 5)\n"
 		"  --shadow <none|ray-traced|shadow-map>  shadow mode (default ray-traced)\n"
+		"  --no-environment         disable selected HDRI/EXR sky sampling\n"
+		"  --no-three-point         disable analytic 3-point lights\n"
+		"  --no-key-light           disable key light\n"
+		"  --no-fill-light          disable fill light\n"
+		"  --no-rim-light           disable rim light\n"
+		"  --point-light-shadows    enable finite BVH shadow rays for 3-point lights\n"
+		"  --no-direct-diffuse      disable direct diffuse lighting\n"
+		"  --no-direct-specular     disable direct GGX specular lighting\n"
+		"  --no-clearcoat-specular  disable direct clearcoat specular lighting\n"
+		"  --key-intensity <value>  key light intensity (default 16)\n"
+		"  --fill-intensity <value> fill light intensity (default 4)\n"
+		"  --rim-intensity <value>  rim light intensity (default 12)\n"
+		"  --specular-scale <value> direct specular scale (default 1)\n"
+		"  --point-light-size <value> scene-radius scale for finite point lights (default 0.25)\n"
+		"  --lighting-log           enable [VulkanLighting] diagnostics\n"
 		"  --denoiser <off|spatial-atrous>        denoiser (default off)\n"
 		"  --debug-view <final|raw|denoised|normal|albedo|depth|material-id|instance-id>\n"
 		"  --capture                  arm RenderDoc capture for next dispatch\n"
@@ -119,6 +149,38 @@ static HeadlessOptions parseArgs(int argc, char** argv) {
 				opts.shadowMode = VulkanPreviewShadowMode::ShadowMap;
 			else
 				opts.shadowMode = VulkanPreviewShadowMode::RayTraced;
+		} else if (std::strcmp(a, "--no-environment") == 0) {
+			opts.enableEnvironment = false;
+		} else if (std::strcmp(a, "--no-three-point") == 0) {
+			opts.enableThreePointLighting = false;
+		} else if (std::strcmp(a, "--no-key-light") == 0) {
+			opts.keyLightEnabled = false;
+		} else if (std::strcmp(a, "--no-fill-light") == 0) {
+			opts.fillLightEnabled = false;
+		} else if (std::strcmp(a, "--no-rim-light") == 0) {
+			opts.rimLightEnabled = false;
+		} else if (std::strcmp(a, "--point-light-shadows") == 0) {
+			opts.pointLightShadows = true;
+		} else if (std::strcmp(a, "--no-point-light-shadows") == 0) {
+			opts.pointLightShadows = false;
+		} else if (std::strcmp(a, "--no-direct-diffuse") == 0) {
+			opts.directDiffuse = false;
+		} else if (std::strcmp(a, "--no-direct-specular") == 0) {
+			opts.directSpecular = false;
+		} else if (std::strcmp(a, "--no-clearcoat-specular") == 0) {
+			opts.clearcoatSpecular = false;
+		} else if (std::strcmp(a, "--key-intensity") == 0) {
+			opts.keyLightIntensity = std::atof(nextArg(i, "--key-intensity"));
+		} else if (std::strcmp(a, "--fill-intensity") == 0) {
+			opts.fillLightIntensity = std::atof(nextArg(i, "--fill-intensity"));
+		} else if (std::strcmp(a, "--rim-intensity") == 0) {
+			opts.rimLightIntensity = std::atof(nextArg(i, "--rim-intensity"));
+		} else if (std::strcmp(a, "--specular-scale") == 0) {
+			opts.directSpecularScale = std::atof(nextArg(i, "--specular-scale"));
+		} else if (std::strcmp(a, "--point-light-size") == 0) {
+			opts.pointLightSizeScale = std::atof(nextArg(i, "--point-light-size"));
+		} else if (std::strcmp(a, "--lighting-log") == 0) {
+			opts.lightingLog = true;
 		} else if (std::strcmp(a, "--denoiser") == 0) {
 			const char* v = nextArg(i, "--denoiser");
 			if (std::strcmp(v, "spatial-atrous") == 0)
@@ -151,6 +213,11 @@ static HeadlessOptions parseArgs(int argc, char** argv) {
 	opts.samples = std::clamp(opts.samples, kMinSamples, kMaxSamples);
 	if (opts.width  < 1) opts.width  = 1;
 	if (opts.height < 1) opts.height = 1;
+	opts.keyLightIntensity = std::max(opts.keyLightIntensity, 0.0f);
+	opts.fillLightIntensity = std::max(opts.fillLightIntensity, 0.0f);
+	opts.rimLightIntensity = std::max(opts.rimLightIntensity, 0.0f);
+	opts.directSpecularScale = std::max(opts.directSpecularScale, 0.0f);
+	opts.pointLightSizeScale = std::max(opts.pointLightSizeScale, 0.0f);
 	return opts;
 }
 
@@ -204,6 +271,50 @@ static VulkanPreviewCamera defaultCamera(float aspect) {
 	return cam;
 }
 
+static void applyThreePointLighting(
+	VulkanPreviewSettings& settings,
+	const HeadlessOptions& opts,
+	bool hasModelBounds,
+	const glm::vec3& boundsMin,
+	const glm::vec3& boundsMax)
+{
+	settings.enableEnvironment = opts.enableEnvironment;
+	settings.enableThreePointLighting = opts.enableThreePointLighting;
+	settings.lightingDebug.keyLightEnabled = opts.keyLightEnabled;
+	settings.lightingDebug.fillLightEnabled = opts.fillLightEnabled;
+	settings.lightingDebug.rimLightEnabled = opts.rimLightEnabled;
+	settings.lightingDebug.pointLightShadows = opts.pointLightShadows;
+	settings.lightingDebug.directDiffuse = opts.directDiffuse;
+	settings.lightingDebug.directSpecular = opts.directSpecular;
+	settings.lightingDebug.clearcoatSpecular = opts.clearcoatSpecular;
+	settings.lightingDebug.verboseLogging = opts.lightingLog;
+	settings.lightingDebug.directSpecularScale = opts.directSpecularScale;
+	settings.lightingDebug.pointLightSizeScale = opts.pointLightSizeScale;
+
+	glm::vec3 center(0.0f);
+	float radius = 1.0f;
+	if (hasModelBounds) {
+		center = (boundsMin + boundsMax) * 0.5f;
+		float r = 0.5f * glm::length(boundsMax - boundsMin);
+		if (std::isfinite(r) && r > 1e-4f) {
+			radius = r;
+		}
+	}
+
+	auto makeLight = [&](const glm::vec3& offset, const glm::vec3& color, float intensity) {
+		VulkanPreviewPointLight light;
+		light.position = center + offset * radius;
+		light.radius = radius;
+		light.color = color;
+		light.intensity = intensity;
+		return light;
+	};
+
+	settings.keyLight  = makeLight(glm::vec3(-1.3f, -1.5f, 1.3f), glm::vec3(1.0f, 0.95f, 0.85f), opts.keyLightIntensity);
+	settings.fillLight = makeLight(glm::vec3( 1.5f, -1.2f, 0.6f), glm::vec3(0.8f, 0.88f, 1.0f),  opts.fillLightIntensity);
+	settings.rimLight  = makeLight(glm::vec3( 0.3f,  1.6f, 1.4f), glm::vec3(1.0f, 1.0f, 1.0f),   opts.rimLightIntensity);
+}
+
 // ---------------------------------------------------------------------------
 // Settings builder
 // ---------------------------------------------------------------------------
@@ -218,7 +329,9 @@ static VulkanPreviewSettings buildSettings(const HeadlessOptions& opts) {
 	s.contrast        = 0.8f;
 	s.skyIntensity    = 0.75f;
 	s.enableSky       = true;
+	s.enableEnvironment = opts.enableEnvironment;
 	s.enableSun       = false;
+	s.enableThreePointLighting = opts.enableThreePointLighting;
 	s.shadowMode      = opts.shadowMode;
 	s.denoiser.mode   = opts.denoiserMode;
 	s.denoiser.debugView = opts.debugView;
@@ -261,6 +374,20 @@ static void escapeJson(std::ostream& out, const std::string& s) {
 	}
 }
 
+static const char* debugViewName(VulkanDenoiserDebugView view) {
+	switch (view) {
+	case VulkanDenoiserDebugView::Final: return "final";
+	case VulkanDenoiserDebugView::RawAccumulation: return "raw";
+	case VulkanDenoiserDebugView::DenoisedPreview: return "denoised";
+	case VulkanDenoiserDebugView::Normal: return "normal";
+	case VulkanDenoiserDebugView::Albedo: return "albedo";
+	case VulkanDenoiserDebugView::Depth: return "depth";
+	case VulkanDenoiserDebugView::MaterialId: return "material-id";
+	case VulkanDenoiserDebugView::InstanceId: return "instance-id";
+	default: return "unknown";
+	}
+}
+
 static bool saveJson(const std::string& path,
 	const HeadlessOptions& opts,
 	const VulkanComputePreview& preview,
@@ -274,6 +401,7 @@ static bool saveJson(const std::string& path,
 	}
 
 	GpuStats stats = preview.gpuStats();
+	const std::vector<std::string>& fallbackTextures = preview.fallbackTextureLabels();
 	const char* shaderName = VulkanComputePreview::shaderName(preview.shaderIndex());
 	const char* modelName  = VulkanComputePreview::modelName(preview.modelIndex());
 
@@ -290,6 +418,35 @@ static bool saveJson(const std::string& path,
 	f << "  \"converged\": " << (preview.converged() ? "true" : "false") << ",\n";
 	f << "  \"gpuDispatchMs\": " << stats.gpuDispatchMs << ",\n";
 	f << "  \"primaryRaysPerSec\": " << stats.primaryRaysPerSec << ",\n";
+	f << "  \"lighting\": {"
+		<< "\"environment\": " << (opts.enableEnvironment ? "true" : "false") << ", "
+		<< "\"threePoint\": " << (opts.enableThreePointLighting ? "true" : "false") << ", "
+		<< "\"keyEnabled\": " << (opts.keyLightEnabled ? "true" : "false") << ", "
+		<< "\"fillEnabled\": " << (opts.fillLightEnabled ? "true" : "false") << ", "
+		<< "\"rimEnabled\": " << (opts.rimLightEnabled ? "true" : "false") << ", "
+		<< "\"pointLightShadows\": " << (opts.pointLightShadows ? "true" : "false") << ", "
+		<< "\"directDiffuse\": " << (opts.directDiffuse ? "true" : "false") << ", "
+		<< "\"directSpecular\": " << (opts.directSpecular ? "true" : "false") << ", "
+		<< "\"clearcoatSpecular\": " << (opts.clearcoatSpecular ? "true" : "false") << ", "
+		<< "\"keyIntensity\": " << opts.keyLightIntensity << ", "
+		<< "\"fillIntensity\": " << opts.fillLightIntensity << ", "
+		<< "\"rimIntensity\": " << opts.rimLightIntensity << ", "
+		<< "\"specularScale\": " << opts.directSpecularScale << ", "
+		<< "\"pointLightSize\": " << opts.pointLightSizeScale << "},\n";
+	f << "  \"sceneCounts\": {"
+		<< "\"triangles\": " << stats.sceneCounts.x << ", "
+		<< "\"bvhNodes\": " << stats.sceneCounts.y << ", "
+		<< "\"materials\": " << stats.sceneCounts.z << ", "
+		<< "\"textures\": " << stats.sceneCounts.w << "},\n";
+	f << "  \"textureDescriptorCount\": " << stats.textureDescriptorCount << ",\n";
+	f << "  \"debugView\": \"" << debugViewName(stats.debugView) << "\",\n";
+	f << "  \"fallbackTextureCount\": " << stats.fallbackTextureCount << ",\n";
+	f << "  \"fallbackTextures\": [";
+	for (size_t i = 0; i < fallbackTextures.size(); ++i) {
+		if (i > 0) f << ", ";
+		f << "\""; escapeJson(f, fallbackTextures[i]); f << "\"";
+	}
+	f << "],\n";
 	f << "  \"status\": \""; escapeJson(f, preview.statusMessage()); f << "\",\n";
 	f << "  \"captures\": [";
 	for (size_t i = 0; i < capturePaths.size(); ++i) {
@@ -474,6 +631,7 @@ int main(int argc, char** argv) {
 
 	// --- Build settings ---
 	VulkanPreviewSettings settings = buildSettings(opts);
+	applyThreePointLighting(settings, opts, hasModel && preview.modelBounds(bmin, bmax), bmin, bmax);
 
 	// --- Arm capture ---
 	uint32_t capturesBefore = currentCaptureCount();

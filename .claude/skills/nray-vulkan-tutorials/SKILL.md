@@ -1,6 +1,6 @@
 ---
 name: nray-vulkan-tutorials
-description: Use when working on Vulkan issues in the N-Ray repository, especially compute shader experiments, Vulkan hello-world/window bring-up, VulkanCore wrapper usage, synchronization barriers, descriptor sets, shader compilation, RenderDoc frame capture/resource inspection, headless RenderDoc capture via NrayRenderDocHeadless (bin/Release/NrayRenderDocHeadless — no raylib, no ImGui, renderdoccmd capture, JSON output, setPersistSettings), glTF asset import/conversion/skinning/animation reference examples, Vulkan PBR pipelines (material push constants, IBL pre-computation, irradiance/BRDF-LUT/prefiltered-cube descriptor layouts, textured PBR with tangent vertex attributes), hardware ray tracing (VK_KHR_ray_tracing_pipeline, BLAS/TLAS build, SBT layout, raygen/miss/closesthit/anyhit/intersection/callable shader groups, frame accumulation, glTF ray tracing with descriptor indexing, recursive secondary rays for shadows and reflections via multiple miss shaders/ray payloads/iterate-in-raygen bounce loops), or porting CPU path tracing concepts toward Vulkan compute or HW ray tracing. Always check the local ogldev tutorial tree under /home/thadeu/projects/N-Ray/tutorials/ogldev/Vulkan, the vendored glTF loaders under /home/thadeu/projects/N-Ray/tutorials/saschawillems/gltf, and the upstream Sascha Willems gltfskinning and ray tracing example guides before designing Vulkan or glTF code from scratch. Scope is Vulkan-first: only touch CPU path-tracer internals when explicitly requested by the user.
+description: Use when working on Vulkan issues in the N-Ray repository, especially compute shader experiments, Vulkan hello-world/window bring-up, VulkanCore wrapper usage, synchronization barriers, descriptor sets, shader compilation, RenderDoc frame capture/resource inspection, headless RenderDoc capture via NrayRenderDocHeadless (bin/Release/NrayRenderDocHeadless — no raylib, no ImGui, renderdoccmd capture, JSON output, setPersistSettings), Vulkan preview lighting/performance regression checks, glTF asset import/conversion/skinning/animation reference examples, Vulkan PBR pipelines (material push constants, IBL pre-computation, irradiance/BRDF-LUT/prefiltered-cube descriptor layouts, textured PBR with tangent vertex attributes), hardware ray tracing (VK_KHR_ray_tracing_pipeline, BLAS/TLAS build, SBT layout, raygen/miss/closesthit/anyhit/intersection/callable shader groups, frame accumulation, glTF ray tracing with descriptor indexing, recursive secondary rays for shadows and reflections via multiple miss shaders/ray payloads/iterate-in-raygen bounce loops), or porting CPU path tracing concepts toward Vulkan compute or HW ray tracing. Always check the local ogldev tutorial tree under /home/thadeu/projects/N-Ray/tutorials/ogldev/Vulkan, the vendored glTF loaders under /home/thadeu/projects/N-Ray/tutorials/saschawillems/gltf, and the upstream Sascha Willems gltfskinning and ray tracing example guides before designing Vulkan or glTF code from scratch. Scope is Vulkan-first: only touch CPU path-tracer internals when explicitly requested by the user.
 ---
 
 # N-Ray Vulkan Tutorials
@@ -245,6 +245,16 @@ renderdoccmd capture --wait-for-exit \
 
 # Offline report (requires renderdoc Python module from qrenderdoc or custom build):
 python3 tools/renderdoc_capture_report.py build/renderdoc/nray_headless_capture.rdc --verbose
+
+# Lighting performance A/B:
+../bin/Release/NrayRenderDocHeadless \
+  --model-index 0 --width 128 --height 128 --samples 1 --max-bounces 3 \
+  --shadow ray-traced --lighting-log --json-out /tmp/nray_light_base.json
+
+../bin/Release/NrayRenderDocHeadless \
+  --model-index 0 --width 128 --height 128 --samples 1 --max-bounces 3 \
+  --shadow ray-traced --point-light-shadows --lighting-log \
+  --json-out /tmp/nray_light_point_shadows.json
 ```
 
 Key behavior:
@@ -260,10 +270,50 @@ Key behavior:
 - The RenderDoc Python module (`renderdoc`) is not in the Arch Linux system
   package; `renderdoc_capture_report.py` exits with clear guidance if missing.
   The `.rdc` is always valid for manual `qrenderdoc` inspection.
+- The JSON output includes `gpuDispatchMs`, `primaryRaysPerSec`, `sceneCounts`,
+  and a `lighting` object. Use those fields for small performance comparisons
+  instead of judging only by screenshot quality.
 
 Source: `PathTracingRenderer/headless/main_headless.cpp`,
 `PathTracingRenderer/headless/stb_impl.cpp`,
 `tools/renderdoc_capture_report.py`. Build target: `make build-renderdoc-headless`.
+
+## Vulkan Preview Lighting Performance
+
+For lighting or firefly regressions in the Vulkan glTF compute preview, start at
+the direct-light controls before changing denoising, material import, or BVH
+traversal.
+
+Current contract:
+
+- Selectable `.exr`/`.hdr` skies are sampled through descriptor binding 17. A
+  1x1 fallback environment image must stay bound when no sky is loaded.
+- The shader `GpuSettings` layout is mirrored by C++ `GpuSettings`; extend both
+  structs, size asserts, descriptor writes, SPIR-V headers, ImGui controls, and
+  headless JSON output together.
+- `directSunLighting` must return before shadow visibility when the sun is
+  disabled or its intensity is zero. A disabled light should not trace shadow
+  rays.
+- Three-point key/fill/rim point lights default to unshadowed direct lighting.
+  Finite-distance BVH point-light shadows are intentionally opt-in via
+  `Scene -> Vulkan -> Lighting Debug -> Point Light Shadows` or
+  `NrayRenderDocHeadless --point-light-shadows`.
+- `--lighting-log` and `NRAY_VULKAN_LIGHTING_LOG=1` print a one-shot
+  `[VulkanLighting]` line with environment, shadow, diffuse/specular,
+  clearcoat, intensity, and denoiser state. Check that log before guessing which
+  feature path is active.
+
+Fast regression loop:
+
+1. Run the baseline headless command above and record `gpuDispatchMs`.
+2. Run the same command with `--point-light-shadows`; it should be slower and
+   the JSON should show `"pointLightShadows": true`.
+3. If the baseline is already as slow as the point-shadow run, inspect
+   `vulkan_gltf_flat.comp` direct-light gates and the C++ `lightingControls`
+   upload before investigating denoiser or environment sampling.
+4. For fireflies, isolate direct specular with `--no-direct-specular`,
+   `--specular-scale <value>`, and the ImGui `Lighting Debug` controls. Keep
+   accumulation resets wired through the existing invalidation path.
 
 ## N-Ray Compute Migration Guardrails
 

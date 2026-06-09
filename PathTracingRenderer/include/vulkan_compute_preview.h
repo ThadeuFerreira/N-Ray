@@ -18,6 +18,26 @@ struct VulkanPreviewCamera {
 	float aspect = 1.0f;
 };
 
+struct VulkanPreviewPointLight {
+	glm::vec3 position = glm::vec3(0.0f);
+	float radius = 1.0f;
+	glm::vec3 color = glm::vec3(1.0f);
+	float intensity = 1.0f;
+};
+
+struct VulkanPreviewLightingDebugSettings {
+	bool keyLightEnabled = true;
+	bool fillLightEnabled = true;
+	bool rimLightEnabled = true;
+	bool pointLightShadows = false;
+	bool directDiffuse = true;
+	bool directSpecular = true;
+	bool clearcoatSpecular = true;
+	bool verboseLogging = false;
+	float directSpecularScale = 1.0f;
+	float pointLightSizeScale = 0.25f;
+};
+
 enum class VulkanPreviewShadowMode : uint32_t {
 	None = 0,
 	RayTraced = 1,
@@ -89,11 +109,17 @@ struct VulkanPreviewSettings {
 	float contrast = 0.8f;
 	float skyIntensity = 0.75f;
 	bool enableSky = true;
+	bool enableEnvironment = true;
 	bool enableSun = false;
 	glm::vec3 sunDir = glm::vec3(0.0f, 0.0f, 1.0f);
 	float sunAngle = 7.53f;
 	glm::vec3 sunColor = glm::vec3(1.0f, 1.0f, 0.95f);
 	float sunIntensity = 100.0f;
+	bool enableThreePointLighting = true;
+	VulkanPreviewPointLight keyLight;
+	VulkanPreviewPointLight fillLight;
+	VulkanPreviewPointLight rimLight;
+	VulkanPreviewLightingDebugSettings lightingDebug;
 	VulkanPreviewShadowMode shadowMode = VulkanPreviewShadowMode::RayTraced;
 	VulkanDenoiserSettings denoiser;
 	bool resetAccumulation = false;
@@ -143,6 +169,10 @@ struct GpuStats {
 	double primaryRaysPerSec = 0.0;
 	uint32_t frameCount = 0;
 	uint64_t primaryRaysTraced = 0;
+	glm::uvec4 sceneCounts = glm::uvec4(0u);
+	uint32_t textureDescriptorCount = 0;
+	VulkanDenoiserDebugView debugView = VulkanDenoiserDebugView::Final;
+	uint32_t fallbackTextureCount = 0;
 	uint64_t localHeapBytes = 0;
 	uint64_t localHeapUsed = 0;
 	uint64_t pixelBufferBytes = 0;
@@ -179,6 +209,7 @@ public:
 	int height() const;
 	const std::string& statusMessage() const;
 	GpuStats gpuStats() const;
+	const std::vector<std::string>& fallbackTextureLabels() const;
 
 	bool setShader(int index);
 	int shaderIndex() const;
@@ -194,6 +225,13 @@ public:
 	static const char* modelName(int index);
 	int importModelFromFolder(const std::string& folderPath, bool persist = true);
 	bool modelBounds(glm::vec3& boundsMin, glm::vec3& boundsMax) const;
+
+	bool setSky(int index);
+	int skyIndex() const;
+	static int skyCount();
+	static const char* skyName(int index);
+	static const char* selectedSkyFilePath();
+	int importSkyFromFile(const std::string& filePath, bool persist = true);
 
 	// Live material overrides for the active glTF model preview. materialCount()
 	// is 0 unless a model's buffers are loaded. setMaterialState re-uploads the

@@ -206,6 +206,16 @@ renderdoccmd capture \
   --model-index 0 --samples 8 \
   --denoiser spatial-atrous --debug-view denoised \
   --json-out /tmp/denoised.json --ppm-out /tmp/denoised.ppm
+
+# Lighting performance A/B
+../bin/Release/NrayRenderDocHeadless \
+  --model-index 0 --width 128 --height 128 --samples 1 --max-bounces 3 \
+  --shadow ray-traced --lighting-log --json-out /tmp/nray_light_base.json
+
+../bin/Release/NrayRenderDocHeadless \
+  --model-index 0 --width 128 --height 128 --samples 1 --max-bounces 3 \
+  --shadow ray-traced --point-light-shadows --lighting-log \
+  --json-out /tmp/nray_light_point_shadows.json
 ```
 
 The `--help` flag prints all options with valid enum values.
@@ -229,6 +239,10 @@ The `--help` flag prints all options with valid enum values.
 - Startup loads `lastSelectedModelFolder` from `project_settings.json`, which
   can cause a model to load and then be immediately replaced by `--model-index`.
   This is normal; the wasted load takes ~1 s for large models.
+- Lighting options are included in the JSON `lighting` object and mirrored by
+  `[VulkanLighting]` logs when `--lighting-log` is passed. Keep
+  `--point-light-shadows` as an explicit A/B switch; the default path should not
+  pay finite-distance BVH shadow rays for key/fill/rim lights.
 - The RenderDoc Python module (`renderdoc`) is not in the Arch Linux package and
   is not available at the system level. The `tools/renderdoc_capture_report.py`
   script detects this and exits with clear setup guidance. The `.rdc` file is
@@ -245,6 +259,17 @@ The `--help` flag prints all options with valid enum values.
   "samplesRequested": 1, "samplesAccumulated": 1,
   "converged": true,
   "gpuDispatchMs": 15.26, "primaryRaysPerSec": 1.72e+07,
+  "lighting": {
+    "environment": true, "threePoint": true,
+    "pointLightShadows": false,
+    "directDiffuse": true, "directSpecular": true,
+    "clearcoatSpecular": true,
+    "specularScale": 1.0, "pointLightSize": 0.25
+  },
+  "sceneCounts": {
+    "triangles": 1000, "bvhNodes": 511,
+    "materials": 8, "textures": 12
+  },
   "status": "...",
   "captures": ["/path/to/nray_headless_capture.rdc"]
 }
@@ -252,7 +277,9 @@ The `--help` flag prints all options with valid enum values.
 
 `captures` is `[]` when `--capture` was not passed or RenderDoc was not
 injected. `status` reflects the last status message from
-`VulkanComputePreview::statusMessage()`.
+`VulkanComputePreview::statusMessage()`. `lighting.pointLightShadows` should be
+false for the default performance baseline and true only for the explicit
+point-shadow comparison run.
 
 **Offline report script**
 

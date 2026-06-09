@@ -1,4 +1,6 @@
 {
+    "lastSelectedModelFolder": "assets/2024_lbsilhouette_works_murcielago_gt_evo",
+    "lastSelectedSky": "/home/thadeu/Downloads/sunny_rose_garden_2k.exr",
     "models": [
         {
             "folder": "assets/2018_garage_mak_nissan_s15_silvia_-_reggie_mah",
@@ -31,6 +33,64 @@
         {
             "folder": "assets/wolverine_-_wolverine_-_x-2099_bundle",
             "name": "Wolverine X-2099"
+        },
+        {
+            "folder": "/home/thadeu/Downloads/luna_snow_-_sonic_trailblazer",
+            "name": "luna_snow_-_sonic_trailblazer"
+        },
+        {
+            "folder": "/home/thadeu/Downloads/spartan_armour_mkv_-_halo_reach",
+            "name": "spartan_armour_mkv_-_halo_reach"
+        },
+        {
+            "folder": "/home/thadeu/Downloads/beretta_m9_gameready",
+            "name": "beretta_m9_gameready"
+        },
+        {
+            "folder": "/home/thadeu/Downloads/old_lowa_gore-tex_boot_2021__free",
+            "name": "old_lowa_gore-tex_boot_2021__free"
+        },
+        {
+            "folder": "/home/thadeu/Downloads/model_50a_-_hawksbill_sea_turtle",
+            "name": "model_50a_-_hawksbill_sea_turtle"
+        },
+        {
+            "folder": "/home/thadeu/Downloads/nike_air_zoom_pegasus_36",
+            "name": "nike_air_zoom_pegasus_36"
+        },
+        {
+            "folder": "/home/thadeu/Downloads/crystal_glass_decanter",
+            "name": "crystal_glass_decanter"
+        },
+        {
+            "folder": "/home/thadeu/Downloads/drogon__game_of_thrones_dragon",
+            "name": "drogon__game_of_thrones_dragon"
+        },
+        {
+            "folder": "/home/thadeu/Downloads/helmet_with_grotesque_visor",
+            "name": "helmet_with_grotesque_visor"
+        },
+        {
+            "folder": "/home/thadeu/Downloads/laocoon_and_his_sons",
+            "name": "laocoon_and_his_sons"
+        },
+        {
+            "folder": "/home/thadeu/Downloads/glass_of_water",
+            "name": "glass_of_water"
+        },
+        {
+            "folder": "/home/thadeu/Downloads/helmet_v1",
+            "name": "helmet_v1"
+        },
+        {
+            "folder": "/home/thadeu/Downloads/wine_decanter_and_glass",
+            "name": "wine_decanter_and_glass"
+        }
+    ],
+    "skies": [
+        {
+            "file": "/home/thadeu/Downloads/sunny_rose_garden_2k.exr",
+            "name": "Sunny Rose Garden"
         }
     ]
 }

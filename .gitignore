@@ -370,6 +370,7 @@ MigrationBackup/
 FodyWeavers.xsd
 # Premake-generated makefiles/project files (N-Ray)
 /build/
+/extra-docs/
 
 /tutorials
 /assets

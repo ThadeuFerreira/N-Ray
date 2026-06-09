@@ -39,6 +39,7 @@ struct Params {
 	bool russianRoulette = true;
 	int rrMinBounces = 3;
 	bool enableSky = true;
+	bool enableEnvironment = true;
 	float skyIntensity = 0.75f;
 	float blur = 1.0f;
 	float exposure = 1.0f;
@@ -49,6 +50,10 @@ struct Params {
 	glm::vec3 sunColor = { 1.0f, 1.0f, 0.95f };
 	float sunIntensity = 100.0f;
 	float sunAngle = 7.53f;
+	bool enableThreePointLighting = true;
+	float keyLightIntensity = 16.0f;
+	float fillLightIntensity = 4.0f;
+	float rimLightIntensity = 12.0f;
 	size_t emissiveAmount = 0;
 
 	bool renderStatsActive = false;

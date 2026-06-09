@@ -21,17 +21,20 @@ CONFIG     ?= release_x64
 PERF_CONFIG := performance_x64
 RAYLIB_DIR := vendor/raylib/src
 RAYLIB_LIB := $(RAYLIB_DIR)/libraylib.a
+RAYLIB_CONFIG := $(RAYLIB_DIR)/config.h
 
 all: build
 
 # Build the static raylib library from the vendored source. raylib disables HDR
-# loading by default (SUPPORT_FILEFORMAT_HDR 0); the renderer hard-depends on
-# textures/HDRI.hdr, so enable it here before building. vendor/raylib is a git
-# submodule, so doing this in the recipe survives a fresh `git submodule update`
-# (which would otherwise reset config.h and silently drop HDR support).
-$(RAYLIB_LIB):
-	@grep -q 'SUPPORT_FILEFORMAT_HDR      1' $(RAYLIB_DIR)/config.h || \
-		sed -i 's/\(#[[:space:]]*define[[:space:]]\+SUPPORT_FILEFORMAT_HDR[[:space:]]\+\)0/\11/' $(RAYLIB_DIR)/config.h
+# and JPG loading by default; the renderer needs HDR for textures/HDRI.hdr and
+# JPG for glTF color/normal maps, so enable both before building. vendor/raylib
+# is a git submodule, so doing this in the recipe survives a fresh
+# `git submodule update` that would otherwise reset config.h.
+$(RAYLIB_LIB): $(RAYLIB_CONFIG)
+	@grep -q 'SUPPORT_FILEFORMAT_HDR      1' $(RAYLIB_CONFIG) || \
+		sed -i 's/\(#[[:space:]]*define[[:space:]]\+SUPPORT_FILEFORMAT_HDR[[:space:]]\+\)0/\11/' $(RAYLIB_CONFIG)
+	@grep -q 'SUPPORT_FILEFORMAT_JPG      1' $(RAYLIB_CONFIG) || \
+		sed -i 's/\(#[[:space:]]*define[[:space:]]\+SUPPORT_FILEFORMAT_JPG[[:space:]]\+\)0/\11/' $(RAYLIB_CONFIG)
 	$(MAKE) -C $(RAYLIB_DIR) PLATFORM=PLATFORM_DESKTOP RAYLIB_LIBTYPE=STATIC
 
 raylib: $(RAYLIB_LIB)

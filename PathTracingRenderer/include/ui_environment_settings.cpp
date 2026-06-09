@@ -58,6 +58,31 @@ void UI::drawSkySettings(Params& params, const LayoutSizes& sizes) {
 		markRenderDirty(params);
 	}
 
+	if (buttonHelper("Enable Environment", "Use selected HDRI/EXR sky for ray misses and reflections", sizes.button, params.enableEnvironment)) {
+		markRenderDirty(params);
+	}
+
+	ImGui::Spacing();
+	ImGui::Separator();
+
+	sectionHeader("Three Point Lighting");
+
+	if (buttonHelper("Enable 3-Point Lighting", "Enables analytic key/fill/rim lights (Vulkan preview)", sizes.button, params.enableThreePointLighting)) {
+		markRenderDirty(params);
+	}
+
+	if (sliderHelper("Key Intensity", "Main light intensity", sizes.slider, params.keyLightIntensity, 0.0f, 64.0f, LogSlider)) {
+		markRenderDirty(params);
+	}
+
+	if (sliderHelper("Fill Intensity", "Fill light intensity (softens shadows)", sizes.slider, params.fillLightIntensity, 0.0f, 64.0f, LogSlider)) {
+		markRenderDirty(params);
+	}
+
+	if (sliderHelper("Rim Intensity", "Rim/back light intensity (edge highlight)", sizes.slider, params.rimLightIntensity, 0.0f, 64.0f, LogSlider)) {
+		markRenderDirty(params);
+	}
+
 	ImGui::Spacing();
 	ImGui::Separator();
 }
