@@ -19,7 +19,7 @@ void UI::drawRenderSettings(Params& params, const LayoutSizes& sizes) {
 		markRenderDirty(params);
 	}
 
-	if (sliderHelper("Rays Per Pixel", "Amount of rays each pixel traces per sample", sizes.slider, params.raysPerPixel, 1, 8)) {
+	if (sliderHelper("Rays Per Pixel", "Amount of rays each pixel traces per sample", sizes.slider, params.raysPerPixel, kMinRaysPerPixel, kMaxRaysPerPixel)) {
 		markRenderDirty(params);
 	}
 

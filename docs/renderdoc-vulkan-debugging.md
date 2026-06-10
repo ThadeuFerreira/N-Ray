@@ -240,9 +240,14 @@ The `--help` flag prints all options with valid enum values.
   can cause a model to load and then be immediately replaced by `--model-index`.
   This is normal; the wasted load takes ~1 s for large models.
 - Lighting options are included in the JSON `lighting` object and mirrored by
-  `[VulkanLighting]` logs when `--lighting-log` is passed. Keep
-  `--point-light-shadows` as an explicit A/B switch; the default path should not
-  pay finite-distance BVH shadow rays for key/fill/rim lights.
+  `[VulkanLighting]` logs when `--lighting-log` is passed. `--point-light-shadows`
+  is now the **global shadow master**: it gates ALL finite-distance BVH shadows —
+  the sun *and* the key/fill/rim lights. It defaults off, so the baseline pays no
+  shadow rays. With the master on, per-light `--no-key-light-shadows`,
+  `--no-fill-light-shadows`, and `--no-rim-light-shadows` turn off individual
+  point-light shadows (effective point-light shadow = master AND per-light flag).
+  Because the master also gates the sun, an A/B that wants sun shadows from
+  `--shadow ray-traced` must also pass `--point-light-shadows`.
 - The RenderDoc Python module (`renderdoc`) is not in the Arch Linux package and
   is not available at the system level. The `tools/renderdoc_capture_report.py`
   script detects this and exits with clear setup guidance. The `.rdc` file is
@@ -262,6 +267,7 @@ The `--help` flag prints all options with valid enum values.
   "lighting": {
     "environment": true, "threePoint": true,
     "pointLightShadows": false,
+    "keyLightShadows": true, "fillLightShadows": true, "rimLightShadows": true,
     "directDiffuse": true, "directSpecular": true,
     "clearcoatSpecular": true,
     "specularScale": 1.0, "pointLightSize": 0.25
@@ -277,9 +283,10 @@ The `--help` flag prints all options with valid enum values.
 
 `captures` is `[]` when `--capture` was not passed or RenderDoc was not
 injected. `status` reflects the last status message from
-`VulkanComputePreview::statusMessage()`. `lighting.pointLightShadows` should be
-false for the default performance baseline and true only for the explicit
-point-shadow comparison run.
+`VulkanComputePreview::statusMessage()`. `lighting.pointLightShadows` (the shadow
+master) should be false for the default performance baseline and true only for the
+explicit shadow comparison run; `keyLightShadows`/`fillLightShadows`/`rimLightShadows`
+are the per-light gates (default true) that only take effect while the master is on.
 
 **Offline report script**
 

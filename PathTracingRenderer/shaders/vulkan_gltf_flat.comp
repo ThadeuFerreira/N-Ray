@@ -61,15 +61,16 @@ struct GpuSettings {
 	vec4 denoiseParams;
 	uvec4 denoiseFlags;
 	vec4 environmentParams;       // x=enableEnv, y=envReady, z/w unused
-	vec4 pointLightParams;        // x=enableThreePoint, y=sceneRadius, z/w unused
+	vec4 pointLightParams;        // x=enableThreePoint, y=sceneRadius, z=raysPerPixel, w unused
 	vec4 keyLightPositionRadius;  // xyz position, w radius
 	vec4 keyLightColorIntensity;  // rgb color, w intensity
 	vec4 fillLightPositionRadius;
 	vec4 fillLightColorIntensity;
 	vec4 rimLightPositionRadius;
 	vec4 rimLightColorIntensity;
-	vec4 lightingControls;       // x=pointLightShadows, y=directDiffuse, z=directSpecular, w=clearcoatSpecular
+	vec4 lightingControls;       // x=shadowsEnabled(master), y=directDiffuse, z=directSpecular, w=clearcoatSpecular
 	vec4 lightingParams;         // x=directSpecularScale, y=pointLightSizeScale, z/w unused
+	vec4 pointLightShadowFlags;  // x=keyShadows, y=fillShadows, z=rimShadows, w unused
 };
 
 layout(std430, binding = 1) readonly buffer TriIntersectBuffer {
@@ -150,7 +151,18 @@ const uint SHADOW_MODE_NONE = 0u;
 const uint SHADOW_MODE_RAY_TRACED = 1u;
 const uint SHADOW_MODE_SHADOW_MAP = 2u;
 const uint SHADOW_MAP_EMPTY = 0xffffffffu;
+const uint DENOISER_MODE_OFF = 0u;
 const uint INVALID_ID = 0xffffffffu;
+uint gPathSampleIndex = 0u;
+
+// Path-space radiance clamp ceiling for direct lighting on indirect bounces.
+// Punctual-light analytic specular (GGX NDF peaks in the millions at the 0.02
+// roughness floor) and the inverse-square attenuation both spike enormously
+// when a randomly reached secondary surface happens to mirror a light. Those
+// spikes never average out and read as white fireflies, so the contribution
+// added at bounce > 0 is capped here. The primary hit (bounce 0) is left
+// unclamped so deliberate sharp highlights stay correct.
+const float INDIRECT_RADIANCE_CLAMP = 8.0;
 
 bool invalidVec3(vec3 value) {
 	return any(isnan(value)) || any(isinf(value));
@@ -394,6 +406,12 @@ float materialClearcoatRoughness(GpuMaterial material) {
 	return clamp(material.opticalParams.y, 0.02, 1.0);
 }
 
+// Dielectric specular reflectance scale (F0 multiplier). 1.0 = standard 0.04
+// dielectric; 0.0 = no specular (matte). Honors spec/gloss specularFactor.
+float materialDielectricSpecularStrength(GpuMaterial material) {
+	return clamp(material.opticalParams.z, 0.0, 1.0);
+}
+
 float clearcoatFresnel(float cosTheta) {
 	float oneMinusCos = 1.0 - clamp(cosTheta, 0.0, 1.0);
 	return 0.04 + 0.96 * pow(oneMinusCos, 5.0);
@@ -440,7 +458,7 @@ bool alphaCoverageAccepted(float alpha, uint triIdx, float hitU, float hitV) {
 	uint vBits = floatBitsToUint(hitV);
 	uint seed =
 		triIdx ^
-		pcgHash(pc.sampleIndex + 0x9E3779B9u) ^
+		pcgHash(gPathSampleIndex + 0x9E3779B9u) ^
 		pcgHash(uBits ^ (vBits * 1664525u));
 	float threshold = float(pcgHash(seed) >> 8u) * (1.0 / 16777216.0);
 	return alpha > 0.0 && alpha >= threshold;
@@ -750,6 +768,10 @@ vec3 shadowMapVisibility(vec3 hitPos, vec3 normal, vec3 lightDir) {
 }
 
 vec3 directSunVisibility(vec3 hitPos, vec3 normal, vec3 lightDir) {
+	// Global shadow master (lightingControls.x) gates ALL shadows, sun included.
+	if (cfg.lightingControls.x <= 0.5) {
+		return vec3(1.0);
+	}
 	uint shadowMode = uint(cfg.shadowParams.x + 0.5);
 	if (shadowMode == SHADOW_MODE_RAY_TRACED) {
 		return rayTracedShadowVisibility(hitPos, normal, lightDir);
@@ -818,6 +840,7 @@ vec3 directBrdf(
 	vec3 albedo,
 	float roughness,
 	float metalness,
+	float dielectricSpecularStrength,
 	float lightRadius,
 	float lightDistance
 ) {
@@ -835,7 +858,7 @@ vec3 directBrdf(
 	float angularRadius = clamp(max(lightRadius, 0.0) / max(lightDistance, 0.0001), 0.0, 1.0);
 	float effectiveRoughness = clamp(max(roughness, angularRadius), 0.02, 1.0);
 
-	vec3 f0 = mix(vec3(0.04), albedo, clamp(metalness, 0.0, 1.0));
+	vec3 f0 = mix(vec3(0.04) * clamp(dielectricSpecularStrength, 0.0, 1.0), albedo, clamp(metalness, 0.0, 1.0));
 	vec3 fresnel = f0 + (vec3(1.0) - f0) * pow(1.0 - vDotH, 5.0);
 	float d = ggxDistribution(nDotH, effectiveRoughness);
 	float vis = smithGGXCorrelated(nDotV, nDotL, effectiveRoughness);
@@ -914,6 +937,7 @@ vec3 directPointLighting(
 	vec3 albedo,
 	float roughness,
 	float metalness,
+	float dielectricSpecularStrength,
 	float transmissionStrength
 ) {
 	if (cfg.pointLightParams.x <= 0.5) {
@@ -922,7 +946,7 @@ vec3 directPointLighting(
 
 	float sceneRadius = max(cfg.pointLightParams.y, 0.0001);
 	float sceneRadiusSq = sceneRadius * sceneRadius;
-	bool castShadows = cfg.lightingControls.x > 0.5;
+	bool globalShadows = cfg.lightingControls.x > 0.5;
 	float transmissionScale = clamp(1.0 - transmissionStrength, 0.0, 1.0);
 
 	vec4 posRadius[3];
@@ -933,6 +957,11 @@ vec3 directPointLighting(
 	colorIntensity[1] = cfg.fillLightColorIntensity;
 	posRadius[2] = cfg.rimLightPositionRadius;
 	colorIntensity[2] = cfg.rimLightColorIntensity;
+
+	float shadowFlag[3];
+	shadowFlag[0] = cfg.pointLightShadowFlags.x;
+	shadowFlag[1] = cfg.pointLightShadowFlags.y;
+	shadowFlag[2] = cfg.pointLightShadowFlags.z;
 
 	vec3 result = vec3(0.0);
 	for (int i = 0; i < 3; ++i) {
@@ -953,6 +982,7 @@ vec3 directPointLighting(
 
 		float attenuation = sceneRadiusSq / max(dist * dist, 0.0001);
 		vec3 visibility = vec3(1.0);
+		bool castShadows = globalShadows && shadowFlag[i] > 0.5;
 		if (castShadows) {
 			visibility = pointShadowVisibility(hitPos, normal, lightDir, dist);
 			if (maxComponent(visibility) <= 0.0) {
@@ -960,11 +990,27 @@ vec3 directPointLighting(
 			}
 		}
 
-		vec3 brdf = directBrdf(normal, viewDir, lightDir, albedo, roughness, metalness, posRadius[i].w, dist);
+		vec3 brdf = directBrdf(normal, viewDir, lightDir, albedo, roughness, metalness, dielectricSpecularStrength, posRadius[i].w, dist);
 		result += brdf * colorIntensity[i].rgb * intensity * attenuation * visibility * transmissionScale;
 	}
 
 	return result;
+}
+
+// Caps a direct-lighting contribution on indirect bounces to kill fireflies at
+// the source (before they enter the accumulation buffer). Gated on the same
+// fireflyClamp toggle as the denoiser prepare pass (denoiseFlags.z), and only
+// while a denoiser mode is active. bounce 0 is the directly visible hit and is
+// never clamped.
+vec3 clampIndirectContribution(vec3 contribution, int bounce) {
+	if (cfg.denoiseFlags.x == DENOISER_MODE_OFF || cfg.denoiseFlags.z == 0u || bounce <= 0) {
+		return contribution;
+	}
+	float peak = maxComponent(contribution);
+	if (peak > INDIRECT_RADIANCE_CLAMP) {
+		contribution *= INDIRECT_RADIANCE_CLAMP / peak;
+	}
+	return contribution;
 }
 
 void main() {
@@ -974,24 +1020,22 @@ void main() {
 	}
 
 	uint pixelIndex = uint(pixel.y * pc.width + pixel.x);
-	uint rng = seedRng(pixelIndex, pc.sampleIndex);
+	uint raysPerPixel = clamp(uint(cfg.pointLightParams.z + 0.5), 1u, 8u);
 
-	vec2 jitter = vec2(rngFloat(rng), rngFloat(rng));
-	vec2 uv = (vec2(pixel) + jitter) / vec2(pc.width, pc.height);
+	// Invariant across the per-pixel ray batch: the camera projection scale and
+	// render-param scalars depend only on push/uniform state, so derive them
+	// once instead of recomputing them for every ray. The ray origin is NOT
+	// invariant (the bounce loop advances it), so it is reset per ray below.
 	float verticalScale = pc.cameraParams.x;
 	float aspect = pc.cameraParams.y;
-	vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-	vec3 origin = pc.cameraPos.xyz;
-	vec3 dir = safeNormalize(
-		pc.cameraForward.xyz +
-		pc.cameraRight.xyz * ndc.x * aspect * verticalScale +
-		pc.cameraUp.xyz * ndc.y * verticalScale,
-		pc.cameraForward.xyz
-	);
-	vec3 invDir = 1.0 / dir;
+	int maxBounces = max(0, int(cfg.renderParams.x + 0.5));
+	int rrMinBounces = max(0, int(cfg.renderParams.y + 0.5));
+	bool useRussianRoulette = cfg.renderParams.z > 0.5;
 
-	vec3 radiance = vec3(0.0);
-	vec3 throughput = vec3(1.0);
+	// The G-buffer is owned by the first ray that hits anything. Declaring the
+	// first-hit state out here (rather than per ray) lets it persist across the
+	// batch, so no separate "stored" mirror is needed.
+	vec3 radianceAccum = vec3(0.0);
 	bool firstHitRecorded = false;
 	vec3 firstHitNormal = vec3(0.0);
 	vec3 firstHitAlbedo = vec3(0.0);
@@ -1000,316 +1044,329 @@ void main() {
 	float firstHitDepth = 0.0;
 	uint firstHitMaterialId = INVALID_ID;
 	uint firstHitInstanceId = INVALID_ID;
-	int maxBounces = max(0, int(cfg.renderParams.x + 0.5));
-	int rrMinBounces = max(0, int(cfg.renderParams.y + 0.5));
-	bool useRussianRoulette = cfg.renderParams.z > 0.5;
-	bool insideVolumeMedium = false;
-	float mediumIor = 1.0;
-	vec3 mediumAttenuationColor = vec3(1.0);
-	float mediumAttenuationDistance = 0.0;
-	float mediumTransmission = 0.0;
-	float mediumFallbackThickness = 0.0;
-	uint mediumMaterialId = INVALID_ID;
 
-	for (int bounce = 0; bounce <= maxBounces; ++bounce) {
-		uint hitTriIdx;
-		float closestT;
-		float hitU;
-		float hitV;
-		bool stackOverflow;
-		bool hit = traverseBvh(origin, dir, invDir, hitTriIdx, closestT, hitU, hitV, stackOverflow);
+	for (uint rayIndex = 0u; rayIndex < raysPerPixel; ++rayIndex) {
+		gPathSampleIndex = pc.sampleIndex * raysPerPixel + rayIndex;
+		uint rng = seedRng(pixelIndex, gPathSampleIndex);
 
-		if (stackOverflow) {
-			if (insideVolumeMedium) {
-				throughput *= materialBeerAttenuation(
-					mediumAttenuationColor,
-					mediumAttenuationDistance,
-					max(mediumFallbackThickness, 0.0),
-					mediumTransmission
-				);
-			}
-			radiance += throughput * sky(dir);
-			break;
-		}
+		vec2 jitter = vec2(rngFloat(rng), rngFloat(rng));
+		vec2 uv = (vec2(pixel) + jitter) / vec2(pc.width, pc.height);
+		vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+		vec3 origin = pc.cameraPos.xyz;
+		vec3 dir = safeNormalize(
+			pc.cameraForward.xyz +
+			pc.cameraRight.xyz * ndc.x * aspect * verticalScale +
+			pc.cameraUp.xyz * ndc.y * verticalScale,
+			pc.cameraForward.xyz
+		);
+		vec3 invDir = 1.0 / dir;
 
-		if (!hit) {
-			if (insideVolumeMedium) {
-				throughput *= materialBeerAttenuation(
-					mediumAttenuationColor,
-					mediumAttenuationDistance,
-					max(mediumFallbackThickness, 0.0),
-					mediumTransmission
-				);
-			}
-			radiance += throughput * sky(dir);
-			break;
-		}
+		vec3 radiance = vec3(0.0);
+		vec3 throughput = vec3(1.0);
+		bool insideVolumeMedium = false;
+		float mediumIor = 1.0;
+		vec3 mediumAttenuationColor = vec3(1.0);
+		float mediumAttenuationDistance = 0.0;
+		float mediumTransmission = 0.0;
+		float mediumFallbackThickness = 0.0;
+		uint mediumMaterialId = INVALID_ID;
 
-		GpuTriIntersect hitTri = triIsect[hitTriIdx];
-		GpuTriShading shading = triShading[hitTriIdx];
-		float hitW = 1.0 - hitU - hitV;
-		vec3 geometricNormal = safeNormalize(cross(hitTri.eA.xyz, hitTri.eB.xyz), -dir);
-		bool frontFace = dot(dir, geometricNormal) < 0.0;
-		vec3 faceNormal = frontFace ? geometricNormal : -geometricNormal;
-		vec3 normal = safeNormalize(shading.aN.xyz * hitW + shading.bN.xyz * hitU + shading.cN.xyz * hitV, faceNormal);
-		if (dot(normal, -dir) < 0.0) {
-			normal = -normal;
-		}
-		vec2 hitUv = interpolateUv(shading, hitU, hitV);
+		for (int bounce = 0; bounce <= maxBounces; ++bounce) {
+			uint hitTriIdx;
+			float closestT;
+			float hitU;
+			float hitV;
+			bool stackOverflow;
+			bool hit = traverseBvh(origin, dir, invDir, hitTriIdx, closestT, hitU, hitV, stackOverflow);
 
-		uint materialIndex = shading.ids.x;
-		vec3 albedo = vec3(0.8);
-		float roughness = 0.5;
-		float metalness = 0.0;
-		float emissionIntensity = 0.0;
-		vec3 emissionColor = vec3(0.0);
-		float ior = 1.5;
-		float transmissionStrength = 0.0;
-		float clearcoatFactor = 0.0;
-		float clearcoatRoughness = 0.02;
-		float volumeThickness = 0.0;
-		vec3 attenuationColor = vec3(1.0);
-		float attenuationDistance = 0.0;
-		bool thinTransmission = false;
-		bool volumeTransmission = false;
-		bool unlitMaterial = false;
-		if (materialIndex < pc.sceneCounts.z) {
-			GpuMaterial material = materials[materialIndex];
-			vec4 baseColor = material.baseColor;
-			if (validTexture(material.textureIndices.x)) {
-				vec4 baseSample = sampleSceneTexture(material.textureIndices.x, hitUv, vec4(1.0));
-				baseColor *= vec4(srgbToLinear(baseSample.rgb), baseSample.a);
-			}
-			albedo = max(baseColor.rgb, vec3(0.0));
-			albedo = transmissionTint(material, albedo, hitUv);
-			roughness = clamp(material.params.x, 0.02, 1.0);
-			metalness = clamp(material.params.y, 0.0, 1.0);
-			if (validTexture(material.textureIndices.y)) {
-				vec4 mrSample = sampleSceneTexture(material.textureIndices.y, hitUv, vec4(1.0));
-				roughness = clamp(roughness * mrSample.g, 0.02, 1.0);
-				metalness = clamp(metalness * mrSample.b, 0.0, 1.0);
-			}
-			emissionIntensity = max(material.params.z, 0.0);
-			emissionColor = max(material.emissionIor.rgb, vec3(0.0));
-			if (validTexture(material.textureIndices.w)) {
-				vec3 emissiveSample = srgbToLinear(sampleSceneTexture(material.textureIndices.w, hitUv, vec4(1.0)).rgb);
-				emissionColor *= emissiveSample;
-			}
-			ior = max(material.emissionIor.a, 1.001);
-			transmissionStrength = materialTransmissionStrength(material, hitUv);
-			thinTransmission = materialIsThinTransmission(material);
-			volumeThickness = materialVolumeThickness(material, hitUv);
-			volumeTransmission = materialIsVolumeTransmission(material) && volumeThickness > 0.001;
-			if (materialIsVolumeTransmission(material) && !volumeTransmission) {
-				thinTransmission = true;
-			}
-			attenuationColor = material.attenuation.rgb;
-			attenuationDistance = material.attenuation.a;
-			unlitMaterial = materialIsUnlit(material);
-			clearcoatFactor = materialClearcoatFactor(material);
-			clearcoatRoughness = materialClearcoatRoughness(material);
-
-			if (validTexture(material.textureIndices.z)) {
-				vec3 tangentSample = sampleSceneTexture(material.textureIndices.z, hitUv, vec4(0.5, 0.5, 1.0, 1.0)).rgb * 2.0 - 1.0;
-				tangentSample.xy *= material.textureParams.y;
-				tangentSample = safeNormalize(tangentSample, vec3(0.0, 0.0, 1.0));
-
-				vec4 tangent4 = interpolateTangent(shading, hitU, hitV);
-				vec3 tangent = tangent4.xyz - normal * dot(normal, tangent4.xyz);
-				tangent = safeNormalize(tangent, abs(normal.z) < 0.999 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0));
-				vec3 bitangent = safeNormalize(cross(normal, tangent) * tangent4.w, cross(normal, tangent));
-				normal = safeNormalize(
-					tangent * tangentSample.x +
-					bitangent * tangentSample.y +
-					normal * tangentSample.z,
-					normal
-				);
-				if (dot(normal, -dir) < 0.0) {
-					normal = -normal;
+			// Stack overflow aborts traversal early; both it and a genuine miss
+			// escape to the environment, so they share one exit path.
+			if (stackOverflow || !hit) {
+				if (insideVolumeMedium) {
+					throughput *= materialBeerAttenuation(
+						mediumAttenuationColor,
+						mediumAttenuationDistance,
+						max(mediumFallbackThickness, 0.0),
+						mediumTransmission
+					);
 				}
-			}
-		}
-
-		vec3 hitPos = origin + dir * closestT;
-		if (insideVolumeMedium) {
-			throughput *= materialBeerAttenuation(
-				mediumAttenuationColor,
-				mediumAttenuationDistance,
-				closestT,
-				mediumTransmission
-			);
-			if (invalidVec3(throughput) || maxComponent(throughput) <= 0.000001) {
+				radiance += clampIndirectContribution(throughput * sky(dir), bounce);
 				break;
 			}
-		}
 
-		if (!firstHitRecorded) {
-			firstHitRecorded = true;
-			firstHitNormal = normal;
-			firstHitAlbedo = albedo;
-			firstHitRoughness = roughness;
-			firstHitMetalness = metalness;
-			firstHitDepth = closestT;
-			firstHitMaterialId = materialIndex < pc.sceneCounts.z ? materialIndex : INVALID_ID;
-			firstHitInstanceId = shading.ids.y;
-		}
-
-		if (unlitMaterial) {
-			radiance += throughput * max(albedo + emissionColor * emissionIntensity, vec3(0.0));
-			break;
-		}
-
-		if (emissionIntensity > 0.0 && maxComponent(emissionColor) > 0.0) {
-			radiance += throughput * emissionColor * emissionIntensity;
-		}
-
-		vec3 directSun = directSunLighting(
-			hitPos,
-			normal,
-			-dir,
-			albedo,
-			metalness,
-			transmissionStrength,
-			clearcoatFactor,
-			clearcoatRoughness
-		);
-		if (maxComponent(directSun) > 0.0) {
-			radiance += throughput * directSun;
-		}
-
-		vec3 directPoints = directPointLighting(
-			hitPos,
-			normal,
-			-dir,
-			albedo,
-			roughness,
-			metalness,
-			transmissionStrength
-		);
-		if (maxComponent(directPoints) > 0.0) {
-			radiance += throughput * directPoints;
-		}
-
-		vec3 microfacetNormal = sampleGGX(normal, roughness, rngFloat(rng), rngFloat(rng));
-		float etaIncident = insideVolumeMedium ? mediumIor : 1.0;
-		float etaTransmitted = ior;
-		if (volumeTransmission) {
-			etaIncident = insideVolumeMedium ? mediumIor : (frontFace ? 1.0 : ior);
-			etaTransmitted = frontFace ? ior : 1.0;
-		}
-		float r0Dielectric = (etaIncident - etaTransmitted) / (etaIncident + etaTransmitted);
-		r0Dielectric *= r0Dielectric;
-		float r0 = mix(r0Dielectric, 1.0, metalness);
-		float cosThetaI = clamp(-dot(dir, microfacetNormal), 0.0, 1.0);
-		float rTheta = r0 + (1.0 - r0) * pow(1.0 - cosThetaI, 5.0);
-		vec3 clearcoatNormal = normal;
-		float clearcoatProbability = 0.0;
-		if (clearcoatFactor > 0.001) {
-			clearcoatNormal = sampleGGX(normal, clearcoatRoughness, rngFloat(rng), rngFloat(rng));
-			float clearcoatCosTheta = clamp(-dot(dir, clearcoatNormal), 0.0, 1.0);
-			clearcoatProbability = clamp(clearcoatFactor * clearcoatFresnel(clearcoatCosTheta), 0.0, 0.95);
-		}
-		float remainingProbability = 1.0 - clearcoatProbability;
-		float specularProbability = rTheta * remainingProbability;
-		float transmissionProbability = transmissionStrength * (1.0 - rTheta) * remainingProbability;
-
-		bool isSpecular = false;
-		bool isClearcoat = false;
-		bool isTransmission = false;
-		vec3 nextDir = normal;
-		float eventSample = rngFloat(rng);
-		if (clearcoatProbability > 0.0 && eventSample <= clearcoatProbability) {
-			vec3 reflectedDir = safeNormalize(reflect(dir, clearcoatNormal), normal);
-			if (dot(reflectedDir, normal) > 0.0 && dot(reflectedDir, faceNormal) > 0.0) {
-				nextDir = reflectedDir;
-				isSpecular = true;
-				isClearcoat = true;
+			GpuTriIntersect hitTri = triIsect[hitTriIdx];
+			GpuTriShading shading = triShading[hitTriIdx];
+			float hitW = 1.0 - hitU - hitV;
+			vec3 geometricNormal = safeNormalize(cross(hitTri.eA.xyz, hitTri.eB.xyz), -dir);
+			bool frontFace = dot(dir, geometricNormal) < 0.0;
+			vec3 faceNormal = frontFace ? geometricNormal : -geometricNormal;
+			vec3 normal = safeNormalize(shading.aN.xyz * hitW + shading.bN.xyz * hitU + shading.cN.xyz * hitV, faceNormal);
+			if (dot(normal, -dir) < 0.0) {
+				normal = -normal;
 			}
-		}
-		else if (eventSample <= clearcoatProbability + specularProbability) {
-			vec3 reflectedDir = safeNormalize(reflect(dir, microfacetNormal), normal);
-			if (dot(reflectedDir, normal) > 0.0 && dot(reflectedDir, faceNormal) > 0.0) {
-				nextDir = reflectedDir;
-				isSpecular = true;
-			}
-		}
-		else if (eventSample <= clearcoatProbability + specularProbability + transmissionProbability) {
-			if (thinTransmission) {
-				nextDir = dir;
-				isTransmission = true;
-			}
-			else {
-				float eta1 = insideVolumeMedium ? mediumIor : (frontFace ? 1.0 : ior);
-				float eta2 = frontFace ? ior : 1.0;
-				float eta = eta1 / max(eta2, 1.0);
-				vec3 refractedDir = refract(dir, normal, eta);
-				if (!invalidVec3(refractedDir) && dot(refractedDir, refractedDir) > EPSILON) {
-					nextDir = safeNormalize(refractedDir, dir);
-					isTransmission = true;
+			vec2 hitUv = interpolateUv(shading, hitU, hitV);
+
+			uint materialIndex = shading.ids.x;
+			vec3 albedo = vec3(0.8);
+			float roughness = 0.5;
+			float metalness = 0.0;
+			float emissionIntensity = 0.0;
+			vec3 emissionColor = vec3(0.0);
+			float ior = 1.5;
+			float transmissionStrength = 0.0;
+			float clearcoatFactor = 0.0;
+			float clearcoatRoughness = 0.02;
+			float dielectricSpecularStrength = 1.0;
+			float volumeThickness = 0.0;
+			vec3 attenuationColor = vec3(1.0);
+			float attenuationDistance = 0.0;
+			bool thinTransmission = false;
+			bool volumeTransmission = false;
+			bool unlitMaterial = false;
+			if (materialIndex < pc.sceneCounts.z) {
+				GpuMaterial material = materials[materialIndex];
+				vec4 baseColor = material.baseColor;
+				if (validTexture(material.textureIndices.x)) {
+					vec4 baseSample = sampleSceneTexture(material.textureIndices.x, hitUv, vec4(1.0));
+					baseColor *= vec4(srgbToLinear(baseSample.rgb), baseSample.a);
 				}
-				else {
-					nextDir = safeNormalize(reflect(dir, microfacetNormal), faceNormal);
+				albedo = max(baseColor.rgb, vec3(0.0));
+				albedo = transmissionTint(material, albedo, hitUv);
+				roughness = clamp(material.params.x, 0.02, 1.0);
+				metalness = clamp(material.params.y, 0.0, 1.0);
+				if (validTexture(material.textureIndices.y)) {
+					vec4 mrSample = sampleSceneTexture(material.textureIndices.y, hitUv, vec4(1.0));
+					roughness = clamp(roughness * mrSample.g, 0.02, 1.0);
+					metalness = clamp(metalness * mrSample.b, 0.0, 1.0);
+				}
+				emissionIntensity = max(material.params.z, 0.0);
+				emissionColor = max(material.emissionIor.rgb, vec3(0.0));
+				if (validTexture(material.textureIndices.w)) {
+					vec3 emissiveSample = srgbToLinear(sampleSceneTexture(material.textureIndices.w, hitUv, vec4(1.0)).rgb);
+					emissionColor *= emissiveSample;
+				}
+				ior = max(material.emissionIor.a, 1.001);
+				transmissionStrength = materialTransmissionStrength(material, hitUv);
+				thinTransmission = materialIsThinTransmission(material);
+				volumeThickness = materialVolumeThickness(material, hitUv);
+				volumeTransmission = materialIsVolumeTransmission(material) && volumeThickness > 0.001;
+				if (materialIsVolumeTransmission(material) && !volumeTransmission) {
+					thinTransmission = true;
+				}
+				attenuationColor = material.attenuation.rgb;
+				attenuationDistance = material.attenuation.a;
+				unlitMaterial = materialIsUnlit(material);
+				clearcoatFactor = materialClearcoatFactor(material);
+				clearcoatRoughness = materialClearcoatRoughness(material);
+				dielectricSpecularStrength = materialDielectricSpecularStrength(material);
+
+				if (validTexture(material.textureIndices.z)) {
+					vec3 tangentSample = sampleSceneTexture(material.textureIndices.z, hitUv, vec4(0.5, 0.5, 1.0, 1.0)).rgb * 2.0 - 1.0;
+					tangentSample.xy *= material.textureParams.y;
+					tangentSample = safeNormalize(tangentSample, vec3(0.0, 0.0, 1.0));
+
+					vec4 tangent4 = interpolateTangent(shading, hitU, hitV);
+					vec3 tangent = tangent4.xyz - normal * dot(normal, tangent4.xyz);
+					tangent = safeNormalize(tangent, abs(normal.z) < 0.999 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0));
+					vec3 bitangent = safeNormalize(cross(normal, tangent) * tangent4.w, cross(normal, tangent));
+					normal = safeNormalize(
+						tangent * tangentSample.x +
+						bitangent * tangentSample.y +
+						normal * tangentSample.z,
+						normal
+					);
+					if (dot(normal, -dir) < 0.0) {
+						normal = -normal;
+					}
+				}
+			}
+
+			vec3 hitPos = origin + dir * closestT;
+			if (insideVolumeMedium) {
+				throughput *= materialBeerAttenuation(
+					mediumAttenuationColor,
+					mediumAttenuationDistance,
+					closestT,
+					mediumTransmission
+				);
+				if (invalidVec3(throughput) || maxComponent(throughput) <= 0.000001) {
+					break;
+				}
+			}
+
+			if (!firstHitRecorded) {
+				firstHitRecorded = true;
+				firstHitNormal = normal;
+				firstHitAlbedo = albedo;
+				firstHitRoughness = roughness;
+				firstHitMetalness = metalness;
+				firstHitDepth = closestT;
+				firstHitMaterialId = materialIndex < pc.sceneCounts.z ? materialIndex : INVALID_ID;
+				firstHitInstanceId = shading.ids.y;
+			}
+
+			if (unlitMaterial) {
+				radiance += clampIndirectContribution(throughput * max(albedo + emissionColor * emissionIntensity, vec3(0.0)), bounce);
+				break;
+			}
+
+			if (emissionIntensity > 0.0 && maxComponent(emissionColor) > 0.0) {
+				radiance += clampIndirectContribution(throughput * emissionColor * emissionIntensity, bounce);
+			}
+
+			vec3 directSun = directSunLighting(
+				hitPos,
+				normal,
+				-dir,
+				albedo,
+				metalness,
+				transmissionStrength,
+				clearcoatFactor,
+				clearcoatRoughness
+			);
+			if (maxComponent(directSun) > 0.0) {
+				radiance += clampIndirectContribution(throughput * directSun, bounce);
+			}
+
+			vec3 directPoints = directPointLighting(
+				hitPos,
+				normal,
+				-dir,
+				albedo,
+				roughness,
+				metalness,
+				dielectricSpecularStrength,
+				transmissionStrength
+			);
+			if (maxComponent(directPoints) > 0.0) {
+				radiance += clampIndirectContribution(throughput * directPoints, bounce);
+			}
+
+			vec3 microfacetNormal = sampleGGX(normal, roughness, rngFloat(rng), rngFloat(rng));
+			float etaIncident = insideVolumeMedium ? mediumIor : 1.0;
+			float etaTransmitted = ior;
+			if (volumeTransmission) {
+				etaIncident = insideVolumeMedium ? mediumIor : (frontFace ? 1.0 : ior);
+				etaTransmitted = frontFace ? ior : 1.0;
+			}
+			float r0Dielectric = (etaIncident - etaTransmitted) / (etaIncident + etaTransmitted);
+			r0Dielectric *= r0Dielectric;
+			r0Dielectric *= dielectricSpecularStrength;   // honor spec/gloss specularFactor; 1.0 = unchanged
+			float r0 = mix(r0Dielectric, 1.0, metalness);
+			float cosThetaI = clamp(-dot(dir, microfacetNormal), 0.0, 1.0);
+			float rTheta = r0 + (1.0 - r0) * pow(1.0 - cosThetaI, 5.0);
+			vec3 clearcoatNormal = normal;
+			float clearcoatProbability = 0.0;
+			if (clearcoatFactor > 0.001) {
+				clearcoatNormal = sampleGGX(normal, clearcoatRoughness, rngFloat(rng), rngFloat(rng));
+				float clearcoatCosTheta = clamp(-dot(dir, clearcoatNormal), 0.0, 1.0);
+				clearcoatProbability = clamp(clearcoatFactor * clearcoatFresnel(clearcoatCosTheta), 0.0, 0.95);
+			}
+			float remainingProbability = 1.0 - clearcoatProbability;
+			float specularProbability = rTheta * remainingProbability;
+			float transmissionProbability = transmissionStrength * (1.0 - rTheta) * remainingProbability;
+
+			bool isSpecular = false;
+			bool isClearcoat = false;
+			bool isTransmission = false;
+			vec3 nextDir = normal;
+			float eventSample = rngFloat(rng);
+			if (clearcoatProbability > 0.0 && eventSample <= clearcoatProbability) {
+				vec3 reflectedDir = safeNormalize(reflect(dir, clearcoatNormal), normal);
+				if (dot(reflectedDir, normal) > 0.0 && dot(reflectedDir, faceNormal) > 0.0) {
+					nextDir = reflectedDir;
+					isSpecular = true;
+					isClearcoat = true;
+				}
+			}
+			else if (eventSample <= clearcoatProbability + specularProbability) {
+				vec3 reflectedDir = safeNormalize(reflect(dir, microfacetNormal), normal);
+				if (dot(reflectedDir, normal) > 0.0 && dot(reflectedDir, faceNormal) > 0.0) {
+					nextDir = reflectedDir;
 					isSpecular = true;
 				}
 			}
-		}
-
-		if (isSpecular) {
-			throughput *= isClearcoat ? vec3(1.0) : mix(vec3(1.0), albedo, metalness);
-		}
-		else if (isTransmission) {
-			throughput *= mix(vec3(1.0), albedo, 1.0 - metalness);
-			if (volumeTransmission) {
-				if (frontFace) {
-					insideVolumeMedium = true;
-					mediumIor = ior;
-					mediumAttenuationColor = attenuationColor;
-					mediumAttenuationDistance = attenuationDistance;
-					mediumTransmission = transmissionStrength;
-					mediumFallbackThickness = volumeThickness;
-					mediumMaterialId = materialIndex;
+			else if (eventSample <= clearcoatProbability + specularProbability + transmissionProbability) {
+				if (thinTransmission) {
+					nextDir = dir;
+					isTransmission = true;
 				}
-				else if (insideVolumeMedium) {
-					insideVolumeMedium = false;
-					mediumIor = 1.0;
-					mediumAttenuationColor = vec3(1.0);
-					mediumAttenuationDistance = 0.0;
-					mediumTransmission = 0.0;
-					mediumFallbackThickness = 0.0;
-					mediumMaterialId = INVALID_ID;
+				else {
+					float eta1 = insideVolumeMedium ? mediumIor : (frontFace ? 1.0 : ior);
+					float eta2 = frontFace ? ior : 1.0;
+					float eta = eta1 / max(eta2, 1.0);
+					vec3 refractedDir = refract(dir, normal, eta);
+					if (!invalidVec3(refractedDir) && dot(refractedDir, refractedDir) > EPSILON) {
+						nextDir = safeNormalize(refractedDir, dir);
+						isTransmission = true;
+					}
+					else {
+						nextDir = safeNormalize(reflect(dir, microfacetNormal), faceNormal);
+						isSpecular = true;
+					}
 				}
 			}
-		}
-		else {
-			throughput *= albedo;
-			nextDir = sampleCosineHemisphere(normal, faceNormal, rngFloat(rng), rngFloat(rng));
-		}
 
-		if (invalidVec3(throughput) || maxComponent(throughput) <= 0.000001) {
-			break;
-		}
+			if (isSpecular) {
+				throughput *= isClearcoat ? vec3(1.0) : mix(vec3(1.0), albedo, metalness);
+			}
+			else if (isTransmission) {
+				throughput *= mix(vec3(1.0), albedo, 1.0 - metalness);
+				if (volumeTransmission) {
+					if (frontFace) {
+						insideVolumeMedium = true;
+						mediumIor = ior;
+						mediumAttenuationColor = attenuationColor;
+						mediumAttenuationDistance = attenuationDistance;
+						mediumTransmission = transmissionStrength;
+						mediumFallbackThickness = volumeThickness;
+						mediumMaterialId = materialIndex;
+					}
+					else if (insideVolumeMedium) {
+						insideVolumeMedium = false;
+						mediumIor = 1.0;
+						mediumAttenuationColor = vec3(1.0);
+						mediumAttenuationDistance = 0.0;
+						mediumTransmission = 0.0;
+						mediumFallbackThickness = 0.0;
+						mediumMaterialId = INVALID_ID;
+					}
+				}
+			}
+			else {
+				throughput *= albedo;
+				nextDir = sampleCosineHemisphere(normal, faceNormal, rngFloat(rng), rngFloat(rng));
+			}
 
-		vec3 originBiasDir = faceNormal;
-		if (isTransmission) {
-			originBiasDir = thinTransmission ? nextDir : -faceNormal;
-		}
-		origin = hitPos + originBiasDir * rayBias();
-		dir = safeNormalize(nextDir, normal);
-		invDir = 1.0 / dir;
-
-		if (useRussianRoulette && bounce >= rrMinBounces) {
-			float pSurvive = clamp(maxComponent(throughput), 0.05, 1.0);
-			if (rngFloat(rng) > pSurvive) {
+			if (invalidVec3(throughput) || maxComponent(throughput) <= 0.000001) {
 				break;
 			}
-			throughput /= pSurvive;
+
+			vec3 originBiasDir = faceNormal;
+			if (isTransmission) {
+				originBiasDir = thinTransmission ? nextDir : -faceNormal;
+			}
+			origin = hitPos + originBiasDir * rayBias();
+			dir = safeNormalize(nextDir, normal);
+			invDir = 1.0 / dir;
+
+			if (useRussianRoulette && bounce >= rrMinBounces) {
+				float pSurvive = clamp(maxComponent(throughput), 0.05, 1.0);
+				if (rngFloat(rng) > pSurvive) {
+					break;
+				}
+				throughput /= pSurvive;
+			}
 		}
+
+		if (invalidVec3(radiance)) {
+			radiance = vec3(1.0, 0.0, 1.0);
+		}
+
+		radianceAccum += radiance;
 	}
 
-	if (invalidVec3(radiance)) {
-		radiance = vec3(1.0, 0.0, 1.0);
-	}
-
+	vec3 radiance = radianceAccum / float(raysPerPixel);
 	vec3 sum = accum[pixelIndex].rgb + radiance;
 	accum[pixelIndex] = vec4(sum, 1.0);
 

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <imgui.h>
 #include <iostream>
+#include <performance_report.h>
 #include <string>
 #include <rlImGui.h>
 #include <ui_layout.h>
@@ -61,14 +62,60 @@ const char* opticalModeLabel(VulkanPreviewOpticalMode mode) {
 void invalidateVulkanPostprocess(RuntimeResources& runtime) {
 	runtime.vulkanFrameValid = false;
 	runtime.vulkanFrameDispatched = false;
+	runtime.performanceReportWrittenForRun = false;
 	params.displayInvalidated = true;
 }
 
 void invalidateVulkanTrace(RuntimeResources& runtime) {
 	runtime.vulkanFrameValid = false;
 	runtime.vulkanFrameDispatched = false;
+	runtime.performanceReportWrittenForRun = false;
 	params.renderInvalidated = true;
 	params.shouldSample = false;
+}
+
+VulkanPreviewSettings makeVulkanPreviewSettings(RuntimeResources& runtime);
+
+void maybeWriteVulkanPerformanceReport(
+	RuntimeResources& runtime,
+	const GpuStats& gpuStats
+) {
+	if (!runtime.performanceReportAutoOnCompletion ||
+		runtime.performanceReportWrittenForRun ||
+		!runtime.vulkanPreview.converged() ||
+		runtime.vulkanPreview.samplesAccumulated() == 0 ||
+		!VulkanComputePreview::isModelPreviewIndex(runtime.vulkanPreview.shaderIndex())) {
+		return;
+	}
+
+	// Built only when a report is actually about to be written (at most once
+	// per converged run), not every frame.
+	VulkanPreviewSettings settings = makeVulkanPreviewSettings(runtime);
+	try {
+		NrayPerformanceReport report = makeVulkanPerformanceReport(
+			runtime.vulkanPreview,
+			settings,
+			gpuStats,
+			screen.resX,
+			screen.resY,
+			true,
+			runtime.vulkanPreview.statusMessage()
+		);
+		NrayPerformanceReportPaths paths = writePerformanceReportFiles(makeDefaultPerformanceReportPrefix(), report);
+		runtime.performanceReportWrittenForRun = true;
+		runtime.performanceReportLastJson = paths.jsonPath.string();
+		runtime.performanceReportLastMarkdown = paths.markdownPath.string();
+		if (paths.jsonWritten && paths.markdownWritten) {
+			runtime.performanceReportStatus = "Wrote " + runtime.performanceReportLastJson;
+		}
+		else {
+			runtime.performanceReportStatus = "Report write failed: " + paths.error;
+		}
+	}
+	catch (const std::exception& e) {
+		runtime.performanceReportWrittenForRun = true;
+		runtime.performanceReportStatus = std::string("Report write failed: ") + e.what();
+	}
 }
 
 UiLayout makeUiLayout(const RuntimeResources& runtime) {
@@ -396,6 +443,7 @@ VulkanPreviewCamera makeVulkanPreviewCamera() {
 VulkanPreviewSettings makeVulkanPreviewSettings(RuntimeResources& runtime) {
 	VulkanPreviewSettings settings{};
 	settings.maxSamples = std::clamp(params.maxSamples, kMinSamples, kMaxSamples);
+	settings.raysPerPixel = std::clamp(params.raysPerPixel, kMinRaysPerPixel, kMaxRaysPerPixel);
 	settings.maxBounces = std::max(0, params.maxBounces);
 	settings.rrMinBounces = std::max(0, params.rrMinBounces);
 	settings.russianRoulette = params.russianRoulette;
@@ -535,6 +583,9 @@ bool updateVulkanComputePreview(RuntimeResources& runtime) {
 		runtime.vulkanFrame.size() == pixelCount &&
 		!resetAccumulation &&
 		!displayOnlyRedraw;
+	if (resetAccumulation) {
+		runtime.performanceReportWrittenForRun = false;
+	}
 
 	if (!convergedModelFrame) {
 		VulkanPreviewSettings settings = makeVulkanPreviewSettings(runtime);
@@ -575,6 +626,7 @@ bool updateVulkanComputePreview(RuntimeResources& runtime) {
 			params.renderStatsSamplesPerSec = 1000.0 / gpuStats.gpuDispatchMs;
 		}
 	}
+	maybeWriteVulkanPerformanceReport(runtime, gpuStats);
 	drawRenderTexture(runtime.render, screen);
 	return true;
 }
@@ -810,13 +862,22 @@ void drawVulkanMainMenuBar(RuntimeResources& runtime) {
 			ImGui::EndMenu();
 		}
 		if (ImGui::BeginMenu("Shadows")) {
+			bool changed = false;
 			static const char* shadowLabels[] = { "None", "Ray Traced", "Shadow Map" };
 			for (int i = 0; i < 3; i++) {
 				bool selected = static_cast<int>(gVulkanPreviewShadowMode) == i;
 				if (ImGui::MenuItem(shadowLabels[i], nullptr, selected)) {
 					gVulkanPreviewShadowMode = static_cast<VulkanPreviewShadowMode>(i);
-					invalidateVulkanTrace(runtime);
+					changed = true;
 				}
+			}
+			ImGui::Separator();
+			changed |= ImGui::Checkbox("Enable Shadows (master)", &gVulkanLightingDebugSettings.pointLightShadows);
+			changed |= ImGui::Checkbox("Key Shadows", &gVulkanLightingDebugSettings.keyLightShadows);
+			changed |= ImGui::Checkbox("Fill Shadows", &gVulkanLightingDebugSettings.fillLightShadows);
+			changed |= ImGui::Checkbox("Rim Shadows", &gVulkanLightingDebugSettings.rimLightShadows);
+			if (changed) {
+				invalidateVulkanTrace(runtime);
 			}
 			ImGui::EndMenu();
 		}
@@ -826,14 +887,17 @@ void drawVulkanMainMenuBar(RuntimeResources& runtime) {
 			changed |= ImGui::Checkbox("Key Light", &gVulkanLightingDebugSettings.keyLightEnabled);
 			ImGui::SetNextItemWidth(180.0f);
 			changed |= ImGui::SliderFloat("Key Intensity", &params.keyLightIntensity, 0.0f, 64.0f, "%.2f");
+			changed |= ImGui::Checkbox("Key Shadows", &gVulkanLightingDebugSettings.keyLightShadows);
 			changed |= ImGui::Checkbox("Fill Light", &gVulkanLightingDebugSettings.fillLightEnabled);
 			ImGui::SetNextItemWidth(180.0f);
 			changed |= ImGui::SliderFloat("Fill Intensity", &params.fillLightIntensity, 0.0f, 64.0f, "%.2f");
+			changed |= ImGui::Checkbox("Fill Shadows", &gVulkanLightingDebugSettings.fillLightShadows);
 			changed |= ImGui::Checkbox("Rim Light", &gVulkanLightingDebugSettings.rimLightEnabled);
 			ImGui::SetNextItemWidth(180.0f);
 			changed |= ImGui::SliderFloat("Rim Intensity", &params.rimLightIntensity, 0.0f, 64.0f, "%.2f");
+			changed |= ImGui::Checkbox("Rim Shadows", &gVulkanLightingDebugSettings.rimLightShadows);
 			ImGui::Separator();
-			changed |= ImGui::Checkbox("Point Light Shadows", &gVulkanLightingDebugSettings.pointLightShadows);
+			changed |= ImGui::Checkbox("Enable Shadows (master)", &gVulkanLightingDebugSettings.pointLightShadows);
 			changed |= ImGui::Checkbox("Direct Diffuse", &gVulkanLightingDebugSettings.directDiffuse);
 			changed |= ImGui::Checkbox("Direct Specular", &gVulkanLightingDebugSettings.directSpecular);
 			changed |= ImGui::Checkbox("Clearcoat Specular", &gVulkanLightingDebugSettings.clearcoatSpecular);
@@ -852,7 +916,7 @@ void drawVulkanMainMenuBar(RuntimeResources& runtime) {
 			GpuStats gpuStats = runtime.vulkanPreview.gpuStats();
 			ImGui::Separator();
 			ImGui::Text("Sample: %.2f ms", gpuStats.gpuDispatchMs);
-			ImGui::Text("Point shadows: %s", gVulkanLightingDebugSettings.pointLightShadows ? "on" : "off");
+			ImGui::Text("Shadows (master): %s", gVulkanLightingDebugSettings.pointLightShadows ? "on" : "off");
 			ImGui::Text("Denoiser: %s", denoiserModeLabel(gVulkanDenoiserSettings.mode));
 			ImGui::EndMenu();
 		}
@@ -932,6 +996,23 @@ void drawVulkanMainMenuBar(RuntimeResources& runtime) {
 			}
 			if (changed) {
 				invalidateVulkanPostprocess(runtime);
+			}
+			ImGui::EndMenu();
+		}
+		if (ImGui::BeginMenu("Performance Report")) {
+			bool autoReport = runtime.performanceReportAutoOnCompletion;
+			if (ImGui::Checkbox("Auto on completion", &autoReport)) {
+				runtime.performanceReportAutoOnCompletion = autoReport;
+				if (autoReport) {
+					runtime.performanceReportWrittenForRun = false;
+					runtime.performanceReportStatus = "Armed";
+				}
+				else {
+					runtime.performanceReportStatus = "Off";
+				}
+			}
+			if (!runtime.performanceReportStatus.empty()) {
+				ImGui::TextWrapped("%s", runtime.performanceReportStatus.c_str());
 			}
 			ImGui::EndMenu();
 		}

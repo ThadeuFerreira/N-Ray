@@ -294,10 +294,17 @@ Current contract:
 - `directSunLighting` must return before shadow visibility when the sun is
   disabled or its intensity is zero. A disabled light should not trace shadow
   rays.
-- Three-point key/fill/rim point lights default to unshadowed direct lighting.
-  Finite-distance BVH point-light shadows are intentionally opt-in via
-  `Scene -> Vulkan -> Lighting Debug -> Point Light Shadows` or
-  `NrayRenderDocHeadless --point-light-shadows`.
+- Shadows are gated by a global master (`lightingDebug.pointLightShadows`,
+  `GpuSettings.lightingControls.x`), default off, exposed as
+  `Scene -> Vulkan -> Lighting Debug -> Enable Shadows (master)` or
+  `NrayRenderDocHeadless --point-light-shadows`. The master gates ALL finite-distance
+  BVH shadows — the sun (`directSunVisibility` returns full visibility when the master
+  is off) and the key/fill/rim point lights. Each point light additionally has its own
+  gate (`keyLightShadows`/`fillLightShadows`/`rimLightShadows`, carried in
+  `GpuSettings.pointLightShadowFlags.xyz`, default on); effective point-light shadow =
+  master AND per-light flag. UI per-light "Key/Fill/Rim Shadows" checkboxes and headless
+  `--no-key-light-shadows`/`--no-fill-light-shadows`/`--no-rim-light-shadows` drive them.
+  Default-off master keeps the baseline free of shadow rays.
 - `--lighting-log` and `NRAY_VULKAN_LIGHTING_LOG=1` print a one-shot
   `[VulkanLighting]` line with environment, shadow, diffuse/specular,
   clearcoat, intensity, and denoiser state. Check that log before guessing which

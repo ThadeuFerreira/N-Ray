@@ -3,6 +3,7 @@
 
 #include <vulkan_compute_preview.h>
 #include <globalParams.h>
+#include <performance_report.h>
 
 #include <glm/glm.hpp>
 #define GLM_ENABLE_EXPERIMENTAL
@@ -42,6 +43,7 @@ struct HeadlessOptions {
 	int modelIndex     = -1;  // index into project_settings.json manifest
 	std::string modelFolder;  // transient folder, NOT persisted
 	int samples        = 1;
+	int raysPerPixel   = 1;
 	int maxBounces     = 5;
 	int rrMinBounces   = 3;
 	VulkanPreviewShadowMode shadowMode   = VulkanPreviewShadowMode::RayTraced;
@@ -52,7 +54,10 @@ struct HeadlessOptions {
 	bool keyLightEnabled = true;
 	bool fillLightEnabled = true;
 	bool rimLightEnabled = true;
-	bool pointLightShadows = false;
+	bool pointLightShadows = false;   // global shadow master (sun + key/fill/rim)
+	bool keyLightShadows = true;
+	bool fillLightShadows = true;
+	bool rimLightShadows = true;
 	bool directDiffuse = true;
 	bool directSpecular = true;
 	bool clearcoatSpecular = true;
@@ -65,6 +70,7 @@ struct HeadlessOptions {
 	bool doCapture         = false;
 	std::string captureTemplate;
 	std::string jsonOut;
+	std::string perfReportPrefix;
 	std::string ppmOut;
 	bool helpRequested = false;
 };
@@ -80,6 +86,7 @@ static void printHelp(const char* argv0) {
 		"  --model-index <index>      select model from project_settings.json manifest\n"
 		"  --model-folder <path>      transient glTF/GLB folder (not persisted)\n"
 		"  --samples <count>          samples to accumulate (default 1)\n"
+		"  --rays-per-pixel <count>   primary paths per pixel per sample (default 1, max 8)\n"
 		"  --max-bounces <count>      max path-trace bounces (default 5)\n"
 		"  --shadow <none|ray-traced|shadow-map>  shadow mode (default ray-traced)\n"
 		"  --no-environment         disable selected HDRI/EXR sky sampling\n"
@@ -87,7 +94,10 @@ static void printHelp(const char* argv0) {
 		"  --no-key-light           disable key light\n"
 		"  --no-fill-light          disable fill light\n"
 		"  --no-rim-light           disable rim light\n"
-		"  --point-light-shadows    enable finite BVH shadow rays for 3-point lights\n"
+		"  --point-light-shadows    enable shadow master (finite BVH shadows for sun + 3-point lights)\n"
+		"  --no-key-light-shadows   disable shadows for the key light only\n"
+		"  --no-fill-light-shadows  disable shadows for the fill light only\n"
+		"  --no-rim-light-shadows   disable shadows for the rim light only\n"
 		"  --no-direct-diffuse      disable direct diffuse lighting\n"
 		"  --no-direct-specular     disable direct GGX specular lighting\n"
 		"  --no-clearcoat-specular  disable direct clearcoat specular lighting\n"
@@ -102,6 +112,7 @@ static void printHelp(const char* argv0) {
 		"  --capture                  arm RenderDoc capture for next dispatch\n"
 		"  --capture-template <path>  RenderDoc capture path template\n"
 		"  --json-out <path>          write run metadata as JSON\n"
+		"  --perf-report <prefix>     write performance report JSON and Markdown\n"
 		"  --ppm-out <path>           write output pixels as PPM image\n"
 		"  --help                     show this help\n"
 		"\n"
@@ -139,6 +150,8 @@ static HeadlessOptions parseArgs(int argc, char** argv) {
 			opts.modelFolder = nextArg(i, "--model-folder");
 		} else if (std::strcmp(a, "--samples") == 0) {
 			opts.samples = std::atoi(nextArg(i, "--samples"));
+		} else if (std::strcmp(a, "--rays-per-pixel") == 0) {
+			opts.raysPerPixel = std::atoi(nextArg(i, "--rays-per-pixel"));
 		} else if (std::strcmp(a, "--max-bounces") == 0) {
 			opts.maxBounces = std::atoi(nextArg(i, "--max-bounces"));
 		} else if (std::strcmp(a, "--shadow") == 0) {
@@ -163,6 +176,18 @@ static HeadlessOptions parseArgs(int argc, char** argv) {
 			opts.pointLightShadows = true;
 		} else if (std::strcmp(a, "--no-point-light-shadows") == 0) {
 			opts.pointLightShadows = false;
+		} else if (std::strcmp(a, "--key-light-shadows") == 0) {
+			opts.keyLightShadows = true;
+		} else if (std::strcmp(a, "--no-key-light-shadows") == 0) {
+			opts.keyLightShadows = false;
+		} else if (std::strcmp(a, "--fill-light-shadows") == 0) {
+			opts.fillLightShadows = true;
+		} else if (std::strcmp(a, "--no-fill-light-shadows") == 0) {
+			opts.fillLightShadows = false;
+		} else if (std::strcmp(a, "--rim-light-shadows") == 0) {
+			opts.rimLightShadows = true;
+		} else if (std::strcmp(a, "--no-rim-light-shadows") == 0) {
+			opts.rimLightShadows = false;
 		} else if (std::strcmp(a, "--no-direct-diffuse") == 0) {
 			opts.directDiffuse = false;
 		} else if (std::strcmp(a, "--no-direct-specular") == 0) {
@@ -203,6 +228,8 @@ static HeadlessOptions parseArgs(int argc, char** argv) {
 			opts.captureTemplate = nextArg(i, "--capture-template");
 		} else if (std::strcmp(a, "--json-out") == 0) {
 			opts.jsonOut = nextArg(i, "--json-out");
+		} else if (std::strcmp(a, "--perf-report") == 0) {
+			opts.perfReportPrefix = nextArg(i, "--perf-report");
 		} else if (std::strcmp(a, "--ppm-out") == 0) {
 			opts.ppmOut = nextArg(i, "--ppm-out");
 		} else {
@@ -211,6 +238,7 @@ static HeadlessOptions parseArgs(int argc, char** argv) {
 	}
 
 	opts.samples = std::clamp(opts.samples, kMinSamples, kMaxSamples);
+	opts.raysPerPixel = std::clamp(opts.raysPerPixel, kMinRaysPerPixel, kMaxRaysPerPixel);
 	if (opts.width  < 1) opts.width  = 1;
 	if (opts.height < 1) opts.height = 1;
 	opts.keyLightIntensity = std::max(opts.keyLightIntensity, 0.0f);
@@ -284,6 +312,9 @@ static void applyThreePointLighting(
 	settings.lightingDebug.fillLightEnabled = opts.fillLightEnabled;
 	settings.lightingDebug.rimLightEnabled = opts.rimLightEnabled;
 	settings.lightingDebug.pointLightShadows = opts.pointLightShadows;
+	settings.lightingDebug.keyLightShadows = opts.keyLightShadows;
+	settings.lightingDebug.fillLightShadows = opts.fillLightShadows;
+	settings.lightingDebug.rimLightShadows = opts.rimLightShadows;
 	settings.lightingDebug.directDiffuse = opts.directDiffuse;
 	settings.lightingDebug.directSpecular = opts.directSpecular;
 	settings.lightingDebug.clearcoatSpecular = opts.clearcoatSpecular;
@@ -322,6 +353,7 @@ static void applyThreePointLighting(
 static VulkanPreviewSettings buildSettings(const HeadlessOptions& opts) {
 	VulkanPreviewSettings s;
 	s.maxSamples      = opts.samples;
+	s.raysPerPixel    = opts.raysPerPixel;
 	s.maxBounces      = opts.maxBounces;
 	s.rrMinBounces    = opts.rrMinBounces;
 	s.russianRoulette = true;
@@ -365,97 +397,63 @@ static bool savePpm(const std::string& path,
 // JSON metadata writer
 // ---------------------------------------------------------------------------
 
-static void escapeJson(std::ostream& out, const std::string& s) {
-	for (char c : s) {
-		if      (c == '"')  out << "\\\"";
-		else if (c == '\\') out << "\\\\";
-		else if (c == '\n') out << "\\n";
-		else                out << c;
-	}
-}
-
-static const char* debugViewName(VulkanDenoiserDebugView view) {
-	switch (view) {
-	case VulkanDenoiserDebugView::Final: return "final";
-	case VulkanDenoiserDebugView::RawAccumulation: return "raw";
-	case VulkanDenoiserDebugView::DenoisedPreview: return "denoised";
-	case VulkanDenoiserDebugView::Normal: return "normal";
-	case VulkanDenoiserDebugView::Albedo: return "albedo";
-	case VulkanDenoiserDebugView::Depth: return "depth";
-	case VulkanDenoiserDebugView::MaterialId: return "material-id";
-	case VulkanDenoiserDebugView::InstanceId: return "instance-id";
-	default: return "unknown";
-	}
-}
-
-static bool saveJson(const std::string& path,
+static NrayPerformanceReport buildHeadlessReport(
 	const HeadlessOptions& opts,
 	const VulkanComputePreview& preview,
 	const std::vector<std::string>& capturePaths,
-	bool success)
+	bool success,
+	const VulkanPreviewSettings* settingsOverride,
+	double wallTimeSeconds)
 {
-	std::ofstream f(path);
-	if (!f) {
-		std::cerr << "error: cannot write JSON to " << path << "\n";
-		return false;
+	VulkanPreviewSettings settings = settingsOverride != nullptr
+		? *settingsOverride
+		: buildSettings(opts);
+	return makeVulkanPerformanceReport(
+		preview,
+		settings,
+		preview.gpuStats(),
+		opts.width,
+		opts.height,
+		success,
+		preview.statusMessage(),
+		capturePaths,
+		wallTimeSeconds
+	);
+}
+
+static void saveRequestedReports(
+	const HeadlessOptions& opts,
+	const VulkanComputePreview& preview,
+	const std::vector<std::string>& capturePaths,
+	bool success,
+	const VulkanPreviewSettings* settingsOverride = nullptr,
+	double wallTimeSeconds = 0.0)
+{
+	if (opts.jsonOut.empty() && opts.perfReportPrefix.empty()) {
+		return;
 	}
 
-	GpuStats stats = preview.gpuStats();
-	const std::vector<std::string>& fallbackTextures = preview.fallbackTextureLabels();
-	const char* shaderName = VulkanComputePreview::shaderName(preview.shaderIndex());
-	const char* modelName  = VulkanComputePreview::modelName(preview.modelIndex());
+	// Build the report once and emit whichever artifacts were requested.
+	NrayPerformanceReport report =
+		buildHeadlessReport(opts, preview, capturePaths, success, settingsOverride, wallTimeSeconds);
 
-	f << "{\n";
-	f << "  \"success\": " << (success ? "true" : "false") << ",\n";
-	f << "  \"width\": "  << opts.width  << ",\n";
-	f << "  \"height\": " << opts.height << ",\n";
-	f << "  \"shaderIndex\": " << preview.shaderIndex() << ",\n";
-	f << "  \"shaderName\": \""; escapeJson(f, shaderName ? shaderName : ""); f << "\",\n";
-	f << "  \"modelIndex\": " << preview.modelIndex() << ",\n";
-	f << "  \"modelName\": \""; escapeJson(f, modelName ? modelName : ""); f << "\",\n";
-	f << "  \"samplesRequested\": " << opts.samples << ",\n";
-	f << "  \"samplesAccumulated\": " << preview.samplesAccumulated() << ",\n";
-	f << "  \"converged\": " << (preview.converged() ? "true" : "false") << ",\n";
-	f << "  \"gpuDispatchMs\": " << stats.gpuDispatchMs << ",\n";
-	f << "  \"primaryRaysPerSec\": " << stats.primaryRaysPerSec << ",\n";
-	f << "  \"lighting\": {"
-		<< "\"environment\": " << (opts.enableEnvironment ? "true" : "false") << ", "
-		<< "\"threePoint\": " << (opts.enableThreePointLighting ? "true" : "false") << ", "
-		<< "\"keyEnabled\": " << (opts.keyLightEnabled ? "true" : "false") << ", "
-		<< "\"fillEnabled\": " << (opts.fillLightEnabled ? "true" : "false") << ", "
-		<< "\"rimEnabled\": " << (opts.rimLightEnabled ? "true" : "false") << ", "
-		<< "\"pointLightShadows\": " << (opts.pointLightShadows ? "true" : "false") << ", "
-		<< "\"directDiffuse\": " << (opts.directDiffuse ? "true" : "false") << ", "
-		<< "\"directSpecular\": " << (opts.directSpecular ? "true" : "false") << ", "
-		<< "\"clearcoatSpecular\": " << (opts.clearcoatSpecular ? "true" : "false") << ", "
-		<< "\"keyIntensity\": " << opts.keyLightIntensity << ", "
-		<< "\"fillIntensity\": " << opts.fillLightIntensity << ", "
-		<< "\"rimIntensity\": " << opts.rimLightIntensity << ", "
-		<< "\"specularScale\": " << opts.directSpecularScale << ", "
-		<< "\"pointLightSize\": " << opts.pointLightSizeScale << "},\n";
-	f << "  \"sceneCounts\": {"
-		<< "\"triangles\": " << stats.sceneCounts.x << ", "
-		<< "\"bvhNodes\": " << stats.sceneCounts.y << ", "
-		<< "\"materials\": " << stats.sceneCounts.z << ", "
-		<< "\"textures\": " << stats.sceneCounts.w << "},\n";
-	f << "  \"textureDescriptorCount\": " << stats.textureDescriptorCount << ",\n";
-	f << "  \"debugView\": \"" << debugViewName(stats.debugView) << "\",\n";
-	f << "  \"fallbackTextureCount\": " << stats.fallbackTextureCount << ",\n";
-	f << "  \"fallbackTextures\": [";
-	for (size_t i = 0; i < fallbackTextures.size(); ++i) {
-		if (i > 0) f << ", ";
-		f << "\""; escapeJson(f, fallbackTextures[i]); f << "\"";
+	if (!opts.jsonOut.empty()) {
+		std::string error;
+		if (writePerformanceReportJson(opts.jsonOut, report, &error)) {
+			std::cout << "[nray-headless] JSON written: " << opts.jsonOut << "\n";
+		} else {
+			std::cerr << "error: cannot write JSON to " << opts.jsonOut << ": " << error << "\n";
+		}
 	}
-	f << "],\n";
-	f << "  \"status\": \""; escapeJson(f, preview.statusMessage()); f << "\",\n";
-	f << "  \"captures\": [";
-	for (size_t i = 0; i < capturePaths.size(); ++i) {
-		if (i > 0) f << ", ";
-		f << "\""; escapeJson(f, capturePaths[i]); f << "\"";
+	if (!opts.perfReportPrefix.empty()) {
+		NrayPerformanceReportPaths paths = writePerformanceReportFiles(opts.perfReportPrefix, report);
+		if (paths.jsonWritten && paths.markdownWritten) {
+			std::cout << "[nray-headless] performance JSON written: " << paths.jsonPath << "\n";
+			std::cout << "[nray-headless] performance Markdown written: " << paths.markdownPath << "\n";
+		} else {
+			std::cerr << "error: cannot write performance report: " << paths.error << "\n";
+		}
 	}
-	f << "]\n";
-	f << "}\n";
-	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -531,9 +529,7 @@ int main(int argc, char** argv) {
 	preview.setPersistSettings(false);
 	if (!preview.initialize(opts.width, opts.height)) {
 		std::cerr << "[nray-headless] Vulkan init failed: " << preview.statusMessage() << "\n";
-		if (!opts.jsonOut.empty()) {
-			saveJson(opts.jsonOut, opts, preview, {}, false);
-		}
+		saveRequestedReports(opts, preview, {}, false);
 		return 1;
 	}
 	std::cout << "[nray-headless] Vulkan ready: " << preview.statusMessage() << "\n";
@@ -545,14 +541,14 @@ int main(int argc, char** argv) {
 		int idx = preview.importModelFromFolder(opts.modelFolder, /*persist=*/false);
 		if (idx < 0) {
 			std::cerr << "[nray-headless] model import failed: " << preview.statusMessage() << "\n";
-			if (!opts.jsonOut.empty()) { saveJson(opts.jsonOut, opts, preview, {}, false); }
+			saveRequestedReports(opts, preview, {}, false);
 			preview.shutdown();
 			return 1;
 		}
 		if (!preview.setModel(idx)) {
 			std::cerr << "[nray-headless] setModel(" << idx << ") failed after import: "
 				<< preview.statusMessage() << "\n";
-			if (!opts.jsonOut.empty()) { saveJson(opts.jsonOut, opts, preview, {}, false); }
+			saveRequestedReports(opts, preview, {}, false);
 			preview.shutdown();
 			return 1;
 		}
@@ -571,7 +567,7 @@ int main(int argc, char** argv) {
 		} else {
 			std::cerr << "[nray-headless] setModel(" << opts.modelIndex
 				<< ") failed: " << preview.statusMessage() << "\n";
-			if (!opts.jsonOut.empty()) { saveJson(opts.jsonOut, opts, preview, {}, false); }
+			saveRequestedReports(opts, preview, {}, false);
 			preview.shutdown();
 			return 1;
 		}
@@ -586,7 +582,7 @@ int main(int argc, char** argv) {
 			std::cerr << "[nray-headless] auto-select manifest[0] failed"
 				<< (modelName ? std::string(" (") + modelName + ")" : std::string())
 				<< ": " << preview.statusMessage() << "\n";
-			if (!opts.jsonOut.empty()) { saveJson(opts.jsonOut, opts, preview, {}, false); }
+			saveRequestedReports(opts, preview, {}, false);
 			preview.shutdown();
 			return 1;
 		}
@@ -609,7 +605,7 @@ int main(int argc, char** argv) {
 	if (!preview.setShader(shaderIdx)) {
 		std::cerr << "[nray-headless] setShader(" << shaderIdx << ") failed: "
 			<< preview.statusMessage() << "\n";
-		if (!opts.jsonOut.empty()) { saveJson(opts.jsonOut, opts, preview, {}, false); }
+		saveRequestedReports(opts, preview, {}, false);
 		preview.shutdown();
 		return 1;
 	}
@@ -670,6 +666,7 @@ int main(int argc, char** argv) {
 		auto now = std::chrono::steady_clock::now();
 		timeSeconds = std::chrono::duration<float>(now - t0).count();
 	}
+	double renderWallSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
 	if (renderOk) {
 		std::cout << "[nray-headless] done: " << preview.samplesAccumulated()
@@ -691,11 +688,7 @@ int main(int argc, char** argv) {
 		}
 	}
 
-	if (!opts.jsonOut.empty()) {
-		if (saveJson(opts.jsonOut, opts, preview, capturePaths, renderOk)) {
-			std::cout << "[nray-headless] JSON written: " << opts.jsonOut << "\n";
-		}
-	}
+	saveRequestedReports(opts, preview, capturePaths, renderOk, &settings, renderWallSeconds);
 
 	preview.shutdown();
 	return renderOk ? 0 : 1;

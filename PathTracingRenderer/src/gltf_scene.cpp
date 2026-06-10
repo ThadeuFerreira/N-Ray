@@ -55,13 +55,6 @@ float maxComponent(const glm::vec3& value) {
 	return std::max(value.x, std::max(value.y, value.z));
 }
 
-std::string lowerAscii(std::string value) {
-	std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-		return static_cast<char>(std::tolower(c));
-	});
-	return value;
-}
-
 float readNumberValue(const tinygltf::Value& value, float fallback) {
 	if (!value.IsReal() && !value.IsInt()) {
 		return fallback;
@@ -580,119 +573,16 @@ bool textureAlphaLooksLikeCoverage(uint32_t textureIndex, const std::vector<Gltf
 	return alpha.min < 0.95f && (alpha.max - alpha.min) > 0.1f;
 }
 
-bool textContainsAny(const std::string& text, std::initializer_list<const char*> needles) {
-	for (const char* needle : needles) {
-		if (text.find(needle) != std::string::npos) {
-			return true;
-		}
-	}
-	return false;
-}
-
-bool looksLikeTransmissiveSurface(
-	const tinygltf::Material& material,
-	const std::string& sourcePath,
-	const GltfPreviewMaterialMeta& meta,
-	const glm::vec4& averagedBaseColor
-) {
-	std::string text = lowerAscii(material.name + " " + sourcePath);
-	bool nameLooksTransmissive =
-		text.find("glass") != std::string::npos ||
-		text.find("window") != std::string::npos ||
-		text.find("windshield") != std::string::npos ||
-		text.find("windscreen") != std::string::npos ||
-		text.find("lens") != std::string::npos ||
-		text.find("crystal") != std::string::npos ||
-		text.find("water") != std::string::npos ||
-		text.find("liquid") != std::string::npos;
-
-	if (nameLooksTransmissive) {
-		return true;
-	}
-
-	bool simpleBlendMaterial =
-		meta.alphaMode == GLTF_PREVIEW_ALPHA_BLEND &&
-		meta.baseColorTexture == GLTF_PREVIEW_INVALID_TEXTURE &&
-		meta.metallicRoughnessTexture == GLTF_PREVIEW_INVALID_TEXTURE &&
-		meta.roughness <= 0.15f &&
-		averagedBaseColor.a < 0.85f;
-	return simpleBlendMaterial;
-}
-
 void normalizeOpaqueMaterialSemantics(const tinygltf::Material& material, GltfPreviewMaterialMeta& meta) {
-	std::string name = lowerAscii(material.name);
-	bool hasMetallicRoughnessTexture = meta.metallicRoughnessTexture != GLTF_PREVIEW_INVALID_TEXTURE;
-	float rawMetalness = meta.normalizedMetalness;
-	float rawRoughness = meta.normalizedRoughness;
-
-	if (textContainsAny(name, {"tire", "tyre", "rubber", "gasket", "seal"})) {
-		meta.materialKind = GLTF_PREVIEW_MATERIAL_RUBBER;
-		meta.normalizedMetalness = 0.0f;
-		meta.normalizedRoughness = std::max(meta.normalizedRoughness, 0.55f);
-		meta.normalizedSemantic = "rubber dielectric";
-		return;
-	}
-
-	if (textContainsAny(name, {"paint", "body", "colour", "color", "lacquer", "clearcoat"})) {
-		meta.materialKind = GLTF_PREVIEW_MATERIAL_CAR_PAINT;
-		if (!hasMetallicRoughnessTexture || meta.normalizedMetalness > 0.35f) {
-			meta.normalizedMetalness = std::min(meta.normalizedMetalness, 0.08f);
-		}
-		meta.normalizedRoughness = std::clamp(meta.normalizedRoughness, 0.03f, 0.65f);
-		meta.normalizedSemantic = "paint dielectric";
-		return;
-	}
-
-	if (textContainsAny(name, {"plastic", "interior", "leather", "cloth", "fabric", "carbon", "cab", "seat", "dash", "trim", "steering"})) {
-		meta.materialKind = GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC;
-		if (!hasMetallicRoughnessTexture || meta.normalizedMetalness > 0.25f) {
-			meta.normalizedMetalness = 0.0f;
-		}
-		meta.normalizedRoughness = std::max(meta.normalizedRoughness, 0.32f);
-		meta.normalizedSemantic = "nonmetal dielectric";
-		return;
-	}
-
-	if (textContainsAny(name, {"light", "lamp", "indicator", "signal"})) {
-		meta.materialKind = GLTF_PREVIEW_MATERIAL_EMISSIVE;
-		meta.normalizedMetalness = 0.0f;
-		meta.normalizedRoughness = std::clamp(meta.normalizedRoughness, 0.02f, 0.25f);
-		meta.normalizedSemantic = "light surface";
-		return;
-	}
-
-	if (meta.emissiveTexture != GLTF_PREVIEW_INVALID_TEXTURE || meta.emissiveStrength > 1.0f) {
-		meta.materialKind = GLTF_PREVIEW_MATERIAL_EMISSIVE;
-		meta.normalizedMetalness = 0.0f;
-		meta.normalizedRoughness = std::clamp(meta.normalizedRoughness, 0.02f, 0.35f);
-		meta.normalizedSemantic = "emissive surface";
-		return;
-	}
-
-	if (meta.workflow != "specularGlossiness" &&
-		textContainsAny(name, {"metal", "chrome", "steel", "aluminum", "aluminium", "wheel", "rim", "brake", "disc", "rotor", "caliper", "calliper", "exhaust"})) {
-		meta.materialKind = GLTF_PREVIEW_MATERIAL_OPAQUE_METAL;
-		meta.normalizedMetalness = std::max(meta.normalizedMetalness, 0.75f);
-		meta.normalizedSemantic = "metal surface";
-		return;
-	}
-
-	if (!hasMetallicRoughnessTexture && std::abs(rawMetalness - 0.5f) < 0.001f) {
-		meta.materialKind = GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC;
-		meta.normalizedMetalness = 0.0f;
-		meta.normalizedSemantic = "sparse default dielectric";
-		return;
-	}
-
+	(void)material;
+	// Data-driven only: classify by the declared metalness. baseColor / roughness /
+	// metalness are taken verbatim from glTF (clamped in normalizeMaterialMeta), and
+	// emission is applied additively by the shader regardless of kind. Leaving
+	// normalizedSemantic empty lets the alphaMode-driven mask/blend kinds in
+	// normalizeMaterialMeta take precedence for coverage materials.
 	meta.materialKind = meta.normalizedMetalness > 0.5f
 		? GLTF_PREVIEW_MATERIAL_OPAQUE_METAL
 		: GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC;
-
-	if (meta.materialKind == GLTF_PREVIEW_MATERIAL_OPAQUE_METAL && !hasMetallicRoughnessTexture && rawMetalness > 0.5f && rawRoughness > 0.65f) {
-		meta.normalizedMetalness = 0.0f;
-		meta.materialKind = GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC;
-		meta.normalizedSemantic = "rough sparse material";
-	}
 }
 
 void normalizeMaterialMeta(
@@ -705,17 +595,13 @@ void normalizeMaterialMeta(
 	float rawAlphaCoverage = meta.alphaMode == GLTF_PREVIEW_ALPHA_OPAQUE ? 1.0f : clamp01(averagedBaseColor.a);
 	float transmission = clamp01(meta.transmission);
 
-	if (transmission <= 0.001f && looksLikeTransmissiveSurface(material, sourcePath, meta, averagedBaseColor)) {
-		transmission = std::clamp(1.0f - rawAlphaCoverage, 0.35f, 1.0f);
-		meta.inferredTransmission = true;
-	}
-
 	meta.normalizedBaseColorFactor = meta.baseColorFactor;
 	meta.normalizedRoughness = std::clamp(meta.roughness, 0.02f, 1.0f);
 	meta.normalizedMetalness = clamp01(meta.metalness);
 	meta.normalizedTransmission = transmission;
 	meta.normalizedAlphaCoverage = rawAlphaCoverage;
 	meta.normalizedIor = std::max(meta.ior, 1.001f);
+	meta.normalizedDielectricSpecularStrength = std::clamp(meta.dielectricSpecularStrength, 0.0f, 1.0f);
 	meta.normalizedAlphaMode = meta.alphaMode;
 
 	bool transmissive = transmission > 0.001f;
@@ -881,9 +767,6 @@ void logGltfPreviewMaterialImport(
 
 	std::cout << std::endl;
 
-	if (meta.inferredTransmission) {
-		std::cout << "  NORMALIZED material[" << materialIndex << "]: inferred thin transmission from material name/alpha/roughness cues\n";
-	}
 	if (meta.repairedMetallicTransmission) {
 		std::cout << "  WARNING material[" << materialIndex << "]: metallicFactor=" << meta.metalness
 			<< " with transmissionFactor=" << meta.transmission
@@ -896,17 +779,6 @@ void logGltfPreviewMaterialImport(
 		std::cout << "  NORMALIZED material[" << materialIndex << "]: semantic class " << meta.normalizedSemantic
 			<< " mapped to roughness=" << meta.normalizedRoughness
 			<< " metalness=" << meta.normalizedMetalness << "\n";
-	}
-	if (meta.alphaMode == GLTF_PREVIEW_ALPHA_BLEND && meta.transmission < 0.001f) {
-		std::string lowerName = material.name;
-		std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
-			[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-		if (lowerName.find("glass") != std::string::npos ||
-			lowerName.find("window") != std::string::npos ||
-			lowerName.find("windshield") != std::string::npos) {
-			std::cout << "  NOTE material[" << materialIndex << "]: alphaMode=BLEND with no KHR_materials_transmission"
-				<< " -- surface will composite as coverage, not physically transmissive glass\n";
-		}
 	}
 }
 
@@ -1083,6 +955,13 @@ PBRMaterial convertMaterial(
 		meta.specGlossTexture = specGloss.specularGlossinessTexture;
 		meta.specGlossSpecularFactor = specGloss.specularFactor;
 		meta.specGlossGlossinessFactor = specGloss.glossinessFactor;
+
+		// specularFactor is the dielectric specular reflectance color. Reduce it to
+		// a scalar strength (luminance) that scales the shader's default 0.04 F0:
+		// [0,0,0] -> matte (no specular), [1,1,1] -> standard dielectric.
+		const glm::vec3& sf = specGloss.specularFactor;
+		float specLuma = 0.2126f * sf.r + 0.7152f * sf.g + 0.0722f * sf.b;
+		meta.dielectricSpecularStrength = std::clamp(specLuma, 0.0f, 1.0f);
 
 		if (specGloss.specularGlossinessTexture != GLTF_PREVIEW_INVALID_TEXTURE &&
 			specGloss.specularGlossinessTexture < textures.size()) {

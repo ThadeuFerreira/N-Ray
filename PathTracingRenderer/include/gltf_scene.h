@@ -90,6 +90,10 @@ struct GltfPreviewMaterialMeta {
 	uint32_t specGlossTexture = GLTF_PREVIEW_INVALID_TEXTURE;
 	glm::vec3 specGlossSpecularFactor = glm::vec3(1.0f);
 	float specGlossGlossinessFactor = 1.0f;
+	// Dielectric specular reflectance scale (F0 multiplier) in [0,1], derived from
+	// KHR_materials_pbrSpecularGlossiness specularFactor. 1.0 = standard 0.04
+	// dielectric; 0.0 = no specular (matte). Defaults to 1.0 for metallic-roughness.
+	float dielectricSpecularStrength = 1.0f;
 	bool derivedMetallicRoughnessTexture = false;
 
 	uint32_t materialKind = GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC;
@@ -100,7 +104,7 @@ struct GltfPreviewMaterialMeta {
 	float normalizedTransmission = 0.0f;
 	float normalizedAlphaCoverage = 1.0f;
 	float normalizedIor = 1.5f;
-	bool inferredTransmission = false;
+	float normalizedDielectricSpecularStrength = 1.0f;
 	bool inferredVolumeThickness = false;
 	bool repairedTransmissionTint = false;
 	bool repairedMetallicTransmission = false;

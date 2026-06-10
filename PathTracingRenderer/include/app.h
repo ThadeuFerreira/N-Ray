@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <vector>
 #include <raylib.h>
 #include <globalParams.h>
@@ -23,6 +24,11 @@ struct RuntimeResources {
 	std::vector<RenderPixel> vulkanFrame;
 	bool vulkanFrameValid = false;
 	bool vulkanFrameDispatched = false;
+	bool performanceReportAutoOnCompletion = false;
+	bool performanceReportWrittenForRun = false;
+	std::string performanceReportStatus;
+	std::string performanceReportLastJson;
+	std::string performanceReportLastMarkdown;
 	int asyncRaysPerPixel = 1;
 };
 

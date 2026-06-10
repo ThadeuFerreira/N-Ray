@@ -1,5 +1,5 @@
 {
-    "lastSelectedModelFolder": "assets/2024_lbsilhouette_works_murcielago_gt_evo",
+    "lastSelectedModelFolder": "/home/thadeu/Downloads/glass_bunny",
     "lastSelectedSky": "/home/thadeu/Downloads/sunny_rose_garden_2k.exr",
     "models": [
         {
@@ -85,6 +85,10 @@
         {
             "folder": "/home/thadeu/Downloads/wine_decanter_and_glass",
             "name": "wine_decanter_and_glass"
+        },
+        {
+            "folder": "/home/thadeu/Downloads/glass_bunny",
+            "name": "glass_bunny"
         }
     ],
     "skies": [

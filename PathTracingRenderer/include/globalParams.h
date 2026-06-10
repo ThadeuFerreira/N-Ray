@@ -11,6 +11,10 @@
 inline constexpr int kMinSamples = 1;
 inline constexpr int kMaxSamples = 1000;
 
+// Allowed range for primary paths per pixel per sample (Vulkan preview).
+inline constexpr int kMinRaysPerPixel = 1;
+inline constexpr int kMaxRaysPerPixel = 8;
+
 struct Data {
 	std::vector<Tri> tris;
 	std::vector<TriIntersect> triIsect;

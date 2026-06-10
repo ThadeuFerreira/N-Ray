@@ -109,6 +109,7 @@ project "NrayRenderDocHeadless"
         "PathTracingRenderer/src/gltf_scene.cpp",
         "PathTracingRenderer/src/tinygltf_impl.cpp",
         "PathTracingRenderer/src/renderer.cpp",
+        "PathTracingRenderer/src/performance_report.cpp",
     }
 
     includedirs

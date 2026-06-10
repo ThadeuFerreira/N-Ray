@@ -420,7 +420,7 @@ struct GpuMaterial {
 	glm::vec4 textureParams;   // alphaCutoff, normalScale, occlusionStrength, volumeThickness
 	glm::vec4 attenuation;     // rgb attenuationColor, a attenuationDistance
 	glm::uvec4 volumeTextureInfo; // thicknessTexture, unused
-	glm::vec4 opticalParams;   // clearcoatFactor, clearcoatRoughnessFactor, unused, unused
+	glm::vec4 opticalParams;   // clearcoatFactor, clearcoatRoughnessFactor, dielectricSpecularStrength, unused
 };
 
 struct GpuBvhNode {
@@ -445,22 +445,23 @@ struct GpuSettings {
 	glm::vec4 denoiseParams; // x=strength, y=depthSigma, z=normalSigma, w=lumaSigma
 	glm::uvec4 denoiseFlags; // x=mode, y=debugView, z=fireflyClamp, w=atrousPassCount
 	glm::vec4 environmentParams; // x=enableEnv, y=envReady, z/w unused
-	glm::vec4 pointLightParams;  // x=enableThreePoint, y=sceneRadius, z/w unused
+	glm::vec4 pointLightParams;  // x=enableThreePoint, y=sceneRadius, z=raysPerPixel, w unused
 	glm::vec4 keyLightPositionRadius;
 	glm::vec4 keyLightColorIntensity;
 	glm::vec4 fillLightPositionRadius;
 	glm::vec4 fillLightColorIntensity;
 	glm::vec4 rimLightPositionRadius;
 	glm::vec4 rimLightColorIntensity;
-	glm::vec4 lightingControls; // x=pointLightShadows, y=directDiffuse, z=directSpecular, w=clearcoatSpecular
+	glm::vec4 lightingControls; // x=shadowsEnabled(master), y=directDiffuse, z=directSpecular, w=clearcoatSpecular
 	glm::vec4 lightingParams;   // x=directSpecularScale, y=pointLightSizeScale, z/w unused
+	glm::vec4 pointLightShadowFlags; // x=keyShadows, y=fillShadows, z=rimShadows, w unused
 };
 
 static_assert(sizeof(GpuTriIntersect) == 64, "GpuTriIntersect must match std430 shader layout.");
 static_assert(sizeof(GpuTriShading) == 144, "GpuTriShading must match std430 shader layout.");
 static_assert(sizeof(GpuMaterial) == 144, "GpuMaterial must match std430 shader layout.");
 static_assert(sizeof(GpuBvhNode) == 48, "GpuBvhNode must match std430 shader layout.");
-static_assert(sizeof(GpuSettings) == 352, "GpuSettings must match std430 shader layout.");
+static_assert(sizeof(GpuSettings) == 368, "GpuSettings must match std430 shader layout.");
 
 void logModelImport(const std::string& message);
 
@@ -538,7 +539,8 @@ void logGpuMaterialTable(
 			<< " roughness=" << material.params.x
 			<< " metalness=" << material.params.y
 			<< " clearcoat=" << material.opticalParams.x
-			<< " clearcoatRoughness=" << material.opticalParams.y;
+			<< " clearcoatRoughness=" << material.opticalParams.y
+			<< " specStrength=" << material.opticalParams.z;
 		logModelImport(out.str());
 	}
 }
@@ -2269,6 +2271,7 @@ struct VulkanComputePreview::Impl {
 	// records a GPU clear before the next dispatch.
 	uint32_t currentSample = 0;
 	uint32_t maxSamplesCached = 1;
+	uint32_t raysPerPixelCached = 1;
 	bool accumNeedsClear = true;
 
 	// Scene storage buffers are bound to descriptor set bindings 1..4 (binding 0
@@ -2334,7 +2337,19 @@ struct VulkanComputePreview::Impl {
 	uint32_t localHeapIndex = UINT32_MAX;
 	uint64_t localHeapUsed = 0;
 	double lastGpuMs = 0.0;
+	double lastDispatchWallMs = 0.0;
+	double runWallMs = 0.0;
+	double totalGpuMs = 0.0;
+	double minGpuMs = 0.0;
+	double maxGpuMs = 0.0;
+	uint32_t timedDispatchCount = 0;
 	uint32_t frameCount = 0;
+	std::chrono::steady_clock::time_point performanceRunStart{};
+	bool performanceRunActive = false;
+	uint32_t deviceVendorId = 0;
+	uint32_t deviceId = 0;
+	uint32_t deviceApiVersion = 0;
+	uint32_t deviceDriverVersion = 0;
 	VulkanDenoiser denoiser;
 
 	int selectedShader = defaultShaderArrayIndex();
@@ -2447,6 +2462,7 @@ struct VulkanComputePreview::Impl {
 		if (!initialized) {
 			return false;
 		}
+		auto renderWallStart = std::chrono::steady_clock::now();
 
 		const ShaderEntry& selectedEntry = kShaders[selectedShader >= 0 && selectedShader < kShaderCount ? selectedShader : 0];
 		std::string captureLabel = std::string("Vulkan Compute Dispatch: ") + selectedEntry.name;
@@ -2459,9 +2475,14 @@ struct VulkanComputePreview::Impl {
 			return false;
 		}
 
-		// The [kMinSamples, kMaxSamples] policy is enforced upstream by the driver
+		// The [kMin, kMax] sample/rays policy is enforced upstream by the driver
 		// and UI; here we only guard against a non-positive dispatch count.
 		maxSamplesCached = static_cast<uint32_t>(std::max(1, settings.maxSamples));
+		uint32_t requestedRaysPerPixel = static_cast<uint32_t>(std::max(1, settings.raysPerPixel));
+		if (requestedRaysPerPixel != raysPerPixelCached && currentSample > 0) {
+			resetAccumState("rays per pixel changed");
+		}
+		raysPerPixelCached = requestedRaysPerPixel;
 		if (settings.resetAccumulation) {
 			resetAccumState("preview driver reset");
 		}
@@ -2472,6 +2493,11 @@ struct VulkanComputePreview::Impl {
 			currentSample > 0 &&
 			!settings.resetAccumulation;
 		bool traceSample = !postprocessOnly;
+		if (traceSample && !performanceRunActive) {
+			performanceRunActive = true;
+			performanceRunStart = renderWallStart;
+			runWallMs = 0.0;
+		}
 		uint32_t denoiseSampleCount = traceSample ? currentSample + 1u : currentSample;
 
 		// Upload the per-dispatch render/sky settings (binding 6).
@@ -2511,7 +2537,7 @@ struct VulkanComputePreview::Impl {
 		gpuSettings.pointLightParams = glm::vec4(
 			settings.enableThreePointLighting ? 1.0f : 0.0f,
 			sceneRadius,
-			0.0f,
+			static_cast<float>(raysPerPixelCached),
 			0.0f
 		);
 		const float pointLightSizeScale = std::max(settings.lightingDebug.pointLightSizeScale, 0.0f);
@@ -2545,6 +2571,12 @@ struct VulkanComputePreview::Impl {
 			0.0f,
 			0.0f
 		);
+		gpuSettings.pointLightShadowFlags = glm::vec4(
+			settings.lightingDebug.keyLightShadows ? 1.0f : 0.0f,
+			settings.lightingDebug.fillLightShadows ? 1.0f : 0.0f,
+			settings.lightingDebug.rimLightShadows ? 1.0f : 0.0f,
+			0.0f
+		);
 
 		if (lightingVerboseLoggingEnabled(settings.lightingDebug)) {
 			std::ostringstream key;
@@ -2553,7 +2585,10 @@ struct VulkanComputePreview::Impl {
 				<< " radius=" << sceneRadius
 				<< " env=" << (settings.enableEnvironment ? 1 : 0) << "/" << (envReady ? 1 : 0)
 				<< " threePoint=" << (settings.enableThreePointLighting ? 1 : 0)
-				<< " pointShadows=" << (settings.lightingDebug.pointLightShadows ? 1 : 0)
+				<< " shadows=" << (settings.lightingDebug.pointLightShadows ? 1 : 0)
+				<< " shKey=" << (settings.lightingDebug.keyLightShadows ? 1 : 0)
+				<< " shFill=" << (settings.lightingDebug.fillLightShadows ? 1 : 0)
+				<< " shRim=" << (settings.lightingDebug.rimLightShadows ? 1 : 0)
 				<< " diffuse=" << (settings.lightingDebug.directDiffuse ? 1 : 0)
 				<< " specular=" << (settings.lightingDebug.directSpecular ? 1 : 0)
 				<< " clearcoat=" << (settings.lightingDebug.clearcoatSpecular ? 1 : 0)
@@ -2703,6 +2738,7 @@ struct VulkanComputePreview::Impl {
 				selectedEntry.requiresModel &&
 				modelBuffersReady &&
 				settings.shadowMode == VulkanPreviewShadowMode::ShadowMap &&
+				settings.lightingDebug.pointLightShadows &&
 				shadowMapPipeline != VK_NULL_HANDLE &&
 				shadowMapBuffer.buffer != VK_NULL_HANDLE &&
 				sceneCounts.x > 0u;
@@ -2887,6 +2923,9 @@ struct VulkanComputePreview::Impl {
 			if (tsResult == VK_SUCCESS) {
 				uint64_t delta = timestamps[1] - timestamps[0];
 				lastGpuMs = static_cast<double>(delta) * static_cast<double>(timestampPeriod) / 1e6;
+				if (traceSample) {
+					recordGpuTiming(lastGpuMs);
+				}
 			}
 		}
 
@@ -2906,6 +2945,11 @@ struct VulkanComputePreview::Impl {
 		}
 		pixels.resize(static_cast<size_t>(renderWidth) * static_cast<size_t>(renderHeight));
 		std::memcpy(pixels.data(), mappedPixels, pixelBufferSize);
+		auto renderWallEnd = std::chrono::steady_clock::now();
+		lastDispatchWallMs = std::chrono::duration<double, std::milli>(renderWallEnd - renderWallStart).count();
+		if (traceSample && performanceRunActive) {
+			runWallMs = std::chrono::duration<double, std::milli>(renderWallEnd - performanceRunStart).count();
+		}
 		return true;
 	}
 
@@ -2981,6 +3025,7 @@ struct VulkanComputePreview::Impl {
 		pixelMemoryCoherent = false;
 		resetAccumState();
 		maxSamplesCached = 1;
+		raysPerPixelCached = 1;
 		modelBuffersReady = false;
 		modelScene = {};
 		materialsOriginal.clear();
@@ -2989,9 +3034,8 @@ struct VulkanComputePreview::Impl {
 		fallbackTextureLabels.clear();
 		textureDescriptorCount = 1;
 		initialized = false;
-		lastGpuMs = 0.0;
+		resetPerformanceRunStats();
 		localHeapUsed = 0;
-		frameCount = 0;
 		timestampSupported = false;
 		memBudgetSupported = false;
 		descriptorIndexingSupported = false;
@@ -3109,7 +3153,36 @@ struct VulkanComputePreview::Impl {
 	void resetAccumState(const char* reason = "accumulation reset") {
 		currentSample = 0;
 		accumNeedsClear = true;
+		resetPerformanceRunStats();
 		denoiser.resetHistory(reason);
+	}
+
+	void resetPerformanceRunStats() {
+		lastGpuMs = 0.0;
+		lastDispatchWallMs = 0.0;
+		runWallMs = 0.0;
+		totalGpuMs = 0.0;
+		minGpuMs = 0.0;
+		maxGpuMs = 0.0;
+		timedDispatchCount = 0;
+		frameCount = 0;
+		performanceRunActive = false;
+	}
+
+	void recordGpuTiming(double gpuMs) {
+		if (gpuMs <= 0.0) {
+			return;
+		}
+		totalGpuMs += gpuMs;
+		if (timedDispatchCount == 0) {
+			minGpuMs = gpuMs;
+			maxGpuMs = gpuMs;
+		}
+		else {
+			minGpuMs = std::min(minGpuMs, gpuMs);
+			maxGpuMs = std::max(maxGpuMs, gpuMs);
+		}
+		timedDispatchCount++;
 	}
 
 	// Re-upload the host material mirror into the (host-visible) SCENE_MATERIAL
@@ -3371,6 +3444,11 @@ struct VulkanComputePreview::Impl {
 		vkGetPhysicalDeviceProperties(physicalDevice, &selectedProps);
 		timestampPeriod = selectedProps.limits.timestampPeriod;
 		intelGpu = (selectedProps.vendorID == 0x8086);
+		// deviceName was already set to the selected device in the scoring loop.
+		deviceVendorId = selectedProps.vendorID;
+		deviceId = selectedProps.deviceID;
+		deviceApiVersion = selectedProps.apiVersion;
+		deviceDriverVersion = selectedProps.driverVersion;
 
 		{
 			uint32_t count = 0;
@@ -4462,6 +4540,7 @@ struct VulkanComputePreview::Impl {
 			uint32_t materialKind = meta ? meta->materialKind : GLTF_PREVIEW_MATERIAL_OPAQUE_DIELECTRIC;
 			float clearcoatFactor = meta ? std::clamp(meta->clearcoatFactor, 0.0f, 1.0f) : 0.0f;
 			float clearcoatRoughnessFactor = meta ? std::clamp(meta->clearcoatRoughnessFactor, 0.0f, 1.0f) : 0.0f;
+			float dielectricSpecularStrength = meta ? std::clamp(meta->normalizedDielectricSpecularStrength, 0.0f, 1.0f) : 1.0f;
 			gpuMaterials.push_back({
 				baseColor,
 				glm::vec4(roughness, metalness, emissionIntensity, transmission),
@@ -4471,7 +4550,7 @@ struct VulkanComputePreview::Impl {
 				glm::vec4(alphaCutoff, normalScale, occlusionStrength, volumeThickness),
 				glm::vec4(glm::clamp(attenuationColor, glm::vec3(0.0f), glm::vec3(1.0f)), std::max(attenuationDistance, 0.0f)),
 				glm::uvec4(thicknessTexture, 0u, 0u, 0u),
-				glm::vec4(clearcoatFactor, clearcoatRoughnessFactor, 0.0f, 0.0f)
+				glm::vec4(clearcoatFactor, clearcoatRoughnessFactor, dielectricSpecularStrength, 0.0f)
 			});
 		}
 
@@ -4967,8 +5046,7 @@ struct VulkanComputePreview::Impl {
 			return false;
 		}
 
-		frameCount = 0;
-		lastGpuMs = 0.0;
+		resetPerformanceRunStats();
 		setActiveStatus();
 		{
 			std::ostringstream out;
@@ -5085,8 +5163,6 @@ struct VulkanComputePreview::Impl {
 		}
 
 		resetAccumState();
-		frameCount = 0;
-		lastGpuMs = 0.0;
 		setActiveStatus();
 		if (persistSettings) {
 			saveSelectedModelToSettings(selectedModel);
@@ -5499,14 +5575,27 @@ void VulkanComputePreview::resetMaterialStates() {
 GpuStats VulkanComputePreview::gpuStats() const {
 	GpuStats s{};
 	s.gpuDispatchMs = m_impl->lastGpuMs;
+	s.dispatchWallMs = m_impl->lastDispatchWallMs;
+	s.runWallMs = m_impl->runWallMs;
+	s.totalGpuDispatchMs = m_impl->totalGpuMs;
+	s.avgGpuDispatchMs = m_impl->timedDispatchCount > 0
+		? m_impl->totalGpuMs / static_cast<double>(m_impl->timedDispatchCount)
+		: 0.0;
+	s.minGpuDispatchMs = m_impl->minGpuMs;
+	s.maxGpuDispatchMs = m_impl->maxGpuMs;
 	s.frameCount = m_impl->frameCount;
+	s.timedDispatchCount = m_impl->timedDispatchCount;
 	s.sceneCounts = m_impl->sceneCounts;
 	s.textureDescriptorCount = m_impl->textureDescriptorCount;
 	uint64_t raysPerSample =
 		static_cast<uint64_t>(std::max(m_impl->renderWidth, 0)) *
-		static_cast<uint64_t>(std::max(m_impl->renderHeight, 0));
+		static_cast<uint64_t>(std::max(m_impl->renderHeight, 0)) *
+		static_cast<uint64_t>(std::max(m_impl->raysPerPixelCached, 1u));
 	s.primaryRaysTraced = raysPerSample * static_cast<uint64_t>(m_impl->currentSample);
-	if (m_impl->lastGpuMs > 0.0) {
+	if (m_impl->runWallMs > 0.0) {
+		s.primaryRaysPerSec = static_cast<double>(s.primaryRaysTraced) / (m_impl->runWallMs / 1000.0);
+	}
+	else if (m_impl->lastGpuMs > 0.0) {
 		s.primaryRaysPerSec = static_cast<double>(raysPerSample) / (m_impl->lastGpuMs / 1000.0);
 	}
 	s.localHeapBytes = m_impl->localHeapBytes;
@@ -5516,6 +5605,12 @@ GpuStats VulkanComputePreview::gpuStats() const {
 	s.timestampAvailable = m_impl->timestampSupported;
 	s.samplesAccumulated = m_impl->currentSample;
 	s.maxSamples = m_impl->maxSamplesCached;
+	s.deviceName = m_impl->deviceName;
+	s.vendorId = m_impl->deviceVendorId;
+	s.deviceId = m_impl->deviceId;
+	s.apiVersion = m_impl->deviceApiVersion;
+	s.driverVersion = m_impl->deviceDriverVersion;
+	s.raysPerPixel = m_impl->raysPerPixelCached;
 	s.denoiser = m_impl->denoiser.stats();
 	s.debugView = s.denoiser.debugView;
 	s.fallbackTextureCount = static_cast<uint32_t>(m_impl->fallbackTextureLabels.size());

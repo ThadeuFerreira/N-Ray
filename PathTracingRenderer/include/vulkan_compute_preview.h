@@ -29,7 +29,10 @@ struct VulkanPreviewLightingDebugSettings {
 	bool keyLightEnabled = true;
 	bool fillLightEnabled = true;
 	bool rimLightEnabled = true;
-	bool pointLightShadows = false;
+	bool pointLightShadows = false;   // global shadow master: gates all light shadows (sun + key/fill/rim)
+	bool keyLightShadows = true;      // per-light: effective shadow = pointLightShadows && this
+	bool fillLightShadows = true;
+	bool rimLightShadows = true;
 	bool directDiffuse = true;
 	bool directSpecular = true;
 	bool clearcoatSpecular = true;
@@ -102,6 +105,7 @@ struct VulkanDenoiserStats {
 // restarts the sample accumulation (set on any camera/model/setting change).
 struct VulkanPreviewSettings {
 	int maxSamples = 1;
+	int raysPerPixel = 1;
 	int maxBounces = 5;
 	int rrMinBounces = 3;
 	bool russianRoulette = true;
@@ -166,9 +170,17 @@ struct VulkanPreviewMaterialState {
 
 struct GpuStats {
 	double gpuDispatchMs = 0.0;
+	double dispatchWallMs = 0.0;
+	double runWallMs = 0.0;
+	double totalGpuDispatchMs = 0.0;
+	double avgGpuDispatchMs = 0.0;
+	double minGpuDispatchMs = 0.0;
+	double maxGpuDispatchMs = 0.0;
 	double primaryRaysPerSec = 0.0;
 	uint32_t frameCount = 0;
+	uint32_t timedDispatchCount = 0;
 	uint64_t primaryRaysTraced = 0;
+	uint32_t raysPerPixel = 1;
 	glm::uvec4 sceneCounts = glm::uvec4(0u);
 	uint32_t textureDescriptorCount = 0;
 	VulkanDenoiserDebugView debugView = VulkanDenoiserDebugView::Final;
@@ -180,6 +192,11 @@ struct GpuStats {
 	bool timestampAvailable = false;
 	uint32_t samplesAccumulated = 0;
 	uint32_t maxSamples = 1;
+	std::string deviceName;
+	uint32_t vendorId = 0;
+	uint32_t deviceId = 0;
+	uint32_t apiVersion = 0;
+	uint32_t driverVersion = 0;
 	VulkanDenoiserStats denoiser;
 };
 
